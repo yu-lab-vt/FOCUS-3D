@@ -1,0 +1,18 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: v2.1.0
+_src_path: https://github.com/napari/napari-plugin-template
+display_name: Cellseg
+email: zhangqh24@mails.tsinghua.edu.cn
+full_name: Qinghua Zhang
+github_repository_url: provide later
+github_username_or_organization: Qinghua24
+include_reader_plugin: true
+include_sample_data_plugin: true
+include_widget_plugin: true
+include_writer_plugin: true
+install_dependabot: true
+install_precommit: true
+license: BSD-3
+module_name: cellseg
+plugin_name: cellseg
+short_description: A user-friendly plugin for 3D cell segmentation

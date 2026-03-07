@@ -1,0 +1,25 @@
+# Dependabot configuration
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuring-dependabot-version-updates#enabling-github-dependabot-version-updates
+# https://til.simonwillison.net/github/dependabot-python-setup
+
+version: 2
+updates:
+  # Monitor pip dependencies
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      python-packages:
+        patterns:
+          - "*"
+
+  # Monitor GitHub Actions and propose updates for security and maintenance
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
