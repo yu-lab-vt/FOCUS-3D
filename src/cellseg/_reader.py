@@ -6,7 +6,13 @@ implement multiple readers or even other plugin contributions. see:
 https://napari.org/stable/plugins/building_a_plugin/guides.html#readers
 """
 
+from __future__ import annotations
+
+import os
+
 import numpy as np
+from napari.types import LayerData
+from skimage import io
 
 
 def napari_get_reader(path):
@@ -83,3 +89,41 @@ def reader_function(path):
 
     layer_type = 'image'  # optional, default is "image"
     return [(data, add_kwargs, layer_type)]
+
+
+def read_4d_folder(path: str) -> list[LayerData]:
+    """Reads all .tif files in a folder as a time series (T x Z x Y x X).
+
+    Parameters
+    ----------
+    path : str
+        Path to the folder containing the image files.
+
+    Returns
+    -------
+    List[LayerData]
+        A list containing a single tuple: (data, metadata, layer_type).
+        The data is a 4D numpy array (T, Z, Y, X). Metadata includes layer name.
+    """
+    # Get all .tif files, sorted to maintain correct time order
+    files = sorted(
+        [f for f in os.listdir(path) if f.endswith(('.tif', '.tiff'))]
+    )
+    if not files:
+        return []
+
+    # Load the first image to determine the spatial dimensions (Z, Y, X)
+    first_img = io.imread(os.path.join(path, files[0]))
+    # Determine the number of time points (T)
+    t_frames = len(files)
+    # Initialize a 4D array (T, Z, Y, X)
+    stack_4d = np.zeros((t_frames,) + first_img.shape, dtype=first_img.dtype)
+
+    # Load each file into the corresponding time frame
+    for t, fname in enumerate(files):
+        img = io.imread(os.path.join(path, fname))
+        stack_4d[t] = img
+
+    # Prepare metadata for the layer
+    layer_data = (stack_4d, {'name': '4D Time Series'}, 'image')
+    return [layer_data]

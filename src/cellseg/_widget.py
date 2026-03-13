@@ -29,101 +29,1937 @@ References:
 Replace code below according to your needs.
 """
 
+from __future__ import annotations
+
+import os
 from typing import TYPE_CHECKING
 
-from magicgui import magic_factory
-from magicgui.widgets import CheckBox, Container, create_widget
-from qtpy.QtWidgets import QHBoxLayout, QPushButton, QWidget
-from skimage.util import img_as_float
+import dask.array as da
+import numpy as np
+from dask import compute, delayed
+from napari.layers import Image, Labels, Layer
+from napari.utils import notifications
+from qtpy.QtCore import Qt
+from scipy import ndimage as ndi
+from skimage import io
 
 if TYPE_CHECKING:
-    import napari
+    pass
+import traceback
+from datetime import datetime
 
-
-# Uses the `autogenerate: true` flag in the plugin manifest
-# to indicate it should be wrapped as a magicgui to autogenerate
-# a widget.
-def threshold_autogenerate_widget(
-    img: 'napari.types.ImageData',
-    threshold: 'float',
-) -> 'napari.types.LabelsData':
-    return img_as_float(img) > threshold
-
-
-# the magic_factory decorator lets us customize aspects of our widget
-# we specify a widget type for the threshold parameter
-# and use auto_call=True so the function is called whenever
-# the value of a parameter changes
-@magic_factory(
-    threshold={'widget_type': 'FloatSlider', 'max': 1}, auto_call=True
+import dask_image.ndmeasure
+import tifffile
+import zarr
+from matplotlib.backends.backend_qt5agg import (
+    FigureCanvasQTAgg as FigureCanvas,
 )
-def threshold_magic_widget(
-    img_layer: 'napari.layers.Image', threshold: 'float'
-) -> 'napari.types.LabelsData':
-    return img_as_float(img_layer.data) > threshold
+from matplotlib.figure import Figure
+from qtpy.QtCore import QObject, QThread, Signal
+from qtpy.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDoubleSpinBox,
+    QFileDialog,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QProgressDialog,
+    QPushButton,
+    QRadioButton,
+    QSizePolicy,
+    QSpinBox,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
+from zarr.convenience import copy_store
 
 
-# if we want even more control over our widget, we can use
-# magicgui `Container`
-class ImageThreshold(Container):
-    def __init__(self, viewer: 'napari.viewer.Viewer'):
+# ---------- Background Workers ----------
+class SegmentationWorker(QObject):
+    """Worker for running 3D segmentation in a background thread."""
+
+    progress = Signal(int, str)  # progress value, message
+    finished = Signal(
+        object, str
+    )  # result (labels array), error message (empty if success)
+    cancelled = Signal()
+
+    def __init__(self, image_data, mode, threshold=None, checkpoint=None):
         super().__init__()
-        self._viewer = viewer
-        # use create_widget to generate widgets from type annotations
-        self._image_layer_combo = create_widget(
-            label='Image', annotation='napari.layers.Image'
-        )
-        self._threshold_slider = create_widget(
-            label='Threshold', annotation=float, widget_type='FloatSlider'
-        )
-        self._threshold_slider.min = 0
-        self._threshold_slider.max = 1
-        # use magicgui widgets directly
-        self._invert_checkbox = CheckBox(text='Keep pixels below threshold')
+        self.image_data = image_data
+        self.mode = mode  # 0: manual, 1: auto
+        self.threshold = threshold
+        self.checkpoint = checkpoint
+        self._is_cancelled = False
 
-        # connect your own callbacks
-        self._threshold_slider.changed.connect(self._threshold_im)
-        self._invert_checkbox.changed.connect(self._threshold_im)
+    def cancel(self):
+        self._is_cancelled = True
 
-        # append into/extend the container with your widgets
-        self.extend(
+    def run(self):
+        try:
+            if self.mode == 0:  # manual threshold
+                self.progress.emit(0, 'Applying threshold...')
+                if self._is_cancelled:
+                    self.cancelled.emit()
+                    return
+                # Use the existing _threshold_segmentation logic
+                labels = self._threshold_segmentation(
+                    self.image_data, self.threshold
+                )
+                self.progress.emit(100, 'Segmentation completed.')
+                self.finished.emit(labels, '')
+            elif self.mode == 1:  # auto (placeholder)
+                self.progress.emit(
+                    0, 'Running auto-segmentation (not yet implemented)...'
+                )
+                # Simulate long work
+                QThread.sleep(2)
+                if self._is_cancelled:
+                    self.cancelled.emit()
+                    return
+                self.finished.emit(None, 'Auto-segmentation not implemented.')
+            else:
+                self.finished.emit(None, 'Invalid segmentation mode.')
+        except (ValueError, OSError) as e:
+            self.finished.emit(
+                None, f'Segmentation error: {e}\n{traceback.format_exc()}'
+            )
+
+    def _threshold_segmentation(self, image, thresh):
+        """
+        Perform threshold-based 3D segmentation using manual threshold.
+        Supports numpy, zarr, or dask arrays. For large zarr arrays, uses dask
+        for memory-efficient processing.
+        """
+
+        # Determine input type and convert to dask if not numpy
+        if isinstance(image, np.ndarray):
+            # For numpy, process directly with scipy (fast for in-memory data)
+            binary = image > thresh
+            labeled, _ = ndi.label(binary)
+            return labeled.astype(np.int32)
+        else:
+            # For zarr or other array-like, convert to dask array for chunked processing
+            if not isinstance(image, da.Array):
+                # Try to convert to dask, preserving chunks if possible
+                if hasattr(image, 'chunks'):
+                    image = da.from_array(image, chunks=image.chunks)
+                else:
+                    # Use auto-chunking as fallback
+                    image = da.from_array(image, chunks='auto')
+
+            # Binary threshold (dask supports elementwise comparison)
+            binary = image > thresh
+
+            # Connected components labeling using dask-image
+            labeled, num_features = dask_image.ndmeasure.label(binary)
+
+            # Convert to int32
+            labeled = labeled.astype(np.int32)
+
+            return labeled
+
+
+class StatsWorker(QObject):
+    """Worker for computing quantitative statistics in the background."""
+
+    progress = Signal(int, str)
+    finished = Signal(dict, str)  # stats dict, error message
+
+    def __init__(self, labels_data, image_data):
+        super().__init__()
+        self.labels_data = labels_data
+        self.image_data = image_data
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        try:
+            self.progress.emit(0, 'Computing label areas...')
+            if self._is_cancelled:
+                self.finished.emit({}, 'Cancelled')
+                return
+
+            # Use the existing compute_areas_dask or numpy fallback
+            if isinstance(self.labels_data, da.Array):
+                label_areas = self.compute_areas_dask(self.labels_data)
+                labels_list, areas_list = (
+                    zip(*label_areas, strict=True) if label_areas else ([], [])
+                )
+            else:
+                import numpy as np
+                from skimage.measure import regionprops
+
+                labels = np.asarray(self.labels_data)
+                props = regionprops(
+                    labels,
+                    intensity_image=np.asarray(self.image_data)
+                    if self.image_data is not None
+                    else None,
+                )
+                labels_list = [p.label for p in props]
+                areas_list = [p.area for p in props]
+
+            if self._is_cancelled:
+                self.finished.emit({}, 'Cancelled')
+                return
+
+            self.progress.emit(50, 'Computing intensity statistics...')
+            # ... compute other stats (min/max, histogram) ...
+            # For simplicity, we return the raw lists; the main thread will build the dialog.
+            stats = {
+                'labels': labels_list,
+                'areas': areas_list,
+                'num_cells': len(labels_list),
+                'max_area': max(areas_list) if areas_list else 0,
+                'min_area': min(areas_list) if areas_list else 0,
+                # intensity stats can be added here
+            }
+            self.progress.emit(100, 'Done.')
+            self.finished.emit(stats, '')
+        except (ValueError, OSError) as e:
+            self.finished.emit(
+                {}, f'Statistics error: {e}\n{traceback.format_exc()}'
+            )
+
+    def compute_areas_dask(self, labels):
+        """Return a Dask bag of (label, area) for each label > 0."""
+        # Get unique labels (excluding 0) - this is a Dask array
+        unique_labels = da.unique(labels)
+        # Filter out background (label 0)
+        unique_labels = unique_labels[unique_labels != 0]
+
+        # Define a function to count pixels of a specific label in a chunk
+        def count_label_in_chunk(block, label):
+            return np.sum(block == label)
+
+        # For each label, apply count over all chunks and sum results
+        def area_for_label(label):
+            # Apply count function to each chunk and reduce by sum
+            counts = da.map_blocks(
+                lambda block: np.array([count_label_in_chunk(block, label)]),
+                labels,
+                dtype=np.int64,
+                chunks=(1,),  # each chunk returns a scalar
+            )
+            return da.sum(counts).compute()  # compute to get scalar
+
+        # Create delayed tasks for each label
+        tasks = {
+            int(label): delayed(area_for_label)(label)
+            for label in unique_labels.compute()
+        }
+        # Compute all tasks in parallel
+        results = compute(*tasks.values())
+        # Return as list of (label, area)
+        return list(zip(tasks.keys(), results, strict=True))
+
+
+class SaveWorker(QObject):
+    """Worker for saving labels in the background."""
+
+    progress = Signal(int, str)
+    finished = Signal(str)  # success message or empty if error
+    error = Signal(str)
+
+    def __init__(self, labels_data, save_dir, save_format, renumber):
+        super().__init__()
+        self.labels_data = labels_data
+        self.save_dir = save_dir
+        self.save_format = save_format  # 'TIFF' or 'Zarr'
+        self.renumber = renumber
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        try:
+            self.progress.emit(0, 'Preparing data...')
+            if self.renumber:
+                # Renumbering (needs to be done in worker)
+                data = self._renumber_labels(self.labels_data)
+            else:
+                data = self.labels_data
+
+            if self._is_cancelled:
+                self.finished.emit('')
+                return
+
+            os.makedirs(self.save_dir, exist_ok=True)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            base = os.path.join(self.save_dir, f'labels_{timestamp}')
+
+            if self.save_format.startswith('TIFF'):
+                self.progress.emit(30, 'Saving as TIFF...')
+                filename = base + '.tif'
+                if isinstance(data, da.Array):
+                    data = data.compute()
+                with tifffile.TiffWriter(filename, bigtiff=True) as tif:
+                    tif.write(
+                        data, photometric='minisblack', compression='zlib'
+                    )
+                self.progress.emit(100, 'TIFF saved.')
+                self.finished.emit(f'Saved TIFF to {filename}')
+            else:  # Zarr
+                self.progress.emit(30, 'Saving as Zarr...')
+                store_path = base + '.zarr'
+                if isinstance(data, da.Array):
+                    data.to_zarr(store_path, compute=True)
+                elif isinstance(data, zarr.Array):
+                    dest_store = zarr.DirectoryStore(store_path)
+                    copy_store(data.store, dest_store)
+                elif isinstance(data, np.ndarray):
+                    da.from_array(data, chunks='auto').to_zarr(
+                        store_path, compute=True
+                    )
+                else:
+                    raise TypeError(
+                        f'Unsupported data type for Zarr: {type(data)}'
+                    )
+                self.progress.emit(100, 'Zarr saved.')
+                self.finished.emit(f'Saved Zarr to {store_path}')
+        except (ValueError, OSError) as e:
+            self.error.emit(f'Save error: {e}\n{traceback.format_exc()}')
+
+    def _renumber_labels(self, data):
+        """
+        Renumber labels in the given data to consecutive integers starting from 1.
+        Returns a new array (numpy, dask, or zarr) with renumbered labels.
+        """
+        # If data is a dask array, we can compute unique labels in a lazy way
+        if isinstance(data, da.Array):
+            # Get unique labels (excluding 0) using dask
+            unique_labels = da.unique(data)
+            # Filter out background (0) – note: unique_labels is a dask array
+            # We need to compute it to build the mapping, but this may be heavy for large data.
+            # For large data, renumbering is not trivial without loading all labels.
+            # Here we compute unique labels; for very large arrays this might still be slow.
+            unique_labels = unique_labels[unique_labels != 0].compute()
+            if len(unique_labels) == 0:
+                return data  # nothing to renumber
+
+            # Build mapping old -> new (1..N)
+            mapping = {
+                old: i + 1 for i, old in enumerate(sorted(unique_labels))
+            }
+
+            # Apply mapping: we need a function to remap each chunk
+            def remap_chunk(block):
+                # block is a numpy array chunk
+                new_block = np.zeros_like(block)
+                for old, new in mapping.items():
+                    new_block[block == old] = new
+                return new_block
+
+            # Use map_blocks to apply remapping chunkwise
+            new_data = data.map_blocks(remap_chunk, dtype=data.dtype)
+            return new_data
+
+        else:  # numpy array (or other in-memory)
+            # Convert to numpy if not already
+            if not isinstance(data, np.ndarray):
+                data = np.asarray(data)
+            unique_labels = np.unique(data)
+            unique_labels = unique_labels[unique_labels != 0]
+            if len(unique_labels) == 0:
+                return data
+
+            mapping = {
+                old: i + 1 for i, old in enumerate(sorted(unique_labels))
+            }
+            new_data = np.zeros_like(data)
+            for old, new in mapping.items():
+                new_data[data == old] = new
+            return new_data
+
+
+# ---------- Segmentation Widget ----------
+class SegmentationWidget(QWidget):
+    """Widget for 3D/4D cell segmentation and manual label adjustment."""
+
+    def __init__(self, napari_viewer):
+        super().__init__()
+        self.viewer = napari_viewer
+        self.setLayout(QVBoxLayout())
+        self._roi_layer = None  # Temporary ROI shapes/labels layer
+        self._roi_brush_size = (
+            2  # Default brush size for ROI brush mode (changed to 2)
+        )
+        self._current_roi_mode = None  # 'add' or 'subtract'
+        self._roi_brush_layer = None  # Temporary labels layer for brush ROI
+        self._roi_target_label = (
+            None  # Target label for the current ROI operation
+        )
+        self._new_label_mode_active = (
+            False  # No longer used, kept for compatibility (can be removed)
+        )
+        self._new_label_target = (
+            None  # stores the new label ID during that mode
+        )
+        self._pick_mode_active = False  # Toggle state for pick mode
+        self._delete_inside_mode_active = False
+
+        self._init_ui()
+        self._install_delete_shortcut()
+        self.setMaximumWidth(300)
+
+    def _init_ui(self):
+        """Initialize UI components for segmentation."""
+
+        # ---------- Segmentation controls ----------
+        title_seg = QLabel('<b>---------------Segmentation---------------</b>')
+        title_seg.setAlignment(Qt.AlignCenter)
+        self.layout().addWidget(title_seg)
+
+        # Mode selection combo box
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel('Mode:'))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(
             [
-                self._image_layer_combo,
-                self._threshold_slider,
-                self._invert_checkbox,
+                'Use manual threshold',
+                'Auto-segmentation',
+                'Load existing segmentation',
             ]
         )
+        self.mode_combo.currentIndexChanged.connect(
+            self._on_segmentation_mode_changed
+        )
+        mode_layout.addWidget(self.mode_combo)
+        self.layout().addLayout(mode_layout)
 
-    def _threshold_im(self):
-        image_layer = self._image_layer_combo.value
-        if image_layer is None:
+        # Stacked widget for mode-specific controls
+        self.seg_stack = QStackedWidget()
+        self.seg_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.layout().addWidget(self.seg_stack)
+
+        # --- Manual threshold mode container ---
+        manual_widget = QWidget()
+        manual_layout = QHBoxLayout(manual_widget)
+        manual_layout.addWidget(QLabel('Threshold:'))
+        self.thresh_spin = QDoubleSpinBox()
+        self.thresh_spin.setRange(0.0, 65535.0)
+        self.thresh_spin.setSingleStep(1)
+        self.thresh_spin.setValue(100)
+        manual_layout.addWidget(self.thresh_spin)
+        self.seg_stack.addWidget(manual_widget)
+
+        # --- Auto-segmentation mode container ---
+        auto_widget = QWidget()
+        auto_layout = QHBoxLayout(auto_widget)
+        auto_layout.addWidget(QLabel('Checkpoint:'))
+        self.checkpoint_edit = QLineEdit()
+        self.checkpoint_edit.setPlaceholderText('Select checkpoint file...')
+        auto_layout.addWidget(self.checkpoint_edit)
+        self.btn_browse_checkpoint = QPushButton('Browse')
+        self.btn_browse_checkpoint.clicked.connect(self._browse_checkpoint)
+        auto_layout.addWidget(self.btn_browse_checkpoint)
+        self.seg_stack.addWidget(auto_widget)
+
+        # --- Load existing segmentation mode container ---
+        load_widget = QWidget()
+        load_layout = QHBoxLayout(load_widget)
+        self.btn_show_seg = QPushButton('Load from TIFF')
+        self.btn_show_seg.clicked.connect(self._show_segmentation_tif)
+        load_layout.addWidget(self.btn_show_seg)
+        self.btn_load_zarr = QPushButton('Load from Zarr')
+        self.btn_load_zarr.clicked.connect(self._load_zarr_folder)
+        load_layout.addWidget(self.btn_load_zarr)
+        self.seg_stack.addWidget(load_widget)
+
+        # Run button
+        self.btn_seg_3d = QPushButton('Run 3D Segmentation')
+        self.btn_seg_3d.clicked.connect(self._segment_3d)
+        self.layout().addWidget(self.btn_seg_3d)
+
+        # --- Manual adjustment controls ---
+        self.layout().addWidget(QLabel(''))
+        title_seg = QLabel('<b>-------------Manual Curation-------------</b>')
+        title_seg.setAlignment(Qt.AlignCenter)  # <-- add this
+        self.layout().addWidget(title_seg)
+
+        # Pick mode toggle button (new)
+        self.btn_pick_mode = QPushButton('Enter Curation Mode')
+        self.btn_pick_mode.clicked.connect(self._toggle_pick_mode)
+        self.layout().addWidget(self.btn_pick_mode)
+
+        # ROI mode selection
+        # ROI drawing mode selection (polygon vs brush)
+        roi_draw_layout = QHBoxLayout()
+        roi_draw_layout.addWidget(QLabel('Draw Mode:'))
+        self.roi_polygon_radio = QRadioButton('Polygon')
+        self.roi_polygon_radio.setChecked(True)
+        self.roi_brush_radio = QRadioButton('Brush')
+        roi_draw_layout.addWidget(self.roi_polygon_radio)
+        roi_draw_layout.addWidget(self.roi_brush_radio)
+        self.layout().addLayout(roi_draw_layout)
+
+        # Connect radio buttons to control brush size visibility
+        self.roi_polygon_radio.toggled.connect(self._on_roi_draw_mode_changed)
+        self.roi_brush_radio.toggled.connect(self._on_roi_draw_mode_changed)
+
+        # Brush size for ROI brush mode (initially hidden)
+        self.brush_size_widget = QWidget()
+        brush_size_layout = QHBoxLayout(self.brush_size_widget)
+        brush_size_layout.addWidget(QLabel('Brush Size:'))
+        self.roi_brush_spin = QSpinBox()
+        self.roi_brush_spin.setRange(1, 100)
+        self.roi_brush_spin.setValue(self._roi_brush_size)  # default 2
+        self.roi_brush_spin.valueChanged.connect(
+            self._on_roi_brush_size_changed
+        )
+        brush_size_layout.addWidget(self.roi_brush_spin)
+        self.brush_size_widget.setVisible(False)  # hidden initially
+        self.layout().addWidget(self.brush_size_widget)
+
+        roi_mode_layout = QHBoxLayout()
+        self.btn_roi_add = QPushButton('Add to Label')
+        self.btn_roi_add.clicked.connect(lambda: self._enter_roi_mode('add'))
+        roi_mode_layout.addWidget(self.btn_roi_add)
+
+        self.btn_roi_subtract = QPushButton('Subtract from Label')
+        self.btn_roi_subtract.clicked.connect(
+            lambda: self._enter_roi_mode('subtract')
+        )
+        roi_mode_layout.addWidget(self.btn_roi_subtract)
+        self.layout().addLayout(roi_mode_layout)
+
+        # Add new label and change label buttons (horizontal layout for alignment)
+        new_label_layout = (
+            QHBoxLayout()
+        )  # Create horizontal layout for two buttons
+
+        # Add New Label button (existing)
+        self.btn_add_new_label = QPushButton('Add New Label')
+        self.btn_add_new_label.clicked.connect(self._add_new_label)
+        new_label_layout.addWidget(self.btn_add_new_label)
+
+        # Add Change Label button (new)
+        self.btn_change_label = QPushButton('Change Label')
+        self.btn_change_label.clicked.connect(
+            self._change_selected_label_id
+        )  # Connect to new method
+        new_label_layout.addWidget(self.btn_change_label)
+
+        self.layout().addLayout(
+            new_label_layout
+        )  # Add horizontal layout to main layout
+
+        # Apply/Cancel buttons for ROI (initially disabled)
+        roi_apply_layout = QHBoxLayout()
+        self.btn_apply_roi = QPushButton('Apply ROI')
+        self.btn_apply_roi.setShortcut('Ctrl+A')
+        self.btn_apply_roi.clicked.connect(self._apply_roi)
+        self.btn_apply_roi.setEnabled(False)
+        roi_apply_layout.addWidget(self.btn_apply_roi)
+
+        self.btn_cancel_roi = QPushButton('Cancel ROI')
+        self.btn_cancel_roi.clicked.connect(self._cancel_roi)
+        self.btn_cancel_roi.setEnabled(False)
+        roi_apply_layout.addWidget(self.btn_cancel_roi)
+        self.layout().addLayout(roi_apply_layout)
+
+        # Delete buttons
+        delete_layout = QHBoxLayout()
+        self.btn_delete_slice = QPushButton('Delete Current Z')
+        self.btn_delete_slice.setShortcut('Delete')
+        self.btn_delete_slice.clicked.connect(
+            self._delete_selected_label_slice
+        )
+        delete_layout.addWidget(self.btn_delete_slice)
+
+        self.btn_delete_all = QPushButton('Delete All Z')
+        self.btn_delete_all.clicked.connect(self._delete_selected_label_all)
+        delete_layout.addWidget(self.btn_delete_all)
+        self.layout().addLayout(delete_layout)
+
+        delete_inside_layout = QHBoxLayout()
+        self.btn_delete_inside = QPushButton('Delete Inside ROI (All Z)')
+        self.btn_delete_inside.clicked.connect(
+            self._enter_delete_inside_roi_mode
+        )
+        delete_inside_layout.addWidget(self.btn_delete_inside)
+        self.layout().addLayout(delete_inside_layout)
+
+        # --- Advanced ---
+        self.layout().addWidget(QLabel(''))
+        title_seg = QLabel(
+            '<b>----------------- Advanced -----------------</b>'
+        )
+        title_seg.setAlignment(Qt.AlignCenter)  # <-- add this
+        self.layout().addWidget(title_seg)
+
+        self.btn_finetune = QPushButton('Finetune with Current Labels')
+        self.btn_finetune.clicked.connect(self._finetune_network)
+        self.layout().addWidget(self.btn_finetune)
+
+        self.btn_localfinetune = QPushButton('Re-segmented Local Area')
+        self.btn_localfinetune.clicked.connect(self._local_finetune)
+        self.layout().addWidget(self.btn_localfinetune)
+
+        # Add Quantitative Statistics button
+        self.btn_stats = QPushButton('Quantitative Statistics')
+        self.btn_stats.clicked.connect(self._show_quantitative_stats)
+        self.layout().addWidget(self.btn_stats)
+
+        # Save directory selector
+        self.layout().addWidget(QLabel(''))
+        title_seg = QLabel('<b>-------------------Save-------------------</b>')
+        title_seg.setAlignment(Qt.AlignCenter)
+        self.layout().addWidget(title_seg)
+
+        # Directory selection
+        path_layout = QHBoxLayout()
+        self.path_edit = QLineEdit()
+        self.path_edit.setText(
+            os.path.join(os.getcwd(), 'segmentation_results')
+        )
+        path_layout.addWidget(self.path_edit)
+        self.btn_browse = QPushButton('Browse')
+        self.btn_browse.clicked.connect(self._browse_folder)
+        path_layout.addWidget(self.btn_browse)
+        self.layout().addLayout(path_layout)
+
+        # --- Add format selection combo box here ---
+        format_layout = QHBoxLayout()
+        format_layout.addWidget(QLabel('Save format:'))
+        self.save_format_combo = QComboBox()
+        self.save_format_combo.addItems(
+            ['TIFF', 'Zarr (recommended for big images)']
+        )
+        format_layout.addWidget(self.save_format_combo)
+        self.layout().addLayout(format_layout)
+
+        # Save button and renumber checkbox
+        save_layout = QHBoxLayout()
+        self.chk_renumber = QCheckBox('Update Labels')
+        self.chk_renumber.setChecked(True)  # default checked
+        save_layout.addWidget(self.chk_renumber)
+
+        self.btn_save = QPushButton('Save')
+        self.btn_save.clicked.connect(self._save_current_labels)
+        save_layout.addWidget(self.btn_save)
+
+        self.layout().addLayout(save_layout)
+        # Initialise control states
+        self._update_curation_controls()
+
+    def _update_curation_controls(self):
+        """
+        Enable/disable curation-related widgets based on whether curation mode is active.
+        Also respects the current ROI/new-label mode.
+        """
+        # curation mode must be active to use any curation tool
+        curation_active = self._pick_mode_active
+        in_session = (
+            self._current_roi_mode is not None
+            or self._new_label_mode_active
+            or self._delete_inside_mode_active
+        )
+        # Buttons that are always disabled when curation mode is off
+        self.btn_roi_add.setEnabled(curation_active)
+        self.btn_roi_subtract.setEnabled(curation_active)
+        self.btn_add_new_label.setEnabled(curation_active)
+        self.btn_delete_slice.setEnabled(curation_active)
+        self.btn_delete_all.setEnabled(curation_active)
+        self.btn_change_label.setEnabled(curation_active)
+        self.btn_delete_inside.setEnabled(curation_active and not in_session)
+        # Apply/Cancel are only enabled during an active ROI or new-label session,
+        # and only if curation mode is active
+        if curation_active and in_session:
+            # They will be enabled/disabled by the ROI/new-label entry/exit methods
+            # (their state is managed separately, so we don't override here)
+            pass
+        else:
+            self.btn_apply_roi.setEnabled(False)
+            self.btn_cancel_roi.setEnabled(False)
+
+        # Draw mode radio buttons are only enabled if no ROI/new-label session is active
+        # and curation mode is active
+
+        self.roi_polygon_radio.setEnabled(curation_active and not in_session)
+        self.roi_brush_radio.setEnabled(curation_active and not in_session)
+
+        # Brush size widget is only visible when brush mode is selected and curation active
+        if curation_active:
+            self._on_roi_draw_mode_changed()  # this handles visibility of brush_size_widget
+        else:
+            self.brush_size_widget.setVisible(False)
+
+    def _on_roi_draw_mode_changed(self):
+        """Show brush size widget only when brush mode is selected."""
+        if self._new_label_mode_active:
+            # Optionally ignore changes or warn the user
+            return
+        use_brush = self.roi_brush_radio.isChecked()
+        self.brush_size_widget.setVisible(use_brush)
+
+    def _on_roi_brush_size_changed(self, value):
+        self._roi_brush_size = value
+        if self._roi_brush_layer is not None:
+            self._roi_brush_layer.brush_size = value
+
+    def _install_delete_shortcut(self):
+        """Install a global Delete key shortcut using an event filter."""
+        self.viewer.window._qt_window.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        """Handle Delete key press globally."""
+        from qtpy.QtCore import QEvent
+        from qtpy.QtGui import QKeySequence
+
+        if event.type() == QEvent.KeyPress and event.matches(
+            QKeySequence.Delete
+        ):
+            # Delete on current slice by default
+            self._delete_selected_label_slice()
+            return True
+        return super().eventFilter(obj, event)
+
+    # ---------- Helper methods ----------
+    def _browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, 'Select Save Directory'
+        )
+        if folder:
+            self.path_edit.setText(folder)
+
+    def _change_selected_label_id(self):
+        """
+        Change ID of selected label on current Z slice only.
+        1. Get selected label from labels layer
+        2. Show input dialog for new ID
+        3. Replace old ID with new ID on current slice
+        """
+        # Get active labels layer (reuse existing method)
+        labels_layer = self._get_labels_layer()
+        if labels_layer is None:
+            notifications.show_warning('No labels layer found!')
             return
 
-        image = img_as_float(image_layer.data)
-        name = image_layer.name + '_thresholded'
-        threshold = self._threshold_slider.value
-        if self._invert_checkbox.value:
-            thresholded = image < threshold
+        # Get current selected label (source ID) - skip background (0)
+        source_label = labels_layer.selected_label
+        if source_label == 0:
+            notifications.show_warning('Cannot modify background label (0)!')
+            return
+
+        # Get current Z slice index (Z is first axis in 3D data)
+        current_z = self.viewer.dims.current_step[0]
+
+        # Show input dialog for new label ID
+        from qtpy.QtWidgets import QInputDialog
+
+        new_label, ok = QInputDialog.getInt(
+            self,
+            'Change Label ID',
+            f'Current selected label: {source_label}\nCurrent slice: {current_z}\nEnter new label ID:',
+            min=1,  # New ID can't be background (0)
+            max=65535,  # Max value for uint16 (common label dtype)
+            value=source_label + 1,  # Default to next available ID
+        )
+
+        # Exit if user cancels dialog
+        if not ok:
+            return
+
+        # Skip if new ID is same as original
+        if new_label == source_label:
+            notifications.show_info(
+                f'New ID ({new_label}) matches original - no changes made.'
+            )
+            return
+
+        # Get current slice data (supports numpy/zarr arrays)
+        slice_data = labels_layer.data[current_z]
+
+        # Validate data type and replace label IDs
+        if isinstance(slice_data, np.ndarray):
+            # Create mask for pixels with source label
+            mask = slice_data == source_label
+
+            # Check if source label exists on current slice
+            if not np.any(mask):
+                notifications.show_info(
+                    f'Label {source_label} not found on slice {current_z}!'
+                )
+                return
+
+            # Replace source label with new ID
+            slice_data[mask] = new_label
+
+            # Update the slice in labels layer (critical for zarr compatibility)
+            labels_layer.data[current_z] = slice_data
+            labels_layer.refresh()  # Refresh viewer display
+
+            notifications.show_info(
+                f'Success! Label {source_label} → {new_label} (slice {current_z}).'
+            )
         else:
-            thresholded = image > threshold
-        if name in self._viewer.layers:
-            self._viewer.layers[name].data = thresholded
+            notifications.show_error(
+                f'Unsupported data type: {type(slice_data)} (only numpy/zarr supported).'
+            )
+
+    def _save_current_labels(self):
+        """Save labels in background."""
+        labels_layer = self._get_labels_layer()
+        if labels_layer is None:
+            return
+
+        data = labels_layer.data
+        renumber = self.chk_renumber.isChecked()
+        save_format = self.save_format_combo.currentText()
+        save_dir = self.path_edit.text()
+
+        # Progress dialog
+        self.save_progress = QProgressDialog(
+            'Saving...', 'Cancel', 0, 100, self
+        )
+        self.save_progress.setWindowTitle('Save Progress')
+        self.save_progress.setAutoClose(True)
+        self.save_progress.show()
+
+        # Worker
+        self.save_thread = QThread()
+        self.save_worker = SaveWorker(data, save_dir, save_format, renumber)
+        self.save_worker.moveToThread(self.save_thread)
+
+        self.save_worker.progress.connect(
+            lambda val, msg: self.save_progress.setLabelText(msg)
+        )
+        self.save_worker.progress.connect(
+            lambda val, msg: self.save_progress.setValue(val)
+        )
+        self.save_worker.finished.connect(self._on_save_finished)
+        self.save_worker.error.connect(self._on_save_error)
+        self.save_progress.canceled.connect(self.save_worker.cancel)
+        self.save_progress.canceled.connect(self.save_thread.quit)
+        self.save_thread.started.connect(self.save_worker.run)
+        self.save_worker.finished.connect(self.save_thread.quit)
+        self.save_worker.finished.connect(self.save_worker.deleteLater)
+        self.save_thread.finished.connect(self.save_thread.deleteLater)
+
+        self.save_thread.start()
+
+    def _on_save_finished(self, message):
+        self.save_progress.close()
+        if message:
+            notifications.show_info(message)
+
+    def _on_save_error(self, error_msg):
+        self.save_progress.close()
+        notifications.show_error(error_msg)
+
+    def _get_active_image(self):
+        layer = self.viewer.layers.selection.active
+        if isinstance(layer, Image):
+            return layer
+        notifications.show_error('Please select an image layer.')
+        return None
+
+    def _get_labels_layer(self):
+        for layer in self.viewer.layers:
+            if isinstance(layer, Labels):
+                return layer
+        notifications.show_error('No Labels layer found.')
+        return None
+
+    def _save_labels(self, labels: np.ndarray, base_filename: str):
+        save_dir = self.path_edit.text()
+        os.makedirs(save_dir, exist_ok=True)
+        filepath = os.path.join(save_dir, base_filename)
+        io.imsave(filepath, labels.astype(np.uint16))
+        notifications.show_info(f'Saved to {filepath}')
+
+    def _on_segmentation_mode_changed(self, index):
+        """Handle segmentation mode combo box changes."""
+        self.seg_stack.setCurrentIndex(index)
+        # Disable Run button in Load mode (index 2), enable otherwise
+        self.btn_seg_3d.setEnabled(index != 2)
+
+    def _browse_checkpoint(self):
+        """Open file dialog to select a checkpoint file."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            'Select Checkpoint File',
+            '',
+            'Checkpoint files (*.pth *.pt *.ckpt);;All files (*)',
+        )
+        if file_path:
+            self.checkpoint_edit.setText(file_path)
+
+    # ---------- Segmentation actions ----------
+    def _segment_3d(self):
+        """Run segmentation based on the selected mode (now in background)."""
+        active = self._get_active_image()
+        if active is None:
+            return
+        data = active.data
+        if data.ndim != 3:
+            notifications.show_error('Image must be 3D (Z, Y, X).')
+            return
+
+        mode = self.mode_combo.currentIndex()
+        if mode == 0:  # Manual threshold
+            thresh = self.thresh_spin.value()
+            checkpoint = None
+        elif mode == 1:  # Auto-segmentation
+            checkpoint = self.checkpoint_edit.text().strip()
+            if not checkpoint:
+                notifications.show_error('Please select a checkpoint file.')
+                return
+            thresh = None
         else:
-            self._viewer.add_labels(thresholded, name=name)
+            return  # Load mode should be disabled
+
+        # Create progress dialog
+        self.progress_dialog = QProgressDialog(
+            'Starting segmentation...', 'Cancel', 0, 100, self
+        )
+        self.progress_dialog.setWindowTitle('Segmentation Progress')
+        self.progress_dialog.setAutoClose(True)
+        self.progress_dialog.setAutoReset(True)
+        self.progress_dialog.show()
+
+        # Create worker and thread
+        self.seg_thread = QThread()
+        self.seg_worker = SegmentationWorker(
+            data, mode, threshold=thresh, checkpoint=checkpoint
+        )
+        self.seg_worker.moveToThread(self.seg_thread)
+
+        # Connect signals
+        self.seg_worker.progress.connect(
+            lambda val, msg: self.progress_dialog.setLabelText(msg)
+        )
+        self.seg_worker.progress.connect(
+            lambda val, msg: self.progress_dialog.setValue(val)
+        )
+        self.seg_worker.finished.connect(self._on_segmentation_finished)
+        self.seg_worker.cancelled.connect(self._on_segmentation_cancelled)
+        self.progress_dialog.canceled.connect(self.seg_worker.cancel)
+        self.progress_dialog.canceled.connect(self.seg_thread.quit)
+        self.seg_thread.started.connect(self.seg_worker.run)
+        self.seg_worker.finished.connect(self.seg_thread.quit)
+        self.seg_worker.finished.connect(self.seg_worker.deleteLater)
+        self.seg_thread.finished.connect(self.seg_thread.deleteLater)
+
+        self.seg_thread.start()
+
+    def _on_segmentation_finished(self, result, error_msg):
+        """Handle completion of segmentation."""
+        self.progress_dialog.close()
+        if error_msg:
+            notifications.show_error(error_msg)
+        elif result is not None:
+            # result is the labels array
+            if (
+                isinstance(result, np.ndarray) and result.nbytes > 100e6
+            ):  # >100 MB
+                result = da.from_array(result, chunks='auto')
+            active = self._get_active_image()
+            name = active.name if active else 'seg'
+            self.viewer.add_labels(result, name=f'{name}_seg')
+            notifications.show_info('Segmentation completed.')
+        else:
+            notifications.show_warning('Segmentation returned no result.')
+
+    def _on_segmentation_cancelled(self):
+        self.progress_dialog.close()
+        notifications.show_info('Segmentation cancelled.')
+
+    def _auto_segment_3d(self, image, checkpoint_path):
+        """Placeholder for auto-segmentation using a trained model."""
+        # TODO: Implement actual auto-segmentation logic
+        notifications.show_info(
+            f'Auto-segmentation with checkpoint {checkpoint_path} not yet implemented.'
+        )
+
+    def _show_segmentation_tif(self):
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            'Select Segmentation File',
+            self.path_edit.text(),
+            'Supported files (*.tif *.tiff *.zarr)',
+        )
+        if filepath:
+            if filepath.endswith('.zarr'):
+                data = da.from_zarr(filepath)
+                self.viewer.add_labels(data, name=os.path.basename(filepath))
+            else:
+                labels = io.imread(filepath)
+                self.viewer.add_labels(labels, name=os.path.basename(filepath))
+
+    def _load_zarr_folder(self):
+        """Open a directory dialog to select a Zarr folder and load it."""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            'Select Segmentation File',
+            self.path_edit.text(),
+            QFileDialog.ShowDirsOnly,
+        )
+        if folder:
+            try:
+                # data = da.from_zarr(folder)
+                if os.access(folder, os.W_OK):
+                    data = zarr.open(folder, mode='r+')
+                else:
+                    data = zarr.open(folder, mode='r')
+                    notifications.show_warning(
+                        'Zarr is read-only. Modifications may not be saved.'
+                    )
+                self.viewer.add_labels(data, name=os.path.basename(folder))
+                notifications.show_info(f'Loaded Zarr from {folder}')
+            except (ValueError, OSError) as e:
+                notifications.show_error(f'Failed to load Zarr: {e}')
+
+    # ---------- Manual adjustment with undo support ----------
+    def _modify_labels(self, labels_layer, new_data):
+        """
+        Update the labels layer with new data and refresh.
+        """
+        labels_layer.data = new_data
+        labels_layer.refresh()
+
+    def _delete_selected_label_slice(self):
+        """Delete the currently selected label on the current Z slice only."""
+        labels_layer = self._get_labels_layer()
+        if labels_layer is None:
+            return
+        label_val = labels_layer.selected_label
+        if label_val == 0:
+            notifications.show_warning('Cannot delete background (label 0).')
+            return
+        # Assume Z is the first axis
+        z_idx = self.viewer.dims.current_step[0]
+        slice_data = labels_layer.data[z_idx]
+        mask = slice_data == label_val
+        if np.any(mask):
+            slice_data[mask] = 0
+            labels_layer.data[z_idx] = slice_data  # for zarr
+            labels_layer.refresh()
+            notifications.show_info(
+                f'Label {label_val} deleted on slice {z_idx}.'
+            )
+        else:
+            notifications.show_info(
+                f'Label {label_val} not found on this slice.'
+            )
+
+    def _delete_selected_label_all(self):
+        """Delete the currently selected label on all Z slices."""
+        labels_layer = self._get_labels_layer()
+        if labels_layer is None:
+            return
+        label_val = labels_layer.selected_label
+        if label_val == 0:
+            notifications.show_warning('Cannot delete background (label 0).')
+            return
+
+        data = labels_layer.data
+
+        # Check data type and apply appropriate deletion method
+        if isinstance(data, np.ndarray):
+            # For numpy arrays, use efficient boolean indexing
+            mask = data == label_val
+            if np.any(mask):
+                data[mask] = 0
+                labels_layer.refresh()
+                notifications.show_info(
+                    f'Label {label_val} deleted on all slices.'
+                )
+            else:
+                notifications.show_info(
+                    f'Label {label_val} not found in volume.'
+                )
+
+        elif isinstance(data, zarr.Array):
+            # For zarr arrays, process chunk by chunk to avoid loading the whole array
+            import itertools
+
+            found = False
+            # Iterate over all chunks in the zarr array
+            for chunk_coords in itertools.product(
+                *[range(dim) for dim in data.cdata_shape]
+            ):
+                chunk_selection = tuple(
+                    slice(
+                        chunk_idx * data.chunks[i],
+                        min((chunk_idx + 1) * data.chunks[i], data.shape[i]),
+                    )
+                    for i, chunk_idx in enumerate(chunk_coords)
+                )
+                # Read the chunk data as a numpy array (this loads only that chunk)
+                chunk_data = data[chunk_selection]
+                # Create mask for the target label within this chunk
+                chunk_mask = chunk_data == label_val
+                if np.any(chunk_mask):
+                    found = True
+                    # Modify the chunk data and write back to the zarr array
+                    chunk_data[chunk_mask] = 0
+                    data[chunk_selection] = chunk_data
+            # After processing all chunks, refresh and notify
+            if found:
+                labels_layer.refresh()
+                notifications.show_info(
+                    f'Label {label_val} deleted on all slices.'
+                )
+            else:
+                notifications.show_info(
+                    f'Label {label_val} not found in volume.'
+                )
+        else:
+            # Unsupported data type
+            notifications.show_error(
+                f'Unsupported data type for deletion: {type(data)}'
+            )
+
+    # ---------- Pick mode toggle ----------
+    def _toggle_pick_mode(self):
+        """Toggle the labels layer between 'pick' mode and normal view."""
+        labels_layer = self._get_labels_layer()
+        if labels_layer is None:
+            return
+
+        if self._pick_mode_active:
+            # Currently in pick mode, switch to pan_zoom (or previous mode)
+            labels_layer.mode = 'pan_zoom'
+            self.btn_pick_mode.setText('Enter Curation Mode')
+            self._pick_mode_active = False
+            notifications.show_info('Curation mode deactivated.')
+        else:
+            # Enter pick mode
+            labels_layer.mode = 'pick'
+            self.btn_pick_mode.setText('Exit Curation Mode')
+            self._pick_mode_active = True
+            notifications.show_info(
+                'Curation mode activated. Click on a label to select it.'
+            )
+        # Update enable/disable state of all curation controls
+        self._update_curation_controls()
+
+    # ---------- ROI drawing and application ----------
+    def _enter_roi_mode(self, mode: str, target_label=None):
+        """
+        Enter ROI drawing mode for adding or subtracting.
+
+        Parameters
+        ----------
+        mode : 'add' or 'subtract'
+        target_label : int, optional
+            The label that will be modified. If not provided, the currently
+            selected label in the labels layer is used.
+        """
+        # Check if a labels layer exists
+        labels_layer = self._get_labels_layer()
+        if labels_layer is None:
+            return
+
+        # Determine the target label
+        if target_label is None:
+            self._roi_target_label = None
+            if labels_layer.selected_label == 0:
+                notifications.show_warning(
+                    'Please select a non-background label first.'
+                )
+                return
+        else:
+            # Ensure target_label is not background
+            if target_label == 0:
+                notifications.show_error('Target label cannot be background.')
+                return
+            # Store target label for use in _apply_roi
+            self._roi_target_label = target_label
+
+        # Remove any existing ROI layer
+        self._cancel_roi()
+
+        # Determine drawing mode and show/hide brush size accordingly
+        if self.roi_polygon_radio.isChecked():
+            # Polygon mode: use shapes layer
+            self._roi_layer = self.viewer.add_shapes(
+                name='ROI (draw area)',
+                shape_type='polygon',
+                edge_color='red',
+                face_color='transparent',
+                opacity=0.8,
+            )
+            self.viewer.layers.selection.active = self._roi_layer
+            self._roi_layer.mode = 'add_polygon'
+        else:
+            # Brush mode: use temporary labels layer
+            self._roi_brush_layer = self.viewer.add_labels(
+                np.zeros(labels_layer.data.shape, dtype=np.uint8),
+                name='ROI Brush (draw here)',
+                opacity=0.5,
+            )
+            self._roi_brush_layer.colormap = {1: 'white'}
+            self._roi_brush_layer.brush_size = self._roi_brush_size
+            self._roi_brush_layer.mode = 'paint'
+            self._roi_brush_layer.selected_label = 1
+            self.viewer.layers.selection.active = self._roi_brush_layer
+
+        self._current_roi_mode = mode
+        self.btn_apply_roi.setEnabled(True)
+        self.btn_cancel_roi.setEnabled(True)
+        self.btn_roi_add.setEnabled(False)
+        self.btn_roi_subtract.setEnabled(False)
+        self.btn_add_new_label.setEnabled(False)
+        self.btn_delete_slice.setEnabled(False)
+        self.btn_delete_all.setEnabled(False)
+        # Also disable draw mode radios (cannot switch during session)
+        self.roi_polygon_radio.setEnabled(False)
+        self.roi_brush_radio.setEnabled(False)
+        mode_str = 'ADD to' if mode == 'add' else 'SUBTRACT from'
+        notifications.show_info(
+            f"{mode_str} label {self._roi_target_label}. Draw. Click 'Apply' to execute, 'Cancel' to abort."
+        )
+
+    def _apply_roi(self):
+        """Apply all drawn ROI to modify the target label according to current mode."""
+        if self._new_label_mode_active:
+            self._apply_new_label()
+            return
+
+        if self._delete_inside_mode_active:
+            self._apply_delete_inside()
+            return
+
+        labels_layer = self._get_labels_layer()
+        if labels_layer is None:
+            self._cancel_roi()
+            return
+
+        if self._roi_target_label is None:
+            target_label = labels_layer.selected_label
+            if target_label == 0:
+                notifications.show_error('No valid target label selected.')
+                self._cancel_roi()
+                return
+        else:
+            target_label = self._roi_target_label
+
+        if target_label is None:
+            notifications.show_error('No target label set. Cancelling.')
+            self._cancel_roi()
+            return
+
+        # Get current slice index (assume Z is first axis)
+        z_idx = self.viewer.dims.current_step[0]
+        # data = labels_layer.data.copy()
+        # if data.ndim != 3:
+        #     notifications.show_error("Labels layer is not 3D.")
+        #     self._cancel_roi()
+        #     return
+
+        # Get ROI mask for current slice
+        use_polygon = self.roi_polygon_radio.isChecked()
+        if use_polygon:
+            if (
+                self._roi_layer is None
+                or self._roi_layer not in self.viewer.layers
+            ):
+                notifications.show_error('No ROI layer found.')
+                self._cancel_roi()
+                return
+            shapes_data = self._roi_layer.data
+            if len(shapes_data) == 0:
+                notifications.show_warning('No polygons drawn.')
+                self._cancel_roi()
+                return
+
+            # slice_shape = data.shape[1:3]  # (Y, X)
+            slice_shape = labels_layer.data.shape[1:3]  # (Y, X)
+            combined_mask = np.zeros(slice_shape, dtype=bool)
+            from skimage.draw import polygon as draw_polygon
+
+            for polygon in shapes_data:
+                rr, cc = draw_polygon(
+                    polygon[:, 0], polygon[:, 1], slice_shape
+                )
+                combined_mask[rr, cc] = True
+        else:
+            # Brush mode: get mask from temporary labels layer
+            if (
+                self._roi_brush_layer is None
+                or self._roi_brush_layer not in self.viewer.layers
+            ):
+                notifications.show_error('No ROI brush layer found.')
+                self._cancel_roi()
+                return
+            brush_data = self._roi_brush_layer.data
+            if brush_data.ndim == 3:
+                combined_mask = brush_data[z_idx] == 1
+            else:
+                combined_mask = brush_data == 1
+            if not np.any(combined_mask):
+                notifications.show_warning('No brush strokes drawn.')
+                self._cancel_roi()
+                return
+
+        # Apply based on mode
+        data = labels_layer.data
+        yy, xx = np.where(combined_mask)
+        if len(yy) == 0:
+            notifications.show_warning('No pixels inside ROI.')
+            self._cancel_roi(labels_layer_to_activate=labels_layer)
+            return
+        if self._current_roi_mode == 'add':
+            # Set all pixels inside ROI to target_label
+            data[z_idx, yy, xx] = target_label
+            notifications.show_info(
+                f'Added label {target_label} inside ROI(s) on slice {z_idx}.'
+            )
+        elif self._current_roi_mode == 'subtract':
+            roi_values = data[z_idx, yy, xx]
+            mask_sub = roi_values == target_label
+            if np.any(mask_sub):
+                sub_yy = yy[mask_sub]
+                sub_xx = xx[mask_sub]
+                data[z_idx, sub_yy, sub_xx] = 0
+            notifications.show_info(
+                f'Subtracted label {target_label} inside ROI(s) on slice {z_idx}.'
+            )
+        else:
+            notifications.show_error('Unknown ROI mode.')
+            self._cancel_roi()
+            return
+
+        labels_layer.refresh()
+
+        # Clean up
+        self._cancel_roi(labels_layer_to_activate=labels_layer)
+
+    def _apply_new_label(self):
+        """Apply the accumulated drawings (all slices) to create the new label."""
+        labels_layer = self._get_labels_layer()
+        if labels_layer is None:
+            self._cancel_roi()
+            return
+
+        target_label = self._new_label_target
+        if target_label is None:
+            notifications.show_error('No target label. Cancelling.')
+            self._cancel_roi()
+            return
+
+        # Obtain the 3D mask from the temporary layer
+        if self.roi_polygon_radio.isChecked():
+            # Polygons mode: iterate over all shapes, generate a mask per slice
+            if (
+                self._roi_layer is None
+                or self._roi_layer not in self.viewer.layers
+            ):
+                notifications.show_error('ROI polygon layer missing.')
+                self._cancel_roi()
+                return
+
+            shapes = self._roi_layer.data
+            if len(shapes) == 0:
+                notifications.show_warning(
+                    'No polygons drawn. Nothing to apply.'
+                )
+                self._cancel_roi()
+                return
+
+            # Prepare a dictionary: slice_index -> boolean mask (Y, X)
+            slice_masks = {}
+            from skimage.draw import polygon as draw_polygon
+
+            for shape in shapes:
+                # shape is an (N, 3) array if ndim=3 was set; columns: [z, y, x]?
+                # napari shapes data order: (y, x) or (z, y, x) depending on ndim.
+                # We'll assume (z, y, x) order when ndim=3. Adjust if necessary.
+                if shape.shape[1] == 3:
+                    z = int(
+                        np.round(shape[0, 0])
+                    )  # all vertices of a polygon share the same z
+                    poly = shape[:, 1:]  # (y, x) coordinates
+                else:
+                    # Fallback: if 2D, use the current slice (not ideal, but better than nothing)
+                    z = self.viewer.dims.current_step[0]
+                    poly = shape
+
+                rr, cc = draw_polygon(
+                    poly[:, 0], poly[:, 1], labels_layer.data.shape[1:]
+                )
+                mask = np.zeros(labels_layer.data.shape[1:], dtype=bool)
+                mask[rr, cc] = True
+
+                if z in slice_masks:
+                    slice_masks[z] |= mask
+                else:
+                    slice_masks[z] = mask
+
+            # Apply the masks to the labels layer
+            data = labels_layer.data
+            brush_data = self._roi_brush_layer.data
+            for z in range(data.shape[0]):
+                slice_mask = brush_data[z] == 1
+                if np.any(slice_mask):
+                    yy, xx = np.where(slice_mask)
+                    data[z, yy, xx] = target_label
+            # labels_layer.refresh()
+            notifications.show_info(f'New label {target_label} added.')
+
+        else:
+            # Brush mode: use the whole 3D brush layer
+            if (
+                self._roi_brush_layer is None
+                or self._roi_brush_layer not in self.viewer.layers
+            ):
+                notifications.show_error('ROI brush layer missing.')
+                self._cancel_roi()
+                return
+
+            brush_data = self._roi_brush_layer.data
+            # Check if any brush strokes exist
+            if not np.any(brush_data == 1):
+                notifications.show_warning(
+                    'No brush strokes drawn. Nothing to apply.'
+                )
+                self._cancel_roi()
+                return
+
+            # Directly modify the original labels layer data slice by slice
+            data = labels_layer.data
+            for z in range(data.shape[0]):
+                slice_mask = brush_data[z] == 1
+                if np.any(slice_mask):
+                    # Get the current slice data (as numpy array)
+                    slice_data = data[z]
+                    # Apply the mask to set the target label
+                    slice_data[slice_mask] = target_label
+                    # Write the modified slice back to the zarr array
+                    data[z] = slice_data
+            # labels_layer.refresh()
+            notifications.show_info(f'New label {target_label} added.')
+
+        # Update the labels layer
+        self._modify_labels(labels_layer, data)
+
+        # Clean up and exit new‑label mode
+        self._exit_new_label_mode(labels_layer)
+
+    def _cancel_roi(self, labels_layer_to_activate=None):
+        """Remove the ROI layer(s) and reset buttons."""
+        # Remove polygon layer if exists
+        if self._delete_inside_mode_active:
+            self._delete_inside_mode_active = False
+
+        if self._new_label_mode_active:
+            self._exit_new_label_mode(labels_layer_to_activate)
+            return
+        if (
+            self._roi_layer is not None
+            and self._roi_layer in self.viewer.layers
+        ):
+            self.viewer.layers.remove(self._roi_layer)
+        self._roi_layer = None
+        # Remove brush layer if exists
+        if (
+            self._roi_brush_layer is not None
+            and self._roi_brush_layer in self.viewer.layers
+        ):
+            self.viewer.layers.remove(self._roi_brush_layer)
+        self._roi_brush_layer = None
+        self._current_roi_mode = None
+        self._roi_target_label = None
+        self._update_curation_controls()
+        # Activate the specified labels layer, or any labels layer if none specified
+        if labels_layer_to_activate is not None:
+            if not isinstance(labels_layer_to_activate, Layer):
+                print(
+                    f'Warning: Attempted to set active to non-layer: {labels_layer_to_activate}'
+                )
+                labels_layer_to_activate = None
+            self.viewer.layers.selection.active = labels_layer_to_activate
+        else:
+            # fallback: activate the first labels layer found
+            for layer in self.viewer.layers:
+                if isinstance(layer, Labels):
+                    self.viewer.layers.selection.active = layer
+                    break
+
+    def _exit_new_label_mode(self, labels_layer_to_activate=None):
+        """Clean up after finishing (apply or cancel) a new‑label drawing session."""
+        # Remove temporary layers
+        if (
+            self._roi_layer is not None
+            and self._roi_layer in self.viewer.layers
+        ):
+            self.viewer.layers.remove(self._roi_layer)
+        self._roi_layer = None
+        if (
+            self._roi_brush_layer is not None
+            and self._roi_brush_layer in self.viewer.layers
+        ):
+            self.viewer.layers.remove(self._roi_brush_layer)
+        self._roi_brush_layer = None
+
+        # Reset state flags
+        self._new_label_mode_active = False
+        self._new_label_target = None
+
+        # Re‑enable all buttons (but respect curation mode via _update_curation_controls)
+        self._update_curation_controls()
+
+        # Re‑enable all buttons that were disabled
+        self.btn_roi_add.setEnabled(True)
+        self.btn_roi_subtract.setEnabled(True)
+        self.btn_add_new_label.setEnabled(True)
+        self.btn_delete_slice.setEnabled(True)
+        self.btn_delete_all.setEnabled(True)
+        self.btn_save.setEnabled(True)
+        self.roi_polygon_radio.setEnabled(True)
+        self.roi_brush_radio.setEnabled(True)
+
+        # Disable Apply/Cancel (they are only active during ROI modes)
+        self.btn_apply_roi.setEnabled(False)
+        self.btn_cancel_roi.setEnabled(False)
+
+        if labels_layer_to_activate is not None:
+            if not isinstance(labels_layer_to_activate, Layer):
+                print(
+                    f'Warning: Attempted to set active to non-layer: {labels_layer_to_activate}'
+                )
+                labels_layer_to_activate = None
+            self.viewer.layers.selection.active = labels_layer_to_activate
+        else:
+            # fallback: activate the first labels layer found
+            for layer in self.viewer.layers:
+                if isinstance(layer, Labels):
+                    self.viewer.layers.selection.active = layer
+                    break
+
+    def _enter_delete_inside_roi_mode(self):
+        """Enter a mode to draw a polygon that will be used to delete all labels inside it across all Z slices."""
+        # Check if a labels layer exists
+        labels_layer = self._get_labels_layer()
+        if labels_layer is None:
+            return
+
+        # Remove any existing ROI layer
+        self._cancel_roi()
+
+        # Create a shapes layer for polygon drawing (force polygon mode)
+        self._roi_layer = self.viewer.add_shapes(
+            name='Delete ROI (draw polygon)',
+            shape_type='polygon',
+            edge_color='red',
+            face_color='transparent',
+            opacity=0.8,
+        )
+        self.viewer.layers.selection.active = self._roi_layer
+        self._roi_layer.mode = 'add_polygon'
+
+        # Set mode flag
+        self._delete_inside_mode_active = True
+
+        # Disable other curation buttons
+        self.btn_roi_add.setEnabled(False)
+        self.btn_roi_subtract.setEnabled(False)
+        self.btn_add_new_label.setEnabled(False)
+        self.btn_delete_slice.setEnabled(False)
+        self.btn_delete_all.setEnabled(False)
+        self.btn_delete_inside.setEnabled(
+            False
+        )  # disable itself during session
+        self.btn_change_label.setEnabled(False)
+        self.roi_polygon_radio.setEnabled(False)
+        self.roi_brush_radio.setEnabled(False)
+
+        # Enable Apply/Cancel
+        self.btn_apply_roi.setEnabled(True)
+        self.btn_cancel_roi.setEnabled(True)
+
+        notifications.show_info(
+            'Draw a polygon on the current slice. Click Apply to delete all labels inside this polygon on ALL slices.'
+        )
+
+    def _apply_delete_inside(self):
+        """Delete entire cells (labels) that intersect the drawn polygon across all Z slices."""
+        labels_layer = self._get_labels_layer()
+        if labels_layer is None:
+            self._cancel_roi()
+            return
+
+        # Ensure we have a polygon layer
+        if (
+            self._roi_layer is None
+            or self._roi_layer not in self.viewer.layers
+        ):
+            notifications.show_error('No ROI polygon layer found.')
+            self._cancel_roi()
+            return
+
+        shapes_data = self._roi_layer.data
+        if len(shapes_data) == 0:
+            notifications.show_warning('No polygons drawn.')
+            self._cancel_roi()
+            return
+
+        # Get current Z slice index (assume Z is first axis)
+        current_z = self.viewer.dims.current_step[0]
+
+        # Generate mask for the current slice based on the polygon(s)
+        slice_shape = labels_layer.data.shape[1:3]  # (Y, X)
+        combined_mask = np.zeros(slice_shape, dtype=bool)
+        from skimage.draw import polygon as draw_polygon
+
+        for polygon in shapes_data:
+            # polygon is an (N, 2) array of (y, x) vertices
+            rr, cc = draw_polygon(polygon[:, 0], polygon[:, 1], slice_shape)
+            combined_mask[rr, cc] = True
+
+        if not np.any(combined_mask):
+            notifications.show_warning('No pixels inside polygon.')
+            self._cancel_roi()
+            return
+
+        # Get the current slice data to find which labels are inside the polygon
+        data = labels_layer.data
+        current_slice_data = data[current_z]
+
+        # Extract the unique label IDs present inside the polygon (excluding background 0)
+        if isinstance(current_slice_data, np.ndarray):
+            labels_inside = np.unique(current_slice_data[combined_mask])
+        elif isinstance(current_slice_data, zarr.Array):
+            # For zarr, the slice might be a zarr array; convert to numpy for unique
+            labels_inside = np.unique(current_slice_data[combined_mask])
+        else:
+            notifications.show_error(
+                f'Unsupported data type: {type(current_slice_data)}'
+            )
+            self._cancel_roi()
+            return
+
+        # Remove background if present
+        labels_inside = labels_inside[labels_inside != 0]
+
+        if len(labels_inside) == 0:
+            notifications.show_info(
+                'No non-background labels found inside the polygon.'
+            )
+            self._cancel_roi()
+            return
+
+        # Delete each label across all Z slices
+        total_slices = data.shape[0]
+        deleted_count = 0
+        for label_id in labels_inside:
+            # Process slice by slice to avoid loading entire volume for large arrays
+            for z in range(total_slices):
+                slice_data = data[z]
+                # Create mask for current slice where label equals target
+                if isinstance(slice_data, np.ndarray):
+                    mask = slice_data == label_id
+                elif isinstance(slice_data, zarr.Array):
+                    # Read slice as numpy for masking (zarr supports boolean indexing with numpy mask)
+                    mask = np.asarray(slice_data) == label_id
+                else:
+                    notifications.show_error(
+                        f'Unsupported slice data type: {type(slice_data)}'
+                    )
+                    continue
+
+                if np.any(mask):
+                    # Set those pixels to 0
+                    if isinstance(slice_data, np.ndarray):
+                        slice_data[mask] = 0
+                    elif isinstance(slice_data, zarr.Array):
+                        slice_data[mask] = (
+                            0  # zarr supports boolean indexing assignment
+                        )
+                    # No need to reassign; modifications are in-place
+                    data[z] = slice_data
+            deleted_count += 1
+
+        # Force refresh: call refresh and explicitly trigger data change event
+        self._modify_labels(labels_layer, data)
+        labels_layer.refresh()
+
+        notifications.show_info(
+            f'Deleted {deleted_count} label(s) that intersected the polygon.'
+        )
+
+        # Clean up
+        self._cancel_roi(labels_layer_to_activate=labels_layer)
+
+    def _add_new_label(self):
+        """Enter a mode to draw a new label on any slice. Drawings accumulate until Apply/Cancel."""
+        labels_layer = self._get_labels_layer()
+        if labels_layer is None:
+            return
+
+        # Compute a new unused label ID
+        data = labels_layer.data
+        # new_label = int(data.max()) + 1
+        try:
+            # Use dask to compute max safely for large arrays without loading all data
+            max_label = da.max(data).compute()
+            new_label = int(max_label) + 1
+        except (ValueError, OSError) as e:
+            notifications.show_error(
+                f'Failed to compute maximum label value: {e}'
+            )
+            return
+
+        # Remove any existing ROI temporary layers (safety)
+        self._cancel_roi()
+
+        # Create the appropriate temporary layer based on the current draw mode
+        if self.roi_polygon_radio.isChecked():
+            # Shapes layer (polygons) – set ndim=3 so each polygon stores its slice index
+            self._roi_layer = self.viewer.add_shapes(
+                name='New Label (draw polygons)',
+                shape_type='polygon',
+                edge_color='red',
+                face_color='transparent',
+                opacity=0.8,
+                ndim=3,  # crucial: each vertex gets the current slice coordinate
+            )
+            self.viewer.layers.selection.active = self._roi_layer
+            self._roi_layer.mode = 'add_polygon'
+        else:
+            # Brush mode – temporary labels layer (3D)
+            self._roi_brush_layer = self.viewer.add_labels(
+                np.zeros(labels_layer.data.shape, dtype=np.uint8),
+                name='New Label (brush here)',
+                opacity=0.5,
+            )
+            self._roi_brush_layer.colormap = {1: 'white'}
+            self._roi_brush_layer.brush_size = self._roi_brush_size
+            self._roi_brush_layer.mode = 'paint'
+            self._roi_brush_layer.selected_label = 1
+            self.viewer.layers.selection.active = self._roi_brush_layer
+
+        # Store state
+        self._new_label_mode_active = True
+        self._new_label_target = new_label
+
+        # Disable buttons that should not be used while drawing the new label
+        self.btn_roi_add.setEnabled(False)
+        self.btn_roi_subtract.setEnabled(False)
+        self.btn_add_new_label.setEnabled(False)
+        self.btn_delete_slice.setEnabled(False)
+        self.btn_delete_all.setEnabled(False)
+        self.btn_save.setEnabled(False)
+        # Optionally disable the draw‑mode radio buttons to prevent mode switching
+        self.roi_polygon_radio.setEnabled(False)
+        self.roi_brush_radio.setEnabled(False)
+
+        # Enable Apply/Cancel
+        self.btn_apply_roi.setEnabled(True)
+        self.btn_cancel_roi.setEnabled(True)
+
+        notifications.show_info(
+            f'Adding new label {new_label}. Draw on any slice. Click Apply to confirm, Cancel to abort.'
+        )
+
+    def _show_quantitative_stats(self):
+        """Compute statistics in background, then open dialog."""
+        labels_layer = self._get_labels_layer()
+        if labels_layer is None:
+            QMessageBox.warning(
+                self,
+                'No Labels Layer',
+                'Please load or create a labels layer first.',
+            )
+            return
+
+        image_layer = self._get_active_image()
+        labels_data = labels_layer.data
+        image_data = image_layer.data if image_layer else None
+
+        # Progress dialog
+        self.stats_progress = QProgressDialog(
+            'Computing statistics...', 'Cancel', 0, 100, self
+        )
+        self.stats_progress.setWindowTitle('Statistics Progress')
+        self.stats_progress.setAutoClose(True)
+        self.stats_progress.show()
+
+        # Worker
+        self.stats_thread = QThread()
+        self.stats_worker = StatsWorker(labels_data, image_data)
+        self.stats_worker.moveToThread(self.stats_thread)
+
+        self.stats_worker.progress.connect(
+            lambda val, msg: self.stats_progress.setLabelText(msg)
+        )
+        self.stats_worker.progress.connect(
+            lambda val, msg: self.stats_progress.setValue(val)
+        )
+        self.stats_worker.finished.connect(self._on_stats_finished)
+        self.stats_progress.canceled.connect(self.stats_worker.cancel)
+        self.stats_progress.canceled.connect(self.stats_thread.quit)
+        self.stats_thread.started.connect(self.stats_worker.run)
+        self.stats_worker.finished.connect(self.stats_thread.quit)
+        self.stats_worker.finished.connect(self.stats_worker.deleteLater)
+        self.stats_thread.finished.connect(self.stats_thread.deleteLater)
+
+        self.stats_thread.start()
+
+    def _on_stats_finished(self, stats, error_msg):
+        """Called when statistics are ready; display dialog in main thread."""
+        self.stats_progress.close()
+        if error_msg:
+            QMessageBox.critical(self, 'Statistics Error', error_msg)
+            return
+        if not stats or stats['num_cells'] == 0:
+            QMessageBox.information(
+                self, 'No Cells', 'No non‑background labels found.'
+            )
+            return
+
+        # Now build and show the statistics dialog (same UI as before)
+        self._display_stats_dialog(
+            stats
+        )  # extract the dialog creation code to a separate method
+
+    def _display_stats_dialog(self, stats):
+        """
+        Display the quantitative statistics dialog using pre-computed stats.
+        stats: dict with keys: 'labels', 'areas', 'num_cells', 'max_area', 'min_area'
+            (intensity stats can be added later)
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Quantitative Statistics')
+        dlg.resize(800, 600)
+        main_layout = QVBoxLayout(dlg)
+
+        # --- Size Statistics Group ---
+        size_group = QGroupBox('Cell Size Statistics')
+        size_layout = QVBoxLayout(size_group)
+
+        num_cells = stats['num_cells']
+        max_area = stats['max_area']
+        min_area = stats['min_area']
+        areas_list = stats['areas']
+
+        # Summary labels
+        summary_layout = QHBoxLayout()
+        summary_layout.addWidget(QLabel(f'Number of cells: {num_cells}'))
+        summary_layout.addWidget(QLabel(f'Max size: {int(max_area)}'))
+        summary_layout.addWidget(QLabel(f'Min size: {int(min_area)}'))
+        summary_layout.addStretch()
+        size_layout.addLayout(summary_layout)
+
+        # Histogram of cell sizes
+        fig_size = Figure(figsize=(5, 3))
+        canvas_size = FigureCanvas(fig_size)
+        ax_size = fig_size.add_subplot(111)
+        ax_size.hist(areas_list, bins=50, color='skyblue', edgecolor='black')
+        ax_size.set_xlabel('Size (voxels)')
+        ax_size.set_ylabel('Frequency')
+        ax_size.set_title('Cell Size Distribution')
+        fig_size.tight_layout()
+        size_layout.addWidget(canvas_size)
+
+        main_layout.addWidget(size_group)
+
+        # --- Intensity Statistics Group (if available) ---
+        # For now, intensity stats are not computed in the background.
+        # You can extend the StatsWorker to also compute and include them in the stats dict.
+        intensity_group = QGroupBox('Intensity Statistics (within cells)')
+        intensity_layout = QVBoxLayout(intensity_group)
+        no_intensity_label = QLabel('Intensity statistics not computed.')
+        no_intensity_label.setStyleSheet('color: gray; font-style: italic;')
+        intensity_layout.addWidget(no_intensity_label)
+        main_layout.addWidget(intensity_group)
+
+        # Close button
+        btn_close = QPushButton('Close')
+        btn_close.clicked.connect(dlg.accept)
+        main_layout.addWidget(btn_close, alignment=Qt.AlignCenter)
+
+        dlg.exec_()
+
+    def _save_labels_tiff(self, data):
+        save_dir = self.path_edit.text()
+        os.makedirs(save_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = os.path.join(save_dir, f'labels_{timestamp}.tif')
+        if isinstance(data, da.Array):
+            data = data.compute()
+        with tifffile.TiffWriter(filename, bigtiff=True) as tif:
+            tif.write(data, photometric='minisblack', compression='zlib')
+        notifications.show_info(f'Saved TIFF to {filename}')
+
+    def _save_labels_zarr(self, data):
+        save_dir = self.path_edit.text()
+        os.makedirs(save_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        store_path = os.path.join(save_dir, f'labels_{timestamp}.zarr')
+        if isinstance(data, da.Array):
+            data.to_zarr(store_path, compute=True)
+            notifications.show_info(f'Saved dask array to Zarr: {store_path}')
+
+        elif isinstance(data, zarr.Array):
+            dest_store = zarr.DirectoryStore(store_path)
+            copy_store(data.store, dest_store)
+            notifications.show_info(f'Copied Zarr store to: {store_path}')
+
+        elif isinstance(data, np.ndarray):
+            da.from_array(data, chunks='auto').to_zarr(
+                store_path, compute=True
+            )
+            notifications.show_info(f'Saved numpy array to Zarr: {store_path}')
+
+            try:
+                arr = np.asarray(data)
+                da.from_array(arr, chunks='auto').to_zarr(
+                    store_path, compute=True
+                )
+                notifications.show_info(
+                    f'Converted and saved to Zarr: {store_path}'
+                )
+            except (ValueError, OSError) as e:
+                notifications.show_error(
+                    f'Unsupported data type for Zarr save: {type(data)} - {e}'
+                )
+                return
+
+    # ---------- Reserved ----------
+    def _finetune_network(self):
+        notifications.show_info('Fine-tuning is not yet implemented.')
+
+    # ---------- Reserved ----------
+    def _local_finetune(self):
+        notifications.show_info('Fine-tuning is not yet implemented.')
 
 
-class ExampleQWidget(QWidget):
-    # your QWidget.__init__ can optionally request the napari viewer instance
-    # use a type annotation of 'napari.viewer.Viewer' for any parameter
-    def __init__(self, viewer: 'napari.viewer.Viewer'):
+# ---------- Tracking Widget (reserved) ----------
+class TrackingWidget(QWidget):
+    """Widget for future cell tracking functionality."""
+
+    def __init__(self, napari_viewer):
         super().__init__()
-        self.viewer = viewer
+        self.viewer = napari_viewer
+        self.setLayout(QVBoxLayout())
+        self._init_ui()
 
-        btn = QPushButton('Click me!')
-        btn.clicked.connect(self._on_click)
+    def _init_ui(self):
+        self.layout().addWidget(QLabel('<b>Cell Tracking (Reserved)</b>'))
+        self.btn_track = QPushButton('Track Cells (Coming Soon)')
+        self.btn_track.setEnabled(False)
+        self.btn_track.clicked.connect(self._placeholder)
+        self.layout().addWidget(self.btn_track)
 
-        self.setLayout(QHBoxLayout())
-        self.layout().addWidget(btn)
+        self.layout().addWidget(
+            QLabel('Future functionality will be added here.')
+        )
+        self.layout().addStretch()
 
-    def _on_click(self):
-        print('napari has', len(self.viewer.layers), 'layers')
+    def _placeholder(self):
+        notifications.show_info('Tracking not implemented yet.')
+
+    """Main widget for 3D cell segmentation and tracking."""

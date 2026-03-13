@@ -18,18 +18,12 @@ contributions:
     - id: cellseg.make_sample_data
       python_name: cellseg._sample_data:make_sample_data
       title: Load sample data from Cellseg
-    - id: cellseg.make_container_widget
-      python_name: cellseg:ImageThreshold
-      title: Make threshold Container widget
-    - id: cellseg.make_magic_widget
-      python_name: cellseg:threshold_magic_widget
-      title: Make threshold magic widget
-    - id: cellseg.make_function_widget
-      python_name: cellseg:threshold_autogenerate_widget
-      title: Make threshold function widget
-    - id: cellseg.make_qwidget
-      python_name: cellseg:ExampleQWidget
-      title: Make example QWidget
+    - id: cellseg.make_segmentation_widget
+      python_name: cellseg._widget:SegmentationWidget
+      title: Open Cell Segmentation Widget
+    - id: cellseg.make_tracking_widget
+      python_name: cellseg._widget:TrackingWidget
+      title: Open Cell Tracking Widget
   readers:
     - command: cellseg.get_reader
       accepts_directories: false
@@ -46,15 +40,10 @@ contributions:
       display_name: Cellseg
       key: unique_id.1
   widgets:
-    - command: cellseg.make_container_widget
-      display_name: Container Threshold
-    - command: cellseg.make_magic_widget
-      display_name: Magic Threshold
-    - command: cellseg.make_function_widget
-      autogenerate: true
-      display_name: Autogenerate Threshold
-    - command: cellseg.make_qwidget
-      display_name: Example QWidget
+    - command: cellseg.make_segmentation_widget
+      display_name: 3D Segmentation
+    - command: cellseg.make_tracking_widget
+      display_name: Tracking
   menus:
     napari/layers/segment:
       - command: cellseg.make_container_widget
