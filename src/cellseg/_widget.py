@@ -273,7 +273,7 @@ class SaveWorker(QObject):
         super().__init__()
         self.labels_data = labels_data
         self.save_dir = save_dir
-        self.save_format = save_format  # 'TIFF' or 'Zarr'
+        self.save_format = save_format  # 'TIFF' or 'Zarr', 2 formats
         self.renumber = renumber
         self._is_cancelled = False
 
