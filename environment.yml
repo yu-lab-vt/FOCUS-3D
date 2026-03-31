@@ -1,8 +1,6 @@
 name: cellseg
 channels:
-  - http://conda.anaconda.org/gurobi
   - conda-forge
-  - https://conda.anaconda.org/gurobi
   - defaults
 dependencies:
   - bzip2=1.0.8=h0ad9c76_9
@@ -42,7 +40,6 @@ dependencies:
     - bermuda==0.1.7
     - build==1.4.0
     - cachey==0.2.1
-    - cellseg==0.0.2.dev1+nogit.gd190d2e9f.d20260307
     - certifi==2026.2.25
     - cfgv==3.5.0
     - charset-normalizer==3.4.4
