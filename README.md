@@ -28,6 +28,7 @@ You can install `cellseg` with the following steps:
 2. Install `cellseg`:
 
    ```bash
+   conda activate cellseg
    pip install napari[all]
    pip install -e .
    ```
@@ -35,7 +36,6 @@ You can install `cellseg` with the following steps:
 3. Launch the application:
 
    ```bash
-   conda activate cellseg
    napari
    ```
 
