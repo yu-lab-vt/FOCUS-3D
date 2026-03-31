@@ -9,49 +9,79 @@
 [![npe2](https://img.shields.io/badge/plugin-npe2-blue?link=https://napari.org/stable/plugins/index.html)](https://napari.org/stable/plugins/index.html)
 [![Copier](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/copier-org/copier/master/img/badge/badge-grayscale-inverted-border-purple.json)](https://github.com/copier-org/copier)
 
-A user-friendly plugin for 3D cell segmentation
-
-----------------------------------
-
-This [napari] plugin was generated with [copier] using the [napari-plugin-template] (None).
-
-<!--
-Don't miss the full getting started guide to set up your new package:
-https://github.com/napari/napari-plugin-template#getting-started
-
-and review the napari docs for plugin developers:
-https://napari.org/stable/plugins/index.html
--->
+CellSeg is a user-friendly napari plugin for 3D cell segmentation. Cellseg supports a series of functions such as 3D automatic segmentation, manual curation, 3D structure reconstruction, fine-tuning, quantitative analysis, etc.
+ <p align="center">
+<img width="823" height="492" alt="image" src="https://github.com/user-attachments/assets/c45dd0ef-73e3-48bd-849a-915669cf2418" />
+  <br>
+</p> 
 
 ## Installation
 
-You can install `cellseg` via [pip]:
+You can install `cellseg` with the following steps:
 
-```bash
-pip install cellseg
-```
+1. Create a new environment in the directory containing `environment.yml`:
 
-If napari is not already installed, you can install `cellseg` with napari and Qt via:
+   ```bash
+   conda env create -n cellseg -f environment.yml
+   ```
 
-```bash
-pip install "cellseg[all]"
-```
+2. Install `cellseg`:
 
+   ```bash
+   cd cellseg
+   pip install -e .
+   ```
 
+3. Launch the application:
 
-## Contributing
+   ```bash
+   conda activate cellseg
+   napari
+   ```
 
-Contributions are very welcome. Tests can be run with [tox], please ensure
-the coverage at least stays the same before you submit a pull request.
+## Usage
+1. Open CellSeg from `Plugins -> 3D Segmentation (CellSeg)`.
+2. Open the raw image from `File -> Open Folder` for a `.zarr` dataset (recommended), or `File -> Open File(s)` for `.tif` images.
+3. Load labels from `Load Label -> Load from Zarr` (recommended) or `Load Label -> Load from TIFF`.
+4. Manual curation: go to `Manual Curation -> Enter Curation Mode`.  
+   For `.zarr` labels, curation results are written directly to the file and saved automatically.
+
+| Operation | Shortcut | Description |
+|---|---|---|
+| Enter Curation Mode | — | Activate label editing mode so you can select and modify labels manually. |
+| Polygon Draw Mode | — | Define an ROI by clicking polygon vertices; the enclosed region is used as the selected area. |
+| Brush Draw Mode | — | Define an ROI by painting directly on the image; the painted region is used as the selected area. |
+| Add to Label | `A` | Add the selected ROI to the current label. |
+| Subtract from Label | `S` | Remove the selected ROI from the current label. |
+| Add New Label | `Ctrl + D` | Create a new label. Regions from multiple Z slices can be combined into the same label. |
+| Change Label | `C` | Change the ID of the currently selected label. |
+| Apply ROI | `Ctrl + A` | Apply the current ROI operation. Used with **Add to Label**, **Subtract from Label**, and **Add New Label**. |
+| Cancel ROI | `Ctrl + C` | Cancel the current ROI operation without applying changes. |
+| Delete Current Z | `Delete` | Delete the selected label only in the current Z slice. |
+| Delete All Z | `Ctrl + Delete` | Delete the selected label across all Z slices. |
+| Delete Inside ROI (All Z) | — | Delete all labels inside the selected ROI across all Z slices. |
+| Export Log | — | Export curation actions and label IDs to an Excel file. |
+
+5. Save the curation result as `.zarr` or `.tif`; label IDs can also be reassigned if needed.
+6. 3D reconstruction: reconstruct the selected label, adjust the Z ratio, and save or load the mesh.
+ <p align="center">
+   <img width="625" height="422" alt="image" src="https://github.com/user-attachments/assets/15616b42-5524-431a-a619-ebb6810c7181" />
+  <br>
+</p> 
+7. Calculate Size Distribution: compute cell count and cell size statistics.
+   
+<p align="center">
+  <img width="520" height="236" alt="image" src="https://github.com/user-attachments/assets/da6891eb-765a-43e2-ba90-e155528e497c" />
+  <br>
+</p>
 
 ## License
 
-Distributed under the terms of the [BSD-3] license,
-"cellseg" is free and open source software
+Distributed under the terms of the [BSD-3] license, "cellseg" is free and open source software
 
 ## Issues
 
-If you encounter any problems, please [file an issue] along with a detailed description.
+If you encounter any problems, please [file an issue] along with a detailed description or contact zhangqh24@mails.tsinghua.edu.cn.
 
 [napari]: https://github.com/napari/napari
 [copier]: https://copier.readthedocs.io/en/stable/
