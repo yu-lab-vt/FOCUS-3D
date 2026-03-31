@@ -42,8 +42,6 @@ contributions:
   widgets:
     - command: cellseg.make_segmentation_widget
       display_name: 3D Segmentation
-    - command: cellseg.make_tracking_widget
-      display_name: Tracking
   menus:
     napari/layers/segment:
       - command: cellseg.make_container_widget

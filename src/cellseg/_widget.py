@@ -32,15 +32,18 @@ Replace code below according to your needs.
 from __future__ import annotations
 
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(__file__))
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import dask.array as da
+import napari
 import numpy as np
-from dask import compute, delayed
 from napari.layers import Image, Labels, Layer
 from napari.utils import notifications
 from qtpy.QtCore import Qt
-from scipy import ndimage as ndi
 from skimage import io
 
 if TYPE_CHECKING:
@@ -48,9 +51,9 @@ if TYPE_CHECKING:
 import traceback
 from datetime import datetime
 
-import dask_image.ndmeasure
 import tifffile
 import zarr
+from analysis import QuantitativeWorker
 from matplotlib.backends.backend_qt5agg import (
     FigureCanvasQTAgg as FigureCanvas,
 )
@@ -64,6 +67,7 @@ from qtpy.QtWidgets import (
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -73,195 +77,16 @@ from qtpy.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
+from reconstruction import ReconstructionWorker
+from segmentation import SegmentationWorker
 from zarr.convenience import copy_store
 
 
 # ---------- Background Workers ----------
-class SegmentationWorker(QObject):
-    """Worker for running 3D segmentation in a background thread."""
-
-    progress = Signal(int, str)  # progress value, message
-    finished = Signal(
-        object, str
-    )  # result (labels array), error message (empty if success)
-    cancelled = Signal()
-
-    def __init__(self, image_data, mode, threshold=None, checkpoint=None):
-        super().__init__()
-        self.image_data = image_data
-        self.mode = mode  # 0: manual, 1: auto
-        self.threshold = threshold
-        self.checkpoint = checkpoint
-        self._is_cancelled = False
-
-    def cancel(self):
-        self._is_cancelled = True
-
-    def run(self):
-        try:
-            if self.mode == 0:  # manual threshold
-                self.progress.emit(0, 'Applying threshold...')
-                if self._is_cancelled:
-                    self.cancelled.emit()
-                    return
-                # Use the existing _threshold_segmentation logic
-                labels = self._threshold_segmentation(
-                    self.image_data, self.threshold
-                )
-                self.progress.emit(100, 'Segmentation completed.')
-                self.finished.emit(labels, '')
-            elif self.mode == 1:  # auto (placeholder)
-                self.progress.emit(
-                    0, 'Running auto-segmentation (not yet implemented)...'
-                )
-                # Simulate long work
-                QThread.sleep(2)
-                if self._is_cancelled:
-                    self.cancelled.emit()
-                    return
-                self.finished.emit(None, 'Auto-segmentation not implemented.')
-            else:
-                self.finished.emit(None, 'Invalid segmentation mode.')
-        except (ValueError, OSError) as e:
-            self.finished.emit(
-                None, f'Segmentation error: {e}\n{traceback.format_exc()}'
-            )
-
-    def _threshold_segmentation(self, image, thresh):
-        """
-        Perform threshold-based 3D segmentation using manual threshold.
-        Supports numpy, zarr, or dask arrays. For large zarr arrays, uses dask
-        for memory-efficient processing.
-        """
-
-        # Determine input type and convert to dask if not numpy
-        if isinstance(image, np.ndarray):
-            # For numpy, process directly with scipy (fast for in-memory data)
-            binary = image > thresh
-            labeled, _ = ndi.label(binary)
-            return labeled.astype(np.int32)
-        else:
-            # For zarr or other array-like, convert to dask array for chunked processing
-            if not isinstance(image, da.Array):
-                # Try to convert to dask, preserving chunks if possible
-                if hasattr(image, 'chunks'):
-                    image = da.from_array(image, chunks=image.chunks)
-                else:
-                    # Use auto-chunking as fallback
-                    image = da.from_array(image, chunks='auto')
-
-            # Binary threshold (dask supports elementwise comparison)
-            binary = image > thresh
-
-            # Connected components labeling using dask-image
-            labeled, num_features = dask_image.ndmeasure.label(binary)
-
-            # Convert to int32
-            labeled = labeled.astype(np.int32)
-
-            return labeled
-
-
-class StatsWorker(QObject):
-    """Worker for computing quantitative statistics in the background."""
-
-    progress = Signal(int, str)
-    finished = Signal(dict, str)  # stats dict, error message
-
-    def __init__(self, labels_data, image_data):
-        super().__init__()
-        self.labels_data = labels_data
-        self.image_data = image_data
-        self._is_cancelled = False
-
-    def cancel(self):
-        self._is_cancelled = True
-
-    def run(self):
-        try:
-            self.progress.emit(0, 'Computing label areas...')
-            if self._is_cancelled:
-                self.finished.emit({}, 'Cancelled')
-                return
-
-            # Use the existing compute_areas_dask or numpy fallback
-            if isinstance(self.labels_data, da.Array):
-                label_areas = self.compute_areas_dask(self.labels_data)
-                labels_list, areas_list = (
-                    zip(*label_areas, strict=True) if label_areas else ([], [])
-                )
-            else:
-                import numpy as np
-                from skimage.measure import regionprops
-
-                labels = np.asarray(self.labels_data)
-                props = regionprops(
-                    labels,
-                    intensity_image=np.asarray(self.image_data)
-                    if self.image_data is not None
-                    else None,
-                )
-                labels_list = [p.label for p in props]
-                areas_list = [p.area for p in props]
-
-            if self._is_cancelled:
-                self.finished.emit({}, 'Cancelled')
-                return
-
-            self.progress.emit(50, 'Computing intensity statistics...')
-            # ... compute other stats (min/max, histogram) ...
-            # For simplicity, we return the raw lists; the main thread will build the dialog.
-            stats = {
-                'labels': labels_list,
-                'areas': areas_list,
-                'num_cells': len(labels_list),
-                'max_area': max(areas_list) if areas_list else 0,
-                'min_area': min(areas_list) if areas_list else 0,
-                # intensity stats can be added here
-            }
-            self.progress.emit(100, 'Done.')
-            self.finished.emit(stats, '')
-        except (ValueError, OSError) as e:
-            self.finished.emit(
-                {}, f'Statistics error: {e}\n{traceback.format_exc()}'
-            )
-
-    def compute_areas_dask(self, labels):
-        """Return a Dask bag of (label, area) for each label > 0."""
-        # Get unique labels (excluding 0) - this is a Dask array
-        unique_labels = da.unique(labels)
-        # Filter out background (label 0)
-        unique_labels = unique_labels[unique_labels != 0]
-
-        # Define a function to count pixels of a specific label in a chunk
-        def count_label_in_chunk(block, label):
-            return np.sum(block == label)
-
-        # For each label, apply count over all chunks and sum results
-        def area_for_label(label):
-            # Apply count function to each chunk and reduce by sum
-            counts = da.map_blocks(
-                lambda block: np.array([count_label_in_chunk(block, label)]),
-                labels,
-                dtype=np.int64,
-                chunks=(1,),  # each chunk returns a scalar
-            )
-            return da.sum(counts).compute()  # compute to get scalar
-
-        # Create delayed tasks for each label
-        tasks = {
-            int(label): delayed(area_for_label)(label)
-            for label in unique_labels.compute()
-        }
-        # Compute all tasks in parallel
-        results = compute(*tasks.values())
-        # Return as list of (label, area)
-        return list(zip(tasks.keys(), results, strict=True))
-
-
 class SaveWorker(QObject):
     """Worker for saving labels in the background."""
 
@@ -381,6 +206,165 @@ class SaveWorker(QObject):
             return new_data
 
 
+class DeleteAllWorker(QObject):
+    finished = Signal(int)  # label_val
+    error = Signal(str)
+    progress = Signal(int, str)  # percent, message
+
+    def __init__(self, data, label_val, current_z):
+        super().__init__()
+        self.data = data
+        self.label_val = label_val
+        self.current_z = (
+            current_z  # Store the current slice index for range limiting
+        )
+
+    def run(self):
+        try:
+            delete_N = 25
+            total_slices = self.data.shape[0]
+            # Calculate slice range: 50 slices above and below current slice
+            z_start = max(0, self.current_z - delete_N)
+            z_end = min(
+                total_slices, self.current_z + delete_N
+            )  # +51 because end is exclusive
+            slices_to_process = z_end - z_start
+            found = False
+
+            if isinstance(self.data, np.ndarray):
+                # Process only the relevant slice range
+                for idx, z in enumerate(range(z_start, z_end)):
+                    if QThread.currentThread().isInterruptionRequested():
+                        return
+                    slice_data = self.data[z]
+                    mask = slice_data == self.label_val
+                    if np.any(mask):
+                        slice_data[mask] = 0
+                        # For numpy, slice_data is a view, so changes are in-place
+                        found = True
+                    # Emit progress based on processed slices within the range
+                    progress_percent = int(100 * (idx + 1) / slices_to_process)
+                    self.progress.emit(
+                        progress_percent,
+                        f'Processing slice {z + 1}/{total_slices} (range {z_start + 1}-{z_end})',
+                    )
+
+            elif isinstance(self.data, zarr.Array):
+                # For zarr, process slice by slice within the range (simpler than chunk-based)
+                for idx, z in enumerate(range(z_start, z_end)):
+                    if QThread.currentThread().isInterruptionRequested():
+                        return
+                    slice_data = self.data[z]  # returns a numpy array
+                    mask = slice_data == self.label_val
+                    if np.any(mask):
+                        slice_data[mask] = 0
+                        self.data[z] = slice_data
+                        found = True
+                    progress_percent = int(100 * (idx + 1) / slices_to_process)
+                    self.progress.emit(
+                        progress_percent,
+                        f'Processing slice {z + 1}/{total_slices} (range {z_start + 1}-{z_end})',
+                    )
+            else:
+                self.error.emit(f'Unsupported data type: {type(self.data)}')
+                return
+
+            if found:
+                self.finished.emit(self.label_val)
+            else:
+                # No label found in the processed range, still emit to notify
+                self.finished.emit(self.label_val)
+        except (ValueError, RuntimeError, OSError) as e:
+            self.error.emit(str(e))
+
+
+class DeleteInsideWorker(QObject):
+    """Worker for deleting all labels intersecting a polygon across all Z."""
+
+    finished = Signal(int)  # number of deleted labels
+    error = Signal(str)
+    progress = Signal(int, str)
+
+    def __init__(self, data, shapes, current_z):
+        super().__init__()
+        self.data = data
+        self.shapes = shapes  # list of polygons (each as (N,2) or (N,3) if 3D)
+        self.current_z = current_z
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        """
+        Delete all labels that intersect the drawn polygon across all Z slices.
+        Optimized by processing each slice only once, using np.isin to delete multiple labels simultaneously.
+        """
+        try:
+            from skimage.draw import polygon as draw_polygon
+
+            # --- Step 1: Generate polygon mask on the current slice ---
+            slice_shape = self.data.shape[1:3]  # (Y, X)
+            combined_mask = np.zeros(slice_shape, dtype=bool)
+            for poly in self.shapes:
+                # If polygon vertices include Z coordinate (ndim=3), discard the Z column
+                if poly.shape[1] == 3:
+                    poly = poly[:, 1:]  # keep only (y, x)
+                rr, cc = draw_polygon(poly[:, 0], poly[:, 1], slice_shape)
+                combined_mask[rr, cc] = True
+
+            # --- Step 2: Identify which labels are inside the polygon on the current slice ---
+            current_slice = self.data[self.current_z]
+            labels_in_mask = np.unique(current_slice[combined_mask])
+            labels_in_mask = labels_in_mask[
+                labels_in_mask != 0
+            ]  # exclude background
+
+            if len(labels_in_mask) == 0:
+                self.finished.emit(0)  # no labels to delete
+                return
+
+            # --- Step 3: Delete those labels across all slices, processing one slice at a time ---
+            total_slices = self.data.shape[0]
+            delete_N = 25
+            z_start = max(0, self.current_z - delete_N)
+            z_end = min(total_slices, self.current_z + delete_N + 1)
+            total_steps = z_end - z_start + 1
+            # for z in range(total_slices):
+            for step, z in enumerate(range(z_start, z_end), start=1):
+                if QThread.currentThread().isInterruptionRequested():
+                    return
+
+                # Get the current slice data (as a numpy array; for zarr this is a copy)
+                slice_data = self.data[z]
+
+                # Create a boolean mask marking all pixels that belong to any label in labels_in_mask
+                # np.isin is efficient for a small set of labels and returns a boolean array of same shape
+                mask = np.isin(slice_data, labels_in_mask)
+
+                if np.any(mask):
+                    # Set those pixels to background (0)
+                    slice_data[mask] = 0
+
+                    # If the underlying data is a zarr array, we need to write the modified slice back
+                    if isinstance(self.data, zarr.Array):
+                        self.data[z] = slice_data
+                    # For numpy arrays, slice_data is a view (if contiguous) and changes are already in‑place,
+                    # so no explicit write‑back is needed.
+
+                # Update progress
+                self.progress.emit(
+                    int(100 * step / total_steps),
+                    f'Processing slice {z + 1}/{total_slices}',
+                )
+
+            # --- Step 4: Notify completion with the number of labels deleted ---
+            self.finished.emit(len(labels_in_mask))
+
+        except (ValueError, RuntimeError, OSError) as e:
+            self.error.emit(str(e))
+
+
 # ---------- Segmentation Widget ----------
 class SegmentationWidget(QWidget):
     """Widget for 3D/4D cell segmentation and manual label adjustment."""
@@ -406,18 +390,237 @@ class SegmentationWidget(QWidget):
         )
         self._pick_mode_active = False  # Toggle state for pick mode
         self._delete_inside_mode_active = False
+        self._delete_all_active = False
+        self.operation_log = []
+        self.recon_result = None
+        self.recon_viewer = None
+        self.tab_widget = QTabWidget()
+        self.layout().addWidget(self.tab_widget)
 
-        self._init_ui()
+        self.basic_tab = QWidget()
+        self.seg_tab = QWidget()
+        self.analysis_tab = QWidget()
+
+        self.tab_widget.addTab(self.basic_tab, 'Basic')
+        self.tab_widget.addTab(self.seg_tab, 'Segmentation')
+        self.tab_widget.addTab(self.analysis_tab, 'Analysis')
+
+        self._init_basic_tab()
+        self._init_seg_tab()
+        self._init_analysis_tab()
+
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
         self._install_delete_shortcut()
         self.setMaximumWidth(300)
+        self._apply_contour_to_existing_labels()
 
-    def _init_ui(self):
-        """Initialize UI components for segmentation."""
+    def _init_basic_tab(self):
+        """Initialize UI components for the Basic tab."""
+        layout = QVBoxLayout(self.basic_tab)
 
-        # ---------- Segmentation controls ----------
-        title_seg = QLabel('<b>---------------Segmentation---------------</b>')
-        title_seg.setAlignment(Qt.AlignCenter)
-        self.layout().addWidget(title_seg)
+        group_style = """
+            QGroupBox {
+                font-size: 10pt;
+                border: 1px solid #bfbfbf;
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top center;
+                font-weight: bold;
+                left: -5px;
+                padding: 0 6px 0 6px;
+            }
+        """
+
+        # ---------- Load label group ----------
+        load_group = QGroupBox('Load Label')
+        load_group.setStyleSheet(group_style)
+        load_group_layout = QVBoxLayout()
+
+        load_buttons_widget = QWidget()
+        load_buttons_layout = QHBoxLayout(load_buttons_widget)
+        load_buttons_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.btn_show_seg = QPushButton('Load from TIFF')
+        self.btn_show_seg.clicked.connect(self._show_segmentation_tif)
+        load_buttons_layout.addWidget(self.btn_show_seg)
+
+        self.btn_load_zarr = QPushButton('Load from Zarr')
+        self.btn_load_zarr.clicked.connect(self._load_zarr_folder)
+        load_buttons_layout.addWidget(self.btn_load_zarr)
+
+        load_group_layout.addWidget(load_buttons_widget)
+
+        self.chk_contour = QCheckBox('Only Show Contour')
+        self.chk_contour.setChecked(False)
+        self.chk_contour.toggled.connect(self._toggle_contour)
+        load_group_layout.addWidget(self.chk_contour)
+
+        load_group.setLayout(load_group_layout)
+        layout.addWidget(load_group)
+
+        layout.addSpacing(15)
+
+        # ---------- Manual curation group ----------
+        curation_group = QGroupBox('Manual Curation')
+        curation_group.setStyleSheet(group_style)
+        curation_layout = QVBoxLayout()
+
+        self.btn_pick_mode = QPushButton('Enter Curation Mode')
+        self.btn_pick_mode.clicked.connect(self._toggle_pick_mode)
+        curation_layout.addWidget(self.btn_pick_mode)
+
+        roi_draw_layout = QHBoxLayout()
+        roi_draw_layout.addWidget(QLabel('Draw Mode:'))
+        self.roi_polygon_radio = QRadioButton('Polygon')
+        self.roi_polygon_radio.setChecked(True)
+        self.roi_brush_radio = QRadioButton('Brush')
+        roi_draw_layout.addWidget(self.roi_polygon_radio)
+        roi_draw_layout.addWidget(self.roi_brush_radio)
+        curation_layout.addLayout(roi_draw_layout)
+
+        self.roi_polygon_radio.toggled.connect(self._on_roi_draw_mode_changed)
+        self.roi_brush_radio.toggled.connect(self._on_roi_draw_mode_changed)
+
+        self.brush_size_widget = QWidget()
+        brush_size_layout = QHBoxLayout(self.brush_size_widget)
+        brush_size_layout.setContentsMargins(0, 0, 0, 0)
+        brush_size_layout.addWidget(QLabel('Brush Size:'))
+
+        self.roi_brush_spin = QSpinBox()
+        self.roi_brush_spin.setRange(1, 100)
+        self.roi_brush_spin.setValue(self._roi_brush_size)
+        self.roi_brush_spin.valueChanged.connect(
+            self._on_roi_brush_size_changed
+        )
+        brush_size_layout.addWidget(self.roi_brush_spin)
+
+        self.brush_size_widget.setVisible(False)
+        curation_layout.addWidget(self.brush_size_widget)
+
+        roi_mode_layout = QHBoxLayout()
+        self.btn_roi_add = QPushButton('Add to Label')
+        self.btn_roi_add.setShortcut('A')
+        self.btn_roi_add.clicked.connect(lambda: self._enter_roi_mode('add'))
+        roi_mode_layout.addWidget(self.btn_roi_add)
+
+        self.btn_roi_subtract = QPushButton('Subtract from Label')
+        self.btn_roi_subtract.setShortcut('S')
+        self.btn_roi_subtract.clicked.connect(
+            lambda: self._enter_roi_mode('subtract')
+        )
+        roi_mode_layout.addWidget(self.btn_roi_subtract)
+        curation_layout.addLayout(roi_mode_layout)
+
+        new_label_layout = QHBoxLayout()
+
+        self.btn_add_new_label = QPushButton('Add New Label')
+        self.btn_add_new_label.setShortcut('Ctrl+D')
+        self.btn_add_new_label.clicked.connect(self._add_new_label)
+        new_label_layout.addWidget(self.btn_add_new_label)
+
+        self.btn_change_label = QPushButton('Change Label')
+        self.btn_change_label.setShortcut('C')
+        self.btn_change_label.clicked.connect(self._change_selected_label_id)
+        new_label_layout.addWidget(self.btn_change_label)
+
+        curation_layout.addLayout(new_label_layout)
+
+        roi_apply_layout = QHBoxLayout()
+        self.btn_apply_roi = QPushButton('Apply ROI')
+        self.btn_apply_roi.setShortcut('Ctrl+A')
+        self.btn_apply_roi.clicked.connect(self._apply_roi)
+        self.btn_apply_roi.setEnabled(False)
+        roi_apply_layout.addWidget(self.btn_apply_roi)
+
+        self.btn_cancel_roi = QPushButton('Cancel ROI')
+        self.btn_cancel_roi.setShortcut('Ctrl+C')
+        self.btn_cancel_roi.clicked.connect(self._cancel_roi)
+        self.btn_cancel_roi.setEnabled(False)
+        roi_apply_layout.addWidget(self.btn_cancel_roi)
+        curation_layout.addLayout(roi_apply_layout)
+
+        delete_layout = QHBoxLayout()
+        self.btn_delete_slice = QPushButton('Delete Current Z')
+        self.btn_delete_slice.setShortcut('Delete')
+        self.btn_delete_slice.clicked.connect(
+            self._delete_selected_label_slice
+        )
+        delete_layout.addWidget(self.btn_delete_slice)
+
+        self.btn_delete_all = QPushButton('Delete All Z')
+        self.btn_delete_all.setShortcut('Ctrl+Delete')
+        self.btn_delete_all.clicked.connect(self._delete_selected_label_all)
+        delete_layout.addWidget(self.btn_delete_all)
+        curation_layout.addLayout(delete_layout)
+
+        delete_inside_layout = QHBoxLayout()
+        self.btn_delete_inside = QPushButton('Delete Inside ROI (All Z)')
+        self.btn_delete_inside.clicked.connect(
+            self._enter_delete_inside_roi_mode
+        )
+        delete_inside_layout.addWidget(self.btn_delete_inside)
+        curation_layout.addLayout(delete_inside_layout)
+
+        self.btn_export_log = QPushButton('Export Log')
+        self.btn_export_log.clicked.connect(self._export_log)
+        curation_layout.addWidget(self.btn_export_log)
+
+        curation_group.setLayout(curation_layout)
+        layout.addWidget(curation_group)
+
+        layout.addSpacing(15)
+
+        # ---------- Save group ----------
+        save_group = QGroupBox('Save')
+        save_group.setStyleSheet(group_style)
+        save_layout_main = QVBoxLayout()
+
+        path_layout = QHBoxLayout()
+        self.path_edit = QLineEdit()
+        self.path_edit.setText(
+            os.path.join(os.getcwd(), 'segmentation_results')
+        )
+        path_layout.addWidget(self.path_edit)
+
+        self.btn_browse = QPushButton('Browse')
+        self.btn_browse.clicked.connect(self._browse_folder)
+        path_layout.addWidget(self.btn_browse)
+        save_layout_main.addLayout(path_layout)
+
+        format_layout = QHBoxLayout()
+        format_layout.addWidget(QLabel('Save format:'))
+
+        self.save_format_combo = QComboBox()
+        self.save_format_combo.addItems(['Zarr (recommended)', 'TIFF'])
+        format_layout.addWidget(self.save_format_combo)
+        save_layout_main.addLayout(format_layout)
+
+        save_action_layout = QHBoxLayout()
+        self.chk_renumber = QCheckBox('Update Labels')
+        self.chk_renumber.setChecked(True)
+        save_action_layout.addWidget(self.chk_renumber)
+
+        self.btn_save = QPushButton('Save')
+        self.btn_save.clicked.connect(self._save_current_labels)
+        save_action_layout.addWidget(self.btn_save)
+        save_layout_main.addLayout(save_action_layout)
+
+        save_group.setLayout(save_layout_main)
+        layout.addWidget(save_group)
+
+        # Initialize control states
+        self._update_curation_controls()
+        self.viewer.bind_key('q', self._go_to_previous_slice)
+        self.viewer.bind_key('w', self._go_to_next_slice)
+
+        layout.addStretch()
+
+    def _init_seg_tab(self):
+        layout = QVBoxLayout(self.seg_tab)
 
         # Mode selection combo box
         mode_layout = QHBoxLayout()
@@ -427,19 +630,18 @@ class SegmentationWidget(QWidget):
             [
                 'Use manual threshold',
                 'Auto-segmentation',
-                'Load existing segmentation',
             ]
         )
         self.mode_combo.currentIndexChanged.connect(
             self._on_segmentation_mode_changed
         )
         mode_layout.addWidget(self.mode_combo)
-        self.layout().addLayout(mode_layout)
+        layout.addLayout(mode_layout)
 
         # Stacked widget for mode-specific controls
         self.seg_stack = QStackedWidget()
         self.seg_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.layout().addWidget(self.seg_stack)
+        layout.addWidget(self.seg_stack)
 
         # --- Manual threshold mode container ---
         manual_widget = QWidget()
@@ -464,193 +666,146 @@ class SegmentationWidget(QWidget):
         auto_layout.addWidget(self.btn_browse_checkpoint)
         self.seg_stack.addWidget(auto_widget)
 
-        # --- Load existing segmentation mode container ---
-        load_widget = QWidget()
-        load_layout = QHBoxLayout(load_widget)
-        self.btn_show_seg = QPushButton('Load from TIFF')
-        self.btn_show_seg.clicked.connect(self._show_segmentation_tif)
-        load_layout.addWidget(self.btn_show_seg)
-        self.btn_load_zarr = QPushButton('Load from Zarr')
-        self.btn_load_zarr.clicked.connect(self._load_zarr_folder)
-        load_layout.addWidget(self.btn_load_zarr)
-        self.seg_stack.addWidget(load_widget)
-
         # Run button
         self.btn_seg_3d = QPushButton('Run 3D Segmentation')
         self.btn_seg_3d.clicked.connect(self._segment_3d)
-        self.layout().addWidget(self.btn_seg_3d)
+        layout.addWidget(self.btn_seg_3d)
 
-        # --- Manual adjustment controls ---
-        self.layout().addWidget(QLabel(''))
-        title_seg = QLabel('<b>-------------Manual Curation-------------</b>')
-        title_seg.setAlignment(Qt.AlignCenter)  # <-- add this
-        self.layout().addWidget(title_seg)
-
-        # Pick mode toggle button (new)
-        self.btn_pick_mode = QPushButton('Enter Curation Mode')
-        self.btn_pick_mode.clicked.connect(self._toggle_pick_mode)
-        self.layout().addWidget(self.btn_pick_mode)
-
-        # ROI mode selection
-        # ROI drawing mode selection (polygon vs brush)
-        roi_draw_layout = QHBoxLayout()
-        roi_draw_layout.addWidget(QLabel('Draw Mode:'))
-        self.roi_polygon_radio = QRadioButton('Polygon')
-        self.roi_polygon_radio.setChecked(True)
-        self.roi_brush_radio = QRadioButton('Brush')
-        roi_draw_layout.addWidget(self.roi_polygon_radio)
-        roi_draw_layout.addWidget(self.roi_brush_radio)
-        self.layout().addLayout(roi_draw_layout)
-
-        # Connect radio buttons to control brush size visibility
-        self.roi_polygon_radio.toggled.connect(self._on_roi_draw_mode_changed)
-        self.roi_brush_radio.toggled.connect(self._on_roi_draw_mode_changed)
-
-        # Brush size for ROI brush mode (initially hidden)
-        self.brush_size_widget = QWidget()
-        brush_size_layout = QHBoxLayout(self.brush_size_widget)
-        brush_size_layout.addWidget(QLabel('Brush Size:'))
-        self.roi_brush_spin = QSpinBox()
-        self.roi_brush_spin.setRange(1, 100)
-        self.roi_brush_spin.setValue(self._roi_brush_size)  # default 2
-        self.roi_brush_spin.valueChanged.connect(
-            self._on_roi_brush_size_changed
-        )
-        brush_size_layout.addWidget(self.roi_brush_spin)
-        self.brush_size_widget.setVisible(False)  # hidden initially
-        self.layout().addWidget(self.brush_size_widget)
-
-        roi_mode_layout = QHBoxLayout()
-        self.btn_roi_add = QPushButton('Add to Label')
-        self.btn_roi_add.clicked.connect(lambda: self._enter_roi_mode('add'))
-        roi_mode_layout.addWidget(self.btn_roi_add)
-
-        self.btn_roi_subtract = QPushButton('Subtract from Label')
-        self.btn_roi_subtract.clicked.connect(
-            lambda: self._enter_roi_mode('subtract')
-        )
-        roi_mode_layout.addWidget(self.btn_roi_subtract)
-        self.layout().addLayout(roi_mode_layout)
-
-        # Add new label and change label buttons (horizontal layout for alignment)
-        new_label_layout = (
-            QHBoxLayout()
-        )  # Create horizontal layout for two buttons
-
-        # Add New Label button (existing)
-        self.btn_add_new_label = QPushButton('Add New Label')
-        self.btn_add_new_label.clicked.connect(self._add_new_label)
-        new_label_layout.addWidget(self.btn_add_new_label)
-
-        # Add Change Label button (new)
-        self.btn_change_label = QPushButton('Change Label')
-        self.btn_change_label.clicked.connect(
-            self._change_selected_label_id
-        )  # Connect to new method
-        new_label_layout.addWidget(self.btn_change_label)
-
-        self.layout().addLayout(
-            new_label_layout
-        )  # Add horizontal layout to main layout
-
-        # Apply/Cancel buttons for ROI (initially disabled)
-        roi_apply_layout = QHBoxLayout()
-        self.btn_apply_roi = QPushButton('Apply ROI')
-        self.btn_apply_roi.setShortcut('Ctrl+A')
-        self.btn_apply_roi.clicked.connect(self._apply_roi)
-        self.btn_apply_roi.setEnabled(False)
-        roi_apply_layout.addWidget(self.btn_apply_roi)
-
-        self.btn_cancel_roi = QPushButton('Cancel ROI')
-        self.btn_cancel_roi.clicked.connect(self._cancel_roi)
-        self.btn_cancel_roi.setEnabled(False)
-        roi_apply_layout.addWidget(self.btn_cancel_roi)
-        self.layout().addLayout(roi_apply_layout)
-
-        # Delete buttons
-        delete_layout = QHBoxLayout()
-        self.btn_delete_slice = QPushButton('Delete Current Z')
-        self.btn_delete_slice.setShortcut('Delete')
-        self.btn_delete_slice.clicked.connect(
-            self._delete_selected_label_slice
-        )
-        delete_layout.addWidget(self.btn_delete_slice)
-
-        self.btn_delete_all = QPushButton('Delete All Z')
-        self.btn_delete_all.clicked.connect(self._delete_selected_label_all)
-        delete_layout.addWidget(self.btn_delete_all)
-        self.layout().addLayout(delete_layout)
-
-        delete_inside_layout = QHBoxLayout()
-        self.btn_delete_inside = QPushButton('Delete Inside ROI (All Z)')
-        self.btn_delete_inside.clicked.connect(
-            self._enter_delete_inside_roi_mode
-        )
-        delete_inside_layout.addWidget(self.btn_delete_inside)
-        self.layout().addLayout(delete_inside_layout)
-
-        # --- Advanced ---
-        self.layout().addWidget(QLabel(''))
-        title_seg = QLabel(
-            '<b>----------------- Advanced -----------------</b>'
-        )
-        title_seg.setAlignment(Qt.AlignCenter)  # <-- add this
-        self.layout().addWidget(title_seg)
+        layout.addSpacing(20)
 
         self.btn_finetune = QPushButton('Finetune with Current Labels')
         self.btn_finetune.clicked.connect(self._finetune_network)
-        self.layout().addWidget(self.btn_finetune)
+        layout.addWidget(self.btn_finetune)
 
         self.btn_localfinetune = QPushButton('Re-segmented Local Area')
         self.btn_localfinetune.clicked.connect(self._local_finetune)
-        self.layout().addWidget(self.btn_localfinetune)
+        layout.addWidget(self.btn_localfinetune)
+        layout.addStretch()
 
-        # Add Quantitative Statistics button
-        self.btn_stats = QPushButton('Quantitative Statistics')
+    def _init_analysis_tab(self):
+        layout = QVBoxLayout(self.analysis_tab)
+
+        # ---------- 3D label reconstruction group ----------
+        recon_group = QGroupBox('3D Label Reconstruction')
+        recon_group.setStyleSheet("""
+            QGroupBox {
+                font-size: 10pt;
+                border: 1px solid #bfbfbf;
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top center;
+                font-weight: bold;
+                left: -6px;
+                padding: 0 6px 0 6px;
+            }
+        """)
+        recon_layout = QVBoxLayout()
+
+        # Row 1: Z resolution
+        z_res_layout = QHBoxLayout()
+        z_res_layout.addWidget(QLabel('Z Ratio:'))
+        self.z_res_spin = QDoubleSpinBox()
+        self.z_res_spin.setRange(0.1, 10.0)
+        self.z_res_spin.setSingleStep(0.1)
+        self.z_res_spin.setValue(1.0)
+        z_res_layout.addWidget(self.z_res_spin)
+        recon_layout.addLayout(z_res_layout)
+
+        # Row 2: reconstruct selected label
+        self.btn_3d_reconstruct = QPushButton('Reconstruct Selected Label')
+        self.btn_3d_reconstruct.clicked.connect(self._show_3d_reconstruction)
+        recon_layout.addWidget(self.btn_3d_reconstruct)
+
+        # Row 3: save mesh / load mesh
+        mesh_io_layout = QHBoxLayout()
+
+        self.btn_load_3d_mesh = QPushButton('Load Mesh')
+        self.btn_load_3d_mesh.clicked.connect(self._load_3d_mesh)
+        mesh_io_layout.addWidget(self.btn_load_3d_mesh)
+
+        self.btn_save_3d_mesh = QPushButton('Save Mesh')
+        self.btn_save_3d_mesh.clicked.connect(self._save_3d_mesh)
+        self.btn_save_3d_mesh.setEnabled(False)
+        mesh_io_layout.addWidget(self.btn_save_3d_mesh)
+
+        recon_layout.addLayout(mesh_io_layout)
+        recon_group.setLayout(recon_layout)
+        layout.addWidget(recon_group)
+        layout.addSpacing(12)
+        # ---------- Quantitative statistics group ----------
+        stats_group = QGroupBox('Quantitative Statistics')
+        stats_group.setStyleSheet("""
+            QGroupBox {
+                font-size: 10pt;
+                border: 1px solid #bfbfbf;
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top center;
+                font-weight: bold;
+                padding: 0 6px 0 6px;
+            }
+        """)
+        stats_layout = QVBoxLayout()
+
+        self.btn_stats = QPushButton('Calculate Size Distribution')
         self.btn_stats.clicked.connect(self._show_quantitative_stats)
-        self.layout().addWidget(self.btn_stats)
+        stats_layout.addWidget(self.btn_stats)
 
-        # Save directory selector
-        self.layout().addWidget(QLabel(''))
-        title_seg = QLabel('<b>-------------------Save-------------------</b>')
-        title_seg.setAlignment(Qt.AlignCenter)
-        self.layout().addWidget(title_seg)
+        stats_group.setLayout(stats_layout)
+        layout.addWidget(stats_group)
 
-        # Directory selection
-        path_layout = QHBoxLayout()
-        self.path_edit = QLineEdit()
-        self.path_edit.setText(
-            os.path.join(os.getcwd(), 'segmentation_results')
-        )
-        path_layout.addWidget(self.path_edit)
-        self.btn_browse = QPushButton('Browse')
-        self.btn_browse.clicked.connect(self._browse_folder)
-        path_layout.addWidget(self.btn_browse)
-        self.layout().addLayout(path_layout)
+        layout.addStretch()
 
-        # --- Add format selection combo box here ---
-        format_layout = QHBoxLayout()
-        format_layout.addWidget(QLabel('Save format:'))
-        self.save_format_combo = QComboBox()
-        self.save_format_combo.addItems(
-            ['TIFF', 'Zarr (recommended for big images)']
-        )
-        format_layout.addWidget(self.save_format_combo)
-        self.layout().addLayout(format_layout)
+    def _toggle_contour(self, checked):
+        for layer in self.viewer.layers:
+            if isinstance(layer, Labels):
+                layer.contour = checked
 
-        # Save button and renumber checkbox
-        save_layout = QHBoxLayout()
-        self.chk_renumber = QCheckBox('Update Labels')
-        self.chk_renumber.setChecked(True)  # default checked
-        save_layout.addWidget(self.chk_renumber)
+    def _go_to_previous_slice(self, viewer):
+        """Navigate to previous slice (like left arrow)."""
+        dims = viewer.dims
+        if dims.ndim > 0:
+            current_step = list(dims.current_step)
+            # Change the first dimension (usually Z). Adjust index if needed.
+            current_step[0] = max(0, current_step[0] - 1)
+            dims.current_step = tuple(current_step)
 
-        self.btn_save = QPushButton('Save')
-        self.btn_save.clicked.connect(self._save_current_labels)
-        save_layout.addWidget(self.btn_save)
+    def _go_to_next_slice(self, viewer):
+        """Navigate to next slice (like right arrow)."""
+        dims = viewer.dims
+        if dims.ndim > 0:
+            current_step = list(dims.current_step)
+            current_step[0] = min(dims.nsteps[0] - 1, current_step[0] + 1)
+            dims.current_step = tuple(current_step)
 
-        self.layout().addLayout(save_layout)
-        # Initialise control states
-        self._update_curation_controls()
+    def _apply_contour_to_existing_labels(self):
+        """add contours for existing labels (only once)"""
+        for layer in self.viewer.layers:
+            if isinstance(layer, Labels):
+                if (
+                    not hasattr(layer, '_contour_initialized')
+                    or not layer._contour_initialized
+                ):
+                    layer.contour = False
+                    layer.edge_color = 'white'
+                    layer.edge_width = 1
+                    layer._contour_initialized = True
+                self.chk_contour.blockSignals(True)
+                self.chk_contour.setChecked(layer.contour)
+                self.chk_contour.blockSignals(False)
+        labels_layer = self._get_labels_layer()
+        if labels_layer:
+            self.chk_contour.blockSignals(True)
+            self.chk_contour.setChecked(labels_layer.contour)
+            self.chk_contour.blockSignals(False)
 
     def _update_curation_controls(self):
         """
@@ -663,15 +818,17 @@ class SegmentationWidget(QWidget):
             self._current_roi_mode is not None
             or self._new_label_mode_active
             or self._delete_inside_mode_active
+            or self._delete_all_active
         )
         # Buttons that are always disabled when curation mode is off
         self.btn_roi_add.setEnabled(curation_active)
         self.btn_roi_subtract.setEnabled(curation_active)
         self.btn_add_new_label.setEnabled(curation_active)
-        self.btn_delete_slice.setEnabled(curation_active)
-        self.btn_delete_all.setEnabled(curation_active)
-        self.btn_change_label.setEnabled(curation_active)
+        self.btn_delete_slice.setEnabled(curation_active and not in_session)
+        self.btn_delete_all.setEnabled(curation_active and not in_session)
+        self.btn_change_label.setEnabled(curation_active and not in_session)
         self.btn_delete_inside.setEnabled(curation_active and not in_session)
+        self.btn_export_log.setEnabled(curation_active)
         # Apply/Cancel are only enabled during an active ROI or new-label session,
         # and only if curation mode is active
         if curation_active and in_session:
@@ -693,6 +850,12 @@ class SegmentationWidget(QWidget):
             self._on_roi_draw_mode_changed()  # this handles visibility of brush_size_widget
         else:
             self.brush_size_widget.setVisible(False)
+
+        active_labels = self._get_labels_layer()
+        if active_labels:
+            self.chk_contour.blockSignals(False)
+            self.chk_contour.setChecked(active_labels.contour)
+            self.chk_contour.blockSignals(False)
 
     def _on_roi_draw_mode_changed(self):
         """Show brush size widget only when brush mode is selected."""
@@ -742,7 +905,6 @@ class SegmentationWidget(QWidget):
         # Get active labels layer (reuse existing method)
         labels_layer = self._get_labels_layer()
         if labels_layer is None:
-            notifications.show_warning('No labels layer found!')
             return
 
         # Get current selected label (source ID) - skip background (0)
@@ -755,8 +917,6 @@ class SegmentationWidget(QWidget):
         current_z = self.viewer.dims.current_step[0]
 
         # Show input dialog for new label ID
-        from qtpy.QtWidgets import QInputDialog
-
         new_label, ok = QInputDialog.getInt(
             self,
             'Change Label ID',
@@ -868,7 +1028,7 @@ class SegmentationWidget(QWidget):
         for layer in self.viewer.layers:
             if isinstance(layer, Labels):
                 return layer
-        notifications.show_error('No Labels layer found.')
+        # notifications.show_error('No Labels layer found.')
         return None
 
     def _save_labels(self, labels: np.ndarray, base_filename: str):
@@ -930,6 +1090,7 @@ class SegmentationWidget(QWidget):
 
         # Create worker and thread
         self.seg_thread = QThread()
+        self._apply_contour_to_existing_labels()
         self.seg_worker = SegmentationWorker(
             data, mode, threshold=thresh, checkpoint=checkpoint
         )
@@ -966,7 +1127,11 @@ class SegmentationWidget(QWidget):
                 result = da.from_array(result, chunks='auto')
             active = self._get_active_image()
             name = active.name if active else 'seg'
-            self.viewer.add_labels(result, name=f'{name}_seg')
+            layer = self.viewer.add_labels(result, name=f'{name}_seg')
+            layer.contour = False
+            layer.edge_color = 'white'
+            layer.edge_width = 1
+            layer.opacity = 0.8
             notifications.show_info('Segmentation completed.')
         else:
             notifications.show_warning('Segmentation returned no result.')
@@ -992,10 +1157,22 @@ class SegmentationWidget(QWidget):
         if filepath:
             if filepath.endswith('.zarr'):
                 data = da.from_zarr(filepath)
-                self.viewer.add_labels(data, name=os.path.basename(filepath))
+                layer = self.viewer.add_labels(
+                    data, name=os.path.basename(filepath)
+                )
+                layer.contour = False
+                layer.edge_color = 'white'
+                layer.edge_width = 1
+                layer.opacity = 0.8
             else:
-                labels = io.imread(filepath)
-                self.viewer.add_labels(labels, name=os.path.basename(filepath))
+                data = io.imread(filepath)
+                layer = self.viewer.add_labels(
+                    data, name=os.path.basename(filepath)
+                )
+                layer.contour = False
+                layer.edge_color = 'white'
+                layer.edge_width = 1
+                layer.opacity = 0.8
 
     def _load_zarr_folder(self):
         """Open a directory dialog to select a Zarr folder and load it."""
@@ -1015,7 +1192,13 @@ class SegmentationWidget(QWidget):
                     notifications.show_warning(
                         'Zarr is read-only. Modifications may not be saved.'
                     )
-                self.viewer.add_labels(data, name=os.path.basename(folder))
+                layer = self.viewer.add_labels(
+                    data, name=os.path.basename(folder)
+                )
+                layer.contour = False
+                layer.edge_color = 'white'
+                layer.edge_width = 1
+                layer.opacity = 0.8
                 notifications.show_info(f'Loaded Zarr from {folder}')
             except (ValueError, OSError) as e:
                 notifications.show_error(f'Failed to load Zarr: {e}')
@@ -1045,6 +1228,7 @@ class SegmentationWidget(QWidget):
             slice_data[mask] = 0
             labels_layer.data[z_idx] = slice_data  # for zarr
             labels_layer.refresh()
+            self.operation_log.append(('delete current Z', label_val))
             notifications.show_info(
                 f'Label {label_val} deleted on slice {z_idx}.'
             )
@@ -1053,8 +1237,40 @@ class SegmentationWidget(QWidget):
                 f'Label {label_val} not found on this slice.'
             )
 
+    def _on_delete_slice_finished(self, label_val, z_idx):
+        """Called when slice deletion completes successfully."""
+        labels_layer = self._get_labels_layer()
+        if labels_layer:
+            labels_layer.refresh()
+            self.operation_log.append(('delete current Z', label_val))
+            notifications.show_info(
+                f'Label {label_val} deleted on slice {z_idx}.'
+            )
+        # Progress dialog is closed automatically by thread finished signal
+
+    def _on_delete_error(self, error_msg):
+        """Handle error from any delete worker."""
+        notifications.show_error(f'Delete failed: {error_msg}')
+
+        # Close progress dialog if it exists
+        if hasattr(self, 'delete_progress'):
+            self.delete_progress.close()
+
+        # Reset any active delete flags and restore UI
+        if self._delete_all_active:
+            self._finalize_delete_all()
+        if self._delete_inside_mode_active:
+            self._finalize_delete_inside()
+        self._update_curation_controls()
+        if hasattr(self, 'delete_all_thread'):
+            self.delete_all_thread.quit()
+            self.delete_all_thread.wait()
+        if hasattr(self, 'delete_inside_thread'):
+            self.delete_inside_thread.quit()
+            self.delete_inside_thread.wait()
+
     def _delete_selected_label_all(self):
-        """Delete the currently selected label on all Z slices."""
+        """Delete the currently selected label on all Z slices (background)."""
         labels_layer = self._get_labels_layer()
         if labels_layer is None:
             return
@@ -1062,64 +1278,60 @@ class SegmentationWidget(QWidget):
         if label_val == 0:
             notifications.show_warning('Cannot delete background (label 0).')
             return
-
         data = labels_layer.data
+        current_z = self.viewer.dims.current_step[0]
+        self._delete_all_active = True
+        self._update_curation_controls()  # This will disable relevant buttons
 
-        # Check data type and apply appropriate deletion method
-        if isinstance(data, np.ndarray):
-            # For numpy arrays, use efficient boolean indexing
-            mask = data == label_val
-            if np.any(mask):
-                data[mask] = 0
-                labels_layer.refresh()
-                notifications.show_info(
-                    f'Label {label_val} deleted on all slices.'
-                )
-            else:
-                notifications.show_info(
-                    f'Label {label_val} not found in volume.'
-                )
+        self.delete_all_thread = QThread()
+        self.delete_all_worker = DeleteAllWorker(data, label_val, current_z)
+        self.delete_all_worker.moveToThread(self.delete_all_thread)
 
-        elif isinstance(data, zarr.Array):
-            # For zarr arrays, process chunk by chunk to avoid loading the whole array
-            import itertools
+        self.delete_all_progress = QProgressDialog(
+            'Deleting label from all slices...', 'Cancel', 0, 100, self
+        )
+        self.delete_all_progress.setWindowTitle('Delete All Progress')
+        self.delete_all_progress.canceled.connect(
+            self.delete_all_thread.requestInterruption
+        )
 
-            found = False
-            # Iterate over all chunks in the zarr array
-            for chunk_coords in itertools.product(
-                *[range(dim) for dim in data.cdata_shape]
-            ):
-                chunk_selection = tuple(
-                    slice(
-                        chunk_idx * data.chunks[i],
-                        min((chunk_idx + 1) * data.chunks[i], data.shape[i]),
-                    )
-                    for i, chunk_idx in enumerate(chunk_coords)
-                )
-                # Read the chunk data as a numpy array (this loads only that chunk)
-                chunk_data = data[chunk_selection]
-                # Create mask for the target label within this chunk
-                chunk_mask = chunk_data == label_val
-                if np.any(chunk_mask):
-                    found = True
-                    # Modify the chunk data and write back to the zarr array
-                    chunk_data[chunk_mask] = 0
-                    data[chunk_selection] = chunk_data
-            # After processing all chunks, refresh and notify
-            if found:
-                labels_layer.refresh()
-                notifications.show_info(
-                    f'Label {label_val} deleted on all slices.'
-                )
-            else:
-                notifications.show_info(
-                    f'Label {label_val} not found in volume.'
-                )
-        else:
-            # Unsupported data type
-            notifications.show_error(
-                f'Unsupported data type for deletion: {type(data)}'
-            )
+        self.delete_all_worker.progress.connect(
+            self.delete_all_progress.setValue
+        )
+        self.delete_all_worker.progress.connect(
+            lambda v, msg: self.delete_all_progress.setLabelText(msg)
+        )
+        self.delete_all_worker.finished.connect(self._on_delete_all_finished)
+        self.delete_all_worker.error.connect(self._on_delete_error)
+        self.delete_all_thread.started.connect(self.delete_all_worker.run)
+
+        self.delete_all_thread.finished.connect(
+            lambda: self._finalize_delete_all()
+        )
+        self.delete_all_worker.finished.connect(self.delete_all_thread.quit)
+        self.delete_all_worker.finished.connect(
+            self.delete_all_worker.deleteLater
+        )
+        self.delete_all_thread.finished.connect(
+            self.delete_all_thread.deleteLater
+        )
+        self.delete_all_thread.finished.connect(self.delete_all_progress.close)
+
+        self.delete_all_thread.start()
+        self.delete_all_progress.show()
+
+    def _finalize_delete_all(self):
+        """Reset delete-all flag and restore UI."""
+        self._delete_all_active = False
+        self._update_curation_controls()
+
+    def _on_tab_changed(self, index):
+        """activate pick mode when analysis"""
+        if (
+            index == self.tab_widget.indexOf(self.analysis_tab)
+            and not self._pick_mode_active
+        ):
+            self._toggle_pick_mode()
 
     # ---------- Pick mode toggle ----------
     def _toggle_pick_mode(self):
@@ -1131,6 +1343,11 @@ class SegmentationWidget(QWidget):
         if self._pick_mode_active:
             # Currently in pick mode, switch to pan_zoom (or previous mode)
             labels_layer.mode = 'pan_zoom'
+            self._current_roi_mode = None
+            self._new_label_mode_active = False
+            self._delete_inside_mode_active = False
+            self._delete_all_active = False
+            self._update_curation_controls()
             self.btn_pick_mode.setText('Enter Curation Mode')
             self._pick_mode_active = False
             notifications.show_info('Curation mode deactivated.')
@@ -1144,6 +1361,19 @@ class SegmentationWidget(QWidget):
             )
         # Update enable/disable state of all curation controls
         self._update_curation_controls()
+
+    def _on_delete_all_finished(self, label_val):
+        labels_layer = self._get_labels_layer()
+        if labels_layer:
+            labels_layer.refresh()
+            self.operation_log.append(('delete all Z', label_val))
+            notifications.show_info(
+                f'Label {label_val} nearby slices (current ±30).'
+            )
+        else:
+            notifications.show_info(
+                f'Label {label_val} not found in nearby slices.'
+            )
 
     # ---------- ROI drawing and application ----------
     def _enter_roi_mode(self, mode: str, target_label=None):
@@ -1314,6 +1544,7 @@ class SegmentationWidget(QWidget):
         if self._current_roi_mode == 'add':
             # Set all pixels inside ROI to target_label
             data[z_idx, yy, xx] = target_label
+            self.operation_log.append(('add to label', target_label))
             notifications.show_info(
                 f'Added label {target_label} inside ROI(s) on slice {z_idx}.'
             )
@@ -1324,6 +1555,7 @@ class SegmentationWidget(QWidget):
                 sub_yy = yy[mask_sub]
                 sub_xx = xx[mask_sub]
                 data[z_idx, sub_yy, sub_xx] = 0
+            self.operation_log.append(('subtract from label', target_label))
             notifications.show_info(
                 f'Subtracted label {target_label} inside ROI(s) on slice {z_idx}.'
             )
@@ -1400,12 +1632,9 @@ class SegmentationWidget(QWidget):
 
             # Apply the masks to the labels layer
             data = labels_layer.data
-            brush_data = self._roi_brush_layer.data
-            for z in range(data.shape[0]):
-                slice_mask = brush_data[z] == 1
-                if np.any(slice_mask):
-                    yy, xx = np.where(slice_mask)
-                    data[z, yy, xx] = target_label
+            for z, mask in slice_masks.items():
+                yy, xx = np.where(mask)
+                data[z, yy, xx] = target_label
             # labels_layer.refresh()
             notifications.show_info(f'New label {target_label} added.')
 
@@ -1443,6 +1672,7 @@ class SegmentationWidget(QWidget):
             notifications.show_info(f'New label {target_label} added.')
 
         # Update the labels layer
+        self.operation_log.append(('add new label', target_label))
         self._modify_labels(labels_layer, data)
 
         # Clean up and exit new‑label mode
@@ -1472,6 +1702,8 @@ class SegmentationWidget(QWidget):
         self._roi_brush_layer = None
         self._current_roi_mode = None
         self._roi_target_label = None
+        if self._delete_all_active:
+            self._delete_all_active = False
         self._update_curation_controls()
         # Activate the specified labels layer, or any labels layer if none specified
         if labels_layer_to_activate is not None:
@@ -1585,13 +1817,12 @@ class SegmentationWidget(QWidget):
         )
 
     def _apply_delete_inside(self):
-        """Delete entire cells (labels) that intersect the drawn polygon across all Z slices."""
+        """Delete entire cells intersecting the drawn polygon (background)."""
         labels_layer = self._get_labels_layer()
         if labels_layer is None:
             self._cancel_roi()
             return
 
-        # Ensure we have a polygon layer
         if (
             self._roi_layer is None
             or self._roi_layer not in self.viewer.layers
@@ -1600,98 +1831,105 @@ class SegmentationWidget(QWidget):
             self._cancel_roi()
             return
 
-        shapes_data = self._roi_layer.data
+        shapes_data = (
+            self._roi_layer.data.copy()
+        )  # copy to avoid reference issues
         if len(shapes_data) == 0:
             notifications.show_warning('No polygons drawn.')
             self._cancel_roi()
             return
 
-        # Get current Z slice index (assume Z is first axis)
         current_z = self.viewer.dims.current_step[0]
-
-        # Generate mask for the current slice based on the polygon(s)
-        slice_shape = labels_layer.data.shape[1:3]  # (Y, X)
-        combined_mask = np.zeros(slice_shape, dtype=bool)
-        from skimage.draw import polygon as draw_polygon
-
-        for polygon in shapes_data:
-            # polygon is an (N, 2) array of (y, x) vertices
-            rr, cc = draw_polygon(polygon[:, 0], polygon[:, 1], slice_shape)
-            combined_mask[rr, cc] = True
-
-        if not np.any(combined_mask):
-            notifications.show_warning('No pixels inside polygon.')
-            self._cancel_roi()
-            return
-
-        # Get the current slice data to find which labels are inside the polygon
         data = labels_layer.data
-        current_slice_data = data[current_z]
 
-        # Extract the unique label IDs present inside the polygon (excluding background 0)
-        if isinstance(current_slice_data, np.ndarray):
-            labels_inside = np.unique(current_slice_data[combined_mask])
-        elif isinstance(current_slice_data, zarr.Array):
-            # For zarr, the slice might be a zarr array; convert to numpy for unique
-            labels_inside = np.unique(current_slice_data[combined_mask])
-        else:
-            notifications.show_error(
-                f'Unsupported data type: {type(current_slice_data)}'
-            )
-            self._cancel_roi()
-            return
+        # Manually remove ROI layers WITHOUT resetting the mode flag
+        if (
+            self._roi_layer is not None
+            and self._roi_layer in self.viewer.layers
+        ):
+            self.viewer.layers.remove(self._roi_layer)
+            self._roi_layer = None
+        if (
+            self._roi_brush_layer is not None
+            and self._roi_brush_layer in self.viewer.layers
+        ):
+            self.viewer.layers.remove(self._roi_brush_layer)
+            self._roi_brush_layer = None
 
-        # Remove background if present
-        labels_inside = labels_inside[labels_inside != 0]
+        # Disable Apply/Cancel buttons immediately (they are no longer needed)
+        self.btn_apply_roi.setEnabled(False)
+        self.btn_cancel_roi.setEnabled(False)
 
-        if len(labels_inside) == 0:
-            notifications.show_info(
-                'No non-background labels found inside the polygon.'
-            )
-            self._cancel_roi()
-            return
+        # Create thread and worker
+        self.delete_inside_thread = QThread()
+        self.delete_inside_worker = DeleteInsideWorker(
+            data, shapes_data, current_z
+        )
+        self.delete_inside_worker.moveToThread(self.delete_inside_thread)
 
-        # Delete each label across all Z slices
-        total_slices = data.shape[0]
-        deleted_count = 0
-        for label_id in labels_inside:
-            # Process slice by slice to avoid loading entire volume for large arrays
-            for z in range(total_slices):
-                slice_data = data[z]
-                # Create mask for current slice where label equals target
-                if isinstance(slice_data, np.ndarray):
-                    mask = slice_data == label_id
-                elif isinstance(slice_data, zarr.Array):
-                    # Read slice as numpy for masking (zarr supports boolean indexing with numpy mask)
-                    mask = np.asarray(slice_data) == label_id
-                else:
-                    notifications.show_error(
-                        f'Unsupported slice data type: {type(slice_data)}'
-                    )
-                    continue
-
-                if np.any(mask):
-                    # Set those pixels to 0
-                    if isinstance(slice_data, np.ndarray):
-                        slice_data[mask] = 0
-                    elif isinstance(slice_data, zarr.Array):
-                        slice_data[mask] = (
-                            0  # zarr supports boolean indexing assignment
-                        )
-                    # No need to reassign; modifications are in-place
-                    data[z] = slice_data
-            deleted_count += 1
-
-        # Force refresh: call refresh and explicitly trigger data change event
-        self._modify_labels(labels_layer, data)
-        labels_layer.refresh()
-
-        notifications.show_info(
-            f'Deleted {deleted_count} label(s) that intersected the polygon.'
+        # Progress dialog
+        self.delete_inside_progress = QProgressDialog(
+            'Deleting inside ROI...', 'Cancel', 0, 100, self
+        )
+        self.delete_inside_progress.setWindowTitle(
+            'Delete Inside ROI Progress'
+        )
+        self.delete_inside_progress.canceled.connect(
+            self.delete_inside_thread.requestInterruption
         )
 
-        # Clean up
-        self._cancel_roi(labels_layer_to_activate=labels_layer)
+        self.delete_inside_worker.progress.connect(
+            self.delete_inside_progress.setValue
+        )
+        self.delete_inside_worker.progress.connect(
+            lambda v, msg: self.delete_inside_progress.setLabelText(msg)
+        )
+        self.delete_inside_worker.finished.connect(
+            self._on_delete_inside_finished
+        )
+        self.delete_inside_worker.error.connect(self._on_delete_error)
+        self.delete_inside_thread.started.connect(
+            self.delete_inside_worker.run
+        )
+
+        self.delete_inside_thread.finished.connect(
+            lambda: self._finalize_delete_inside()
+        )
+        self.delete_inside_worker.finished.connect(
+            self.delete_inside_thread.quit
+        )
+        self.delete_inside_worker.finished.connect(
+            self.delete_inside_worker.deleteLater
+        )
+        self.delete_inside_thread.finished.connect(
+            self.delete_inside_thread.deleteLater
+        )
+        self.delete_inside_thread.finished.connect(
+            self.delete_inside_progress.close
+        )
+
+        self.delete_inside_thread.start()
+        self.delete_inside_progress.show()
+
+    def _finalize_delete_inside(self):
+        """Reset delete-inside flag and restore UI."""
+        self._delete_inside_mode_active = False
+        self._update_curation_controls()
+
+    def _on_delete_inside_finished(self, deleted_count):
+        labels_layer = self._get_labels_layer()
+        if labels_layer:
+            labels_layer.refresh()
+            self.operation_log.append(
+                ('delete inside roi + apply roi', deleted_count)
+            )
+            notifications.show_info(
+                f'Deleted {deleted_count} label(s) that intersected the polygon.'
+            )
+        else:
+            notifications.show_info(
+                'No labels found inside polygon or operation cancelled.'
+            )
 
     def _add_new_label(self):
         """Enter a mode to draw a new label on any slice. Drawings accumulate until Apply/Cancel."""
@@ -1764,6 +2002,299 @@ class SegmentationWidget(QWidget):
             f'Adding new label {new_label}. Draw on any slice. Click Apply to confirm, Cancel to abort.'
         )
 
+    def _show_3d_reconstruction(self):
+        """
+        Build the 3D reconstruction for the selected label.
+
+        Heavy mesh extraction runs in a worker thread.
+        The final 3D display is shown in a separate napari viewer window
+        using a Surface layer.
+        """
+        labels_layer = self._get_labels_layer()
+        if labels_layer is None:
+            return
+
+        selected_label = int(labels_layer.selected_label)
+        if selected_label == 0:
+            QMessageBox.warning(
+                self, 'No Label', 'Please select a non-background label first.'
+            )
+            return
+
+        zratio = float(self.z_res_spin.value())
+
+        self.recon_progress = QProgressDialog(
+            'Preparing 3D reconstruction...',
+            'Cancel',
+            0,
+            100,
+            self,
+        )
+        self.recon_progress.setWindowTitle('3D Reconstruction')
+        self.recon_progress.setAutoClose(True)
+        self.recon_progress.setMinimumDuration(0)
+        self.recon_progress.setValue(0)
+        self.recon_progress.show()
+
+        self.recon_thread = QThread(self)
+
+        # Wrap ReconstructionWorker with QObject-style signals dynamically
+        class _QtReconstructionWorker(ReconstructionWorker, QObject):
+            finished = Signal(object)
+            error = Signal(str)
+            progress = Signal(int, str)
+
+            def __init__(self, labels_data, label_id, zratio):
+                QObject.__init__(self)
+                ReconstructionWorker.__init__(
+                    self, labels_data, label_id, zratio
+                )
+
+        self.recon_worker = _QtReconstructionWorker(
+            labels_layer.data,
+            selected_label,
+            zratio,
+        )
+        self.recon_worker.moveToThread(self.recon_thread)
+
+        self.recon_thread.started.connect(self.recon_worker.run)
+        self.recon_worker.progress.connect(self._on_recon_progress)
+        self.recon_worker.finished.connect(self._on_reconstruction_finished)
+        self.recon_worker.error.connect(self._on_recon_error)
+
+        self.recon_progress.canceled.connect(self.recon_worker.cancel)
+
+        self.recon_worker.finished.connect(self.recon_thread.quit)
+        self.recon_worker.error.connect(self.recon_thread.quit)
+        self.recon_worker.finished.connect(self.recon_worker.deleteLater)
+        self.recon_worker.error.connect(self.recon_worker.deleteLater)
+        self.recon_thread.finished.connect(self.recon_thread.deleteLater)
+
+        self.recon_thread.start()
+
+    def _on_recon_progress(self, value, message):
+        """Update progress dialog safely."""
+        if hasattr(self, 'recon_progress') and self.recon_progress is not None:
+            self.recon_progress.setValue(int(value))
+            self.recon_progress.setLabelText(str(message))
+
+    def _on_reconstruction_finished(self, result):
+        """
+        Handle successful reconstruction.
+
+        Instead of creating a custom VTK dialog, open a separate napari viewer
+        and display the reconstructed mesh as a Surface layer.
+        """
+        if hasattr(self, 'recon_progress') and self.recon_progress is not None:
+            self.recon_progress.close()
+            self.recon_progress = None
+
+        if result is None or result.get('n_vertices', 0) == 0:
+            QMessageBox.information(
+                self, 'Empty', 'No voxels found for this label.'
+            )
+            return
+
+        self.recon_result = result
+        self.btn_save_3d_mesh.setEnabled(True)
+
+        vertices_xyz = result['vertices']
+        faces = result['faces']
+
+        if (
+            vertices_xyz is None
+            or faces is None
+            or len(vertices_xyz) == 0
+            or len(faces) == 0
+        ):
+            QMessageBox.information(
+                self, 'Empty', 'No valid mesh was generated for this label.'
+            )
+            return
+
+        # Convert coordinates from X, Y, Z to napari's expected Z, Y, X order.
+        # Z is already scaled by zratio in the worker output.
+        vertices_zyx = np.column_stack(
+            [
+                vertices_xyz[:, 2],
+                vertices_xyz[:, 1],
+                vertices_xyz[:, 0],
+            ]
+        ).astype(np.float32)
+
+        # Use Z coordinate as vertex values for coloring
+        vertex_values = vertices_zyx[:, 0].astype(np.float32)
+
+        # Close previous reconstruction viewer if it exists
+        if hasattr(self, 'recon_viewer') and self.recon_viewer is not None:
+            with suppress(Exception):
+                self.recon_viewer.close()
+
+        labels_layer = self._get_labels_layer()
+        label_name = 'label'
+        label_id = '?'
+        if labels_layer is not None:
+            label_name = labels_layer.name
+            label_id = labels_layer.selected_label
+
+        # Open a separate napari viewer in 3D mode
+        self.recon_viewer = napari.Viewer(
+            title=f'3D Reconstruction - {label_name} - Label {label_id}',
+            ndisplay=3,
+        )
+
+        self.recon_surface_layer = self.recon_viewer.add_surface(
+            (vertices_zyx, faces, vertex_values),
+            name=f'Label {label_id}',
+            opacity=1.0,
+            shading='smooth',
+            colormap='viridis',
+        )
+
+        self.recon_viewer.axes.visible = True
+        self.recon_viewer.scale_bar.visible = True
+
+        with suppress(Exception):
+            self.recon_viewer.reset_view()
+
+    def _on_recon_error(self, error_msg):
+        """Handle reconstruction failure."""
+        if hasattr(self, 'recon_progress') and self.recon_progress is not None:
+            self.recon_progress.close()
+            self.recon_progress = None
+
+        if error_msg == 'Cancelled':
+            return
+
+        QMessageBox.critical(
+            self, 'Error', f'Failed to build 3D model: {error_msg}'
+        )
+
+    def _save_3d_mesh(self):
+        """Save the last reconstructed mesh to an NPZ file."""
+        if not hasattr(self, 'recon_result') or self.recon_result is None:
+            QMessageBox.information(
+                self, 'No Mesh', 'Please reconstruct a 3D mesh first.'
+            )
+            return
+
+        labels_layer = self._get_labels_layer()
+        label_id = None
+        if labels_layer is not None:
+            label_id = int(labels_layer.selected_label)
+
+        default_name = (
+            'reconstruction_mesh.npz'
+            if label_id is None
+            else f'label_{label_id}_mesh.npz'
+        )
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, 'Save 3D Mesh', default_name, 'NumPy mesh (*.npz)'
+        )
+        if not file_path:
+            return
+
+        result = self.recon_result
+
+        np.savez_compressed(
+            file_path,
+            vertices=result['vertices'],
+            faces=result['faces'],
+            n_vertices=np.int32(result['n_vertices']),
+            n_faces=np.int32(result['n_faces']),
+            voxel_count=np.int32(result['voxel_count']),
+            zratio=np.float32(result['zratio']),
+            label_id=np.int32(-1 if label_id is None else label_id),
+        )
+
+        QMessageBox.information(
+            self, 'Saved', f'3D mesh saved to:\n{file_path}'
+        )
+
+    def _load_3d_mesh(self):
+        """Load a saved NPZ mesh file and display it in a 3D napari viewer."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 'Load 3D Mesh', '', 'NumPy mesh (*.npz)'
+        )
+        if not file_path:
+            return
+
+        try:
+            data = np.load(file_path)
+
+            result = {
+                'vertices': data['vertices'],
+                'faces': data['faces'],
+                'n_vertices': int(data['n_vertices']),
+                'n_faces': int(data['n_faces']),
+                'voxel_count': int(data['voxel_count']),
+                'zratio': float(data['zratio']),
+            }
+
+            self.recon_result = result
+            self.btn_save_3d_mesh.setEnabled(True)
+
+            vertices_xyz = result['vertices']
+            faces = result['faces']
+
+            if (
+                vertices_xyz is None
+                or faces is None
+                or len(vertices_xyz) == 0
+                or len(faces) == 0
+            ):
+                QMessageBox.information(
+                    self, 'Empty', 'The loaded mesh file is empty.'
+                )
+                return
+
+            # Convert X, Y, Z back to napari Surface input order: Z, Y, X
+            vertices_zyx = np.column_stack(
+                [
+                    vertices_xyz[:, 2],
+                    vertices_xyz[:, 1],
+                    vertices_xyz[:, 0],
+                ]
+            ).astype(np.float32)
+
+            vertex_values = vertices_zyx[:, 0].astype(np.float32)
+
+            if hasattr(self, 'recon_viewer') and self.recon_viewer is not None:
+                with suppress(Exception):
+                    self.recon_viewer.close()
+                self.recon_viewer = None
+
+            loaded_label_id = '?'
+            if 'label_id' in data:
+                loaded_label_id = int(data['label_id'])
+                if loaded_label_id < 0:
+                    loaded_label_id = '?'
+
+            self.recon_viewer = napari.Viewer(
+                title=f'3D Reconstruction - Loaded Mesh - Label {loaded_label_id}',
+                ndisplay=3,
+            )
+
+            self.recon_surface_layer = self.recon_viewer.add_surface(
+                (vertices_zyx, faces, vertex_values),
+                name=f'Loaded Label {loaded_label_id}',
+                opacity=1.0,
+                shading='smooth',
+                colormap='viridis',
+            )
+
+            self.recon_viewer.axes.visible = True
+            self.recon_viewer.scale_bar.visible = True
+
+            with suppress(Exception):
+                self.recon_viewer.reset_view()
+
+        except (ValueError, OSError, KeyError) as e:
+            QMessageBox.critical(
+                self, 'Load Error', f'Failed to load 3D mesh:\n{e}'
+            )
+
     def _show_quantitative_stats(self):
         """Compute statistics in background, then open dialog."""
         labels_layer = self._get_labels_layer()
@@ -1789,7 +2320,7 @@ class SegmentationWidget(QWidget):
 
         # Worker
         self.stats_thread = QThread()
-        self.stats_worker = StatsWorker(labels_data, image_data)
+        self.stats_worker = QuantitativeWorker(labels_data, image_data)
         self.stats_worker.moveToThread(self.stats_thread)
 
         self.stats_worker.progress.connect(
@@ -1868,7 +2399,7 @@ class SegmentationWidget(QWidget):
 
         # --- Intensity Statistics Group (if available) ---
         # For now, intensity stats are not computed in the background.
-        # You can extend the StatsWorker to also compute and include them in the stats dict.
+        # You can extend the QuantitativeWorker to also compute and include them in the stats dict.
         intensity_group = QGroupBox('Intensity Statistics (within cells)')
         intensity_layout = QVBoxLayout(intensity_group)
         no_intensity_label = QLabel('Intensity statistics not computed.')
@@ -1928,38 +2459,43 @@ class SegmentationWidget(QWidget):
                 )
                 return
 
+    def _export_log(self):
+        """Export the operation log to an Excel file."""
+        if not self.operation_log:
+            QMessageBox.information(self, 'Info', 'No operations to export.')
+            return
+
+        # Ask for save location
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, 'Save Log', '', 'Excel Files (*.xlsx)'
+        )
+        if not file_path:
+            return
+
+        try:
+            import pandas as pd
+
+            df = pd.DataFrame(
+                self.operation_log, columns=['Operation', 'Label ID / Count']
+            )
+            df.to_excel(file_path, index=False)
+            QMessageBox.information(
+                self, 'Success', f'Log exported to {file_path}'
+            )
+        except ImportError:
+            QMessageBox.critical(
+                self,
+                'Missing Dependency',
+                'pandas is required to export Excel files.\n'
+                'Please install it (e.g., pip install pandas openpyxl).',
+            )
+        except (OSError, ValueError) as e:
+            QMessageBox.critical(self, 'Export Failed', str(e))
+
     # ---------- Reserved ----------
     def _finetune_network(self):
         notifications.show_info('Fine-tuning is not yet implemented.')
 
     # ---------- Reserved ----------
     def _local_finetune(self):
-        notifications.show_info('Fine-tuning is not yet implemented.')
-
-
-# ---------- Tracking Widget (reserved) ----------
-class TrackingWidget(QWidget):
-    """Widget for future cell tracking functionality."""
-
-    def __init__(self, napari_viewer):
-        super().__init__()
-        self.viewer = napari_viewer
-        self.setLayout(QVBoxLayout())
-        self._init_ui()
-
-    def _init_ui(self):
-        self.layout().addWidget(QLabel('<b>Cell Tracking (Reserved)</b>'))
-        self.btn_track = QPushButton('Track Cells (Coming Soon)')
-        self.btn_track.setEnabled(False)
-        self.btn_track.clicked.connect(self._placeholder)
-        self.layout().addWidget(self.btn_track)
-
-        self.layout().addWidget(
-            QLabel('Future functionality will be added here.')
-        )
-        self.layout().addStretch()
-
-    def _placeholder(self):
-        notifications.show_info('Tracking not implemented yet.')
-
-    """Main widget for 3D cell segmentation and tracking."""
+        notifications.show_info('local refinement is not yet implemented.')

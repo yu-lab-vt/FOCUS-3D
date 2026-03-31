@@ -10,10 +10,10 @@
 [![Copier](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/copier-org/copier/master/img/badge/badge-grayscale-inverted-border-purple.json)](https://github.com/copier-org/copier)
 
 CellSeg is a user-friendly napari plugin for 3D cell segmentation. Cellseg supports a series of functions such as 3D automatic segmentation, manual curation, 3D structure reconstruction, fine-tuning, quantitative analysis, etc.
- <p align="center">
+<p align="center">
 <img width="823" height="492" alt="image" src="https://github.com/user-attachments/assets/c45dd0ef-73e3-48bd-849a-915669cf2418" />
   <br>
-</p> 
+</p>
 
 ## Installation
 
@@ -45,7 +45,6 @@ You can install `cellseg` with the following steps:
 3. Load labels from `Load Label -> Load from Zarr` (recommended) or `Load Label -> Load from TIFF`.
 4. Manual curation: go to `Manual Curation -> Enter Curation Mode`.  
    For `.zarr` labels, curation results are written directly to the file and saved automatically.
-
 | Operation | Shortcut | Description |
 |---|---|---|
 | Enter Curation Mode | — | Activate label editing mode so you can select and modify labels manually. |
@@ -67,9 +66,9 @@ You can install `cellseg` with the following steps:
  <p align="center">
    <img width="625" height="422" alt="image" src="https://github.com/user-attachments/assets/15616b42-5524-431a-a619-ebb6810c7181" />
   <br>
-</p> 
+</p>
+
 7. Calculate Size Distribution: compute cell count and cell size statistics.
-   
 <p align="center">
   <img width="520" height="236" alt="image" src="https://github.com/user-attachments/assets/da6891eb-765a-43e2-ba90-e155528e497c" />
   <br>
