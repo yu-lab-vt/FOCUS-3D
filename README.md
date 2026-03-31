@@ -28,7 +28,7 @@ You can install `cellseg` with the following steps:
 2. Install `cellseg`:
 
    ```bash
-   cd cellseg
+   pip install napari[all]
    pip install -e .
    ```
 
