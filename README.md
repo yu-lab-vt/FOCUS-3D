@@ -45,6 +45,7 @@ You can install `cellseg` with the following steps:
 3. Load labels from `Load Label -> Load from Zarr` (recommended) or `Load Label -> Load from TIFF`.
 4. Manual curation: go to `Manual Curation -> Enter Curation Mode`.  
    For `.zarr` labels, curation results are written directly to the file and saved automatically.
+   
 | Operation | Shortcut | Description |
 |---|---|---|
 | Enter Curation Mode | — | Activate label editing mode so you can select and modify labels manually. |
