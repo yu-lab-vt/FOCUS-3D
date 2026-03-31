@@ -22,6 +22,7 @@ You can install `cellseg` with the following steps:
 1. Create a new environment in the directory containing `environment.yml`:
 
    ```bash
+   cd your path
    conda env create -n cellseg -f environment.yml
    ```
 
