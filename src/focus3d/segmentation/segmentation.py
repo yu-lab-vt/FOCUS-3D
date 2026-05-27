@@ -144,7 +144,7 @@ def _load_mask2former_inference():
     the Mask2Former code/package is not installed.
     """
     try:
-        from cellseg.segmentation.mask2former_adapter import (
+        from focus3d.segmentation.mask2former_adapter import (
             run_mask2former_inference,
         )
 

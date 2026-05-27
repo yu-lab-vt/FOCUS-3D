@@ -230,7 +230,7 @@ class RefineSelectedCellWorker(QObject):
             )
 
             self.progress.emit(35, 'Running local graph-cut refinement...')
-            from cellseg.basic.Princut_refine.local_refine import (
+            from focus3d.basic.Princut_refine.local_refine import (
                 refine_single_cell_graphcut,
             )
 
@@ -361,12 +361,12 @@ class OneClickModelLoadWorker(QObject):
             )
 
             if backend_name == 'windows':
-                from cellseg.segmentation.FOCUS3D.inference_win import (
+                from focus3d.segmentation.FOCUS3D.inference_win import (
                     build_predictor,
                     setup_cfg,
                 )
             else:
-                from cellseg.segmentation.FOCUS3D.inference import (
+                from focus3d.segmentation.FOCUS3D.inference import (
                     build_predictor,
                     setup_cfg,
                 )
@@ -432,11 +432,11 @@ class ClickedLocalRefineWorker(QObject):
                 5, 'Preparing clicked one-click segmentation...'
             )
 
-            # curation.py is in src/cellseg/basic/curation.py
-            # Mask2former root is src/cellseg/segmentation/Mask2former
+            # curation.py is in src/focus3d/basic/curation.py
+            # Mask2former root is src/focus3d/segmentation/Mask2former
             self.progress.emit(15, 'Importing clicked inference modules...')
 
-            from cellseg.segmentation.FOCUS3D.click_inference import (
+            from focus3d.segmentation.FOCUS3D.click_inference import (
                 infer_clicked_instance,
             )
 
@@ -869,7 +869,7 @@ def _prepare_labels_for_curation(
 
     # Decide where to store editable zarr.
     if output_dir is None or str(output_dir).strip() == '':
-        output_dir = Path.cwd() / 'cellseg_curation_output'
+        output_dir = Path.cwd() / 'focus3d_curation_output'
     else:
         output_dir = Path(output_dir)
 

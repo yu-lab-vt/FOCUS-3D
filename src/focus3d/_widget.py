@@ -70,7 +70,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from cellseg.basic.curation import (
+from focus3d.basic.curation import (
     _add_new_label,
     _apply_delete_inside,
     _apply_new_label,
@@ -114,7 +114,7 @@ from cellseg.basic.curation import (
 
 # from segmentation import SegmentationWorker
 # from local_refine import refine_single_cell_graphcut
-from cellseg.segmentation.seg_io import (
+from focus3d.segmentation.seg_io import (
     _append_log_entry,
     _browse_checkpoint,
     _browse_folder,
@@ -324,7 +324,7 @@ class FineTuneWorker(QObject):
 
     def run(self):
         try:
-            from cellseg.segmentation.FOCUS3D.fine_tune import run_finetune
+            from focus3d.segmentation.FOCUS3D.fine_tune import run_finetune
 
             result = run_finetune(
                 config_file=self.config_file,
@@ -2482,8 +2482,8 @@ class SegmentationWidget(QWidget):
         Return the Mask2former backend root folder.
 
         Expected layout:
-        src/cellseg/_widget.py
-        src/cellseg/segmentation/Mask2former/
+        src/focus3d/_widget.py
+        src/focus3d/segmentation/Mask2former/
         """
         return Path(__file__).resolve().parent / 'segmentation' / 'FOCUS3D'
 
@@ -3122,7 +3122,7 @@ class SegmentationWidget(QWidget):
             image_path = str(image_path)
 
         # ------------------------------------------------------------
-        # 1. Checkpoint / config: relative to cellseg/segmentation/FOCUS3D
+        # 1. Checkpoint / config: relative to focus3d/segmentation/FOCUS3D
         # ------------------------------------------------------------
         checkpoint = self.checkpoint_edit.text().strip()
         if not checkpoint:
@@ -3235,7 +3235,7 @@ class SegmentationWidget(QWidget):
         }
 
         try:
-            from cellseg.segmentation.segmentation import SegmentationWorker
+            from focus3d.segmentation.segmentation import SegmentationWorker
         except Exception as e:
             notifications.show_error(
                 f'Failed to import segmentation module:\n{e}'
@@ -4133,7 +4133,7 @@ class SegmentationWidget(QWidget):
 
 def _lazy_show_3d_reconstruction(self, *args, **kwargs):
     try:
-        from cellseg.analysis.analysis import _show_3d_reconstruction
+        from focus3d.analysis.analysis import _show_3d_reconstruction
     except Exception as e:
         notifications.show_error(f'Failed to import analysis module:\n{e}')
         return
@@ -4143,7 +4143,7 @@ def _lazy_show_3d_reconstruction(self, *args, **kwargs):
 
 def _lazy_toggle_full_3d_view(self, *args, **kwargs):
     try:
-        from cellseg.analysis.analysis import _toggle_full_3d_view
+        from focus3d.analysis.analysis import _toggle_full_3d_view
     except Exception as e:
         notifications.show_error(f'Failed to import analysis module:\n{e}')
         return
@@ -4153,7 +4153,7 @@ def _lazy_toggle_full_3d_view(self, *args, **kwargs):
 
 def _lazy_on_recon_progress(self, *args, **kwargs):
     try:
-        from cellseg.analysis.analysis import _on_recon_progress
+        from focus3d.analysis.analysis import _on_recon_progress
     except Exception as e:
         notifications.show_error(f'Failed to import analysis module:\n{e}')
         return
@@ -4162,7 +4162,7 @@ def _lazy_on_recon_progress(self, *args, **kwargs):
 
 def _lazy_on_reconstruction_finished(self, *args, **kwargs):
     try:
-        from cellseg.analysis.analysis import _on_reconstruction_finished
+        from focus3d.analysis.analysis import _on_reconstruction_finished
     except Exception as e:
         notifications.show_error(f'Failed to import analysis module:\n{e}')
         return
@@ -4171,7 +4171,7 @@ def _lazy_on_reconstruction_finished(self, *args, **kwargs):
 
 def _lazy_on_recon_error(self, *args, **kwargs):
     try:
-        from cellseg.analysis.analysis import _on_recon_error
+        from focus3d.analysis.analysis import _on_recon_error
     except Exception as e:
         notifications.show_error(f'Failed to import analysis module:\n{e}')
         return
@@ -4180,7 +4180,7 @@ def _lazy_on_recon_error(self, *args, **kwargs):
 
 def _lazy_save_3d_mesh(self, *args, **kwargs):
     try:
-        from cellseg.analysis.analysis import _save_3d_mesh
+        from focus3d.analysis.analysis import _save_3d_mesh
     except Exception as e:
         notifications.show_error(f'Failed to import analysis module:\n{e}')
         return
@@ -4190,7 +4190,7 @@ def _lazy_save_3d_mesh(self, *args, **kwargs):
 
 def _lazy_load_3d_mesh(self, *args, **kwargs):
     try:
-        from cellseg.analysis.analysis import _load_3d_mesh
+        from focus3d.analysis.analysis import _load_3d_mesh
     except Exception as e:
         notifications.show_error(f'Failed to import analysis module:\n{e}')
         return
@@ -4200,7 +4200,7 @@ def _lazy_load_3d_mesh(self, *args, **kwargs):
 
 def _lazy_show_quantitative_stats(self, *args, **kwargs):
     try:
-        from cellseg.analysis.analysis import _show_quantitative_stats
+        from focus3d.analysis.analysis import _show_quantitative_stats
     except Exception as e:
         notifications.show_error(f'Failed to import analysis module:\n{e}')
         return
@@ -4210,7 +4210,7 @@ def _lazy_show_quantitative_stats(self, *args, **kwargs):
 
 def _lazy_on_stats_finished(self, *args, **kwargs):
     try:
-        from cellseg.analysis.analysis import _on_stats_finished
+        from focus3d.analysis.analysis import _on_stats_finished
     except Exception as e:
         notifications.show_error(f'Failed to import analysis module:\n{e}')
         return
@@ -4219,7 +4219,7 @@ def _lazy_on_stats_finished(self, *args, **kwargs):
 
 def _lazy_display_stats_dialog(self, *args, **kwargs):
     try:
-        from cellseg.analysis.analysis import _display_stats_dialog
+        from focus3d.analysis.analysis import _display_stats_dialog
     except Exception as e:
         notifications.show_error(f'Failed to import analysis module:\n{e}')
         return

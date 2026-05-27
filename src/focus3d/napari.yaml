@@ -1,50 +1,52 @@
-name: cellseg
-display_name: Cellseg
-# use 'hidden' to remove plugin from napari hub search results
+name: focus-3d
+display_name: FOCUS-3D
 visibility: public
-# see https://napari.org/stable/plugins/technical_references/manifest.html#fields for valid categories
-# categories: []
+
 contributions:
   commands:
-    - id: cellseg.get_reader
-      python_name: cellseg._reader:napari_get_reader
-      title: Open data with Cellseg
-    - id: cellseg.write_multiple
-      python_name: cellseg._writer:write_multiple
-      title: Save multi-layer data with Cellseg
-    - id: cellseg.write_single_image
-      python_name: cellseg._writer:write_single_image
-      title: Save image data with Cellseg
-    - id: cellseg.make_sample_data
-      python_name: cellseg._sample_data:make_sample_data
-      title: Load sample data from Cellseg
-    - id: cellseg.make_segmentation_widget
-      python_name: cellseg._widget:SegmentationWidget
-      title: Open Cell Segmentation Widget
-    - id: cellseg.make_tracking_widget
-      python_name: cellseg._widget:TrackingWidget
-      title: Open Cell Tracking Widget
+    - id: focus-3d.get_reader
+      python_name: focus3d._reader:napari_get_reader
+      title: Open data with FOCUS-3D
+
+    - id: focus-3d.write_multiple
+      python_name: focus3d._writer:write_multiple
+      title: Save multi-layer data with FOCUS-3D
+
+    - id: focus-3d.write_single_image
+      python_name: focus3d._writer:write_single_image
+      title: Save image data with FOCUS-3D
+
+    - id: focus-3d.make_sample_data
+      python_name: focus3d._sample_data:make_sample_data
+      title: Load sample data from FOCUS-3D
+
+    - id: focus-3d.make_segmentation_widget
+      python_name: focus3d._widget:SegmentationWidget
+      title: Open FOCUS-3D Segmentation Widget
+
+    - id: focus-3d.make_tracking_widget
+      python_name: focus3d._widget:TrackingWidget
+      title: Open FOCUS-3D Tracking Widget
+
   readers:
-    - command: cellseg.get_reader
+    - command: focus-3d.get_reader
       accepts_directories: false
       filename_patterns: ['*.npy']
+
   writers:
-    - command: cellseg.write_multiple
-      layer_types: ['image*','labels*']
+    - command: focus-3d.write_multiple
+      layer_types: ['image*', 'labels*']
       filename_extensions: []
-    - command: cellseg.write_single_image
+
+    - command: focus-3d.write_single_image
       layer_types: ['image']
       filename_extensions: ['.npy']
+
   sample_data:
-    - command: cellseg.make_sample_data
-      display_name: Cellseg
+    - command: focus-3d.make_sample_data
+      display_name: FOCUS-3D
       key: unique_id.1
+
   widgets:
-    - command: cellseg.make_segmentation_widget
+    - command: focus-3d.make_segmentation_widget
       display_name: 3D Segmentation
-  menus:
-    napari/layers/segment:
-      - command: cellseg.make_container_widget
-      - command: cellseg.make_magic_widget
-      - command: cellseg.make_function_widget
-      - command: cellseg.make_qwidget

@@ -1,7 +1,7 @@
 [project]
-name = "cellseg"
+name = "focus-3d"
 dynamic = ["version"]
-description = "A user-friendly plugin for 3D cell segmentation"
+description = "FOCUS-3D: a user-friendly napari plugin for interactive 3D cell segmentation, curation, and analysis"
 readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
@@ -24,9 +24,10 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
 requires-python = ">=3.10"
+
 # napari can be included in dependencies if napari imports are required.
 # However, you should not include napari[all], napari[qt],
-# or any other Qt bindings directly (e.g. PyQt5, PySide2).
+# or any other Qt bindings directly, such as PyQt5 or PySide2.
 # See best practices: https://napari.org/stable/plugins/building_a_plugin/best_practices.html
 dependencies = [
     "numpy",
@@ -36,21 +37,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Allow easily installation with the full, default napari installation
-# (including Qt backend) using cellseg[all].
+# Allow easy installation with the full, default napari installation
+# including a Qt backend using focus-3d[all].
 all = ["napari[all]"]
 
 [dependency-groups]
 dev = [
     "tox-uv",
-    "pytest",  # https://docs.pytest.org/en/latest/contents.html
-    "pytest-cov",  # https://pytest-cov.readthedocs.io/en/latest/
-    "pytest-qt",  # https://pytest-qt.readthedocs.io/en/latest/
-    "napari[qt]",  # test with napari's default Qt bindings
+    "pytest",
+    "pytest-cov",
+    "pytest-qt",
+    "napari[qt]",
 ]
 
 [project.entry-points."napari.manifest"]
-cellseg = "cellseg:napari.yaml"
+focus-3d = "focus3d:napari.yaml"
 
 
 
@@ -65,17 +66,17 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-"*" = ["*.yaml"]
+"*" = ["*.yaml", "*.yml"]
 
 [tool.setuptools_scm]
-write_to = "src/cellseg/_version.py"
+write_to = "src/focus3d/_version.py"
 fallback_version = "0.0.1+nogit"
 
 [tool.pytest.ini_options]
 minversion = "6.0"
 addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
 xfail_strict = true
-# filterwarnings = ["error"]  # recommended by PP309; deprecation warnings cause failures so leaving for the user to enable if desired
+# filterwarnings = ["error"]
 log_cli_level = "INFO"
 testpaths = ["tests"]
 
@@ -83,12 +84,18 @@ testpaths = ["tests"]
 line-length = 79
 fix = true
 
+# The FOCUS3D model implementation contains third-party/adapted model code
+# and research scripts. Keep linting focused on the napari plugin wrapper.
+extend-exclude = [
+    "src/focus3d/segmentation/FOCUS3D/**",
+]
+
 [tool.ruff.format]
 quote-style = "single"
 
 [tool.ruff.lint]
 select = [
-    "E", "F", "W", #flake8
+    "E", "F", "W", # flake8
     "UP", # pyupgrade
     "I", # isort
     "BLE", # flake8-blind-exception
@@ -101,6 +108,7 @@ select = [
     "SIM", # flake8-simplify
 ]
 ignore = [
-    "E501", # line too long. handled by formatter
-    "UP006", "UP007", # type annotation. As using magicgui require runtime type annotation then we disable this.
+    "E501", # line too long; handled by formatter
+    "UP006", "UP007", # type annotation; magicgui may require runtime type annotations
+    "BLE001", # allow broad exception handling in GUI callbacks and worker threads
 ]
