@@ -119,3 +119,5 @@ ignore = [
     "UP006", "UP007", # type annotation; magicgui may require runtime type annotations
     "BLE001", # allow broad exception handling in GUI callbacks and worker threads
 ]
+[tool.check-wheel-contents]
+ignore = ["W002"]
