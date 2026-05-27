@@ -82,3 +82,14 @@ venv/
 
 # written by setuptools_scm
 **/_version.py
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Model checkpoints and local data
+*.pth
+*.pt
+*.ckpt
+src/cellseg/patch_curation_dataset/

@@ -22,20 +22,21 @@ You can install `cellseg` with the following steps:
 1. Create a new environment in the directory containing `environment.yml`:
 
    ```bash
+   cd your path
    conda env create -n cellseg -f environment.yml
    ```
 
 2. Install `cellseg`:
 
    ```bash
-   cd cellseg
+   conda activate cellseg
+   pip install napari[all]
    pip install -e .
    ```
 
 3. Launch the application:
 
    ```bash
-   conda activate cellseg
    napari
    ```
 
@@ -43,8 +44,9 @@ You can install `cellseg` with the following steps:
 1. Open CellSeg from `Plugins -> 3D Segmentation (CellSeg)`.
 2. Open the raw image from `File -> Open Folder` for a `.zarr` dataset (recommended), or `File -> Open File(s)` for `.tif` images.
 3. Load labels from `Load Label -> Load from Zarr` (recommended) or `Load Label -> Load from TIFF`.
-4. Manual curation: go to `Manual Curation -> Enter Curation Mode`.  
+4. Manual curation: go to `Manual Curation -> Enter Curation Mode`.
    For `.zarr` labels, curation results are written directly to the file and saved automatically.
+
 | Operation | Shortcut | Description |
 |---|---|---|
 | Enter Curation Mode | — | Activate label editing mode so you can select and modify labels manually. |

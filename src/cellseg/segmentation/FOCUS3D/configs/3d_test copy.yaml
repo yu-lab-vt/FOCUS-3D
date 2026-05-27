@@ -1,0 +1,94 @@
+MODEL:
+  META_ARCHITECTURE: "MaskFormer"
+  BACKBONE:
+    NAME: "D2MAE3DBackbone"
+    IMG_SIZE: [32, 96, 96]
+    PATCH_SIZE: [8,12,12]
+    IN_CHANS: 1
+    EMBED_DIM: 1008
+    DEPTH: 24
+    DECODER_EMBED_DIM: 768
+    DECODER_DEPTH: 8
+    DECODER_NUM_HEADS: 16
+    MLP_RATIO: 4.0
+    NORM_PIX_LOSS: False
+    PRETRAINED: "./MAE_checkpoint_0413/checkpoint-299.pth"
+    VIT_ADAPTER:
+      PRETRAIN_SIZE: [32,96,96]          # 预训练图像尺寸
+      NUM_HEADS: 16               # 交互层的头数
+      ITERATIONS: 4               # 交互层迭代次数（实际上由 interaction_indexes 决定）
+      INTERACTION_INDEXES: [[0, 5], [6, 11], [12, 17], [18, 23]]   # 可选，指定 MAE 哪些层参与交互
+      ADD_VIT_FEATURE: True
+      EMBEDED_DIM : 1008
+  SEM_SEG_HEAD:
+    NAME: "MSDeformAttnPixelDecoder3D"
+    NUM_CLASSES: 1
+    IN_FEATURES: ["res2", "res3", "res4", "res5"]
+    CONVS_DIM: 288
+    MASK_DIM: 288
+    NORM: "GN"
+    TRANSFORMER_ENC_LAYERS: 6
+  MASK_FORMER:
+    TRANSFORMER_DECODER_NAME: "MultiScaleMaskedTransformerDecoder"
+    CLASS_WEIGHT: 2.0
+    MASK_WEIGHT: 5.0
+    DICE_WEIGHT: 5.0
+    NO_OBJECT_WEIGHT: 0.1
+    HIDDEN_DIM: 288   # divided by 8 and 3
+    NUM_OBJECT_QUERIES: 300
+    NHEADS: 8
+    DIM_FEEDFORWARD: 2048
+    DROPOUT: 0.0
+    DEC_LAYERS: 9
+    PRE_NORM: False
+    MASK_DIM: 288
+    ENFORCE_INPUT_PROJ: False
+    OVERSAMPLE_RATIO : 3.0
+    IMPORTANCE_SAMPLE_RATIO: 0.7
+    TRAIN_NUM_POINTS : 50000
+    DN : "seg"
+    DN_NUM : 100
+    DN_NOISE_SCALE: 0.4
+    DN_LOSS_WEIGHT : 1.0
+    TEST:
+      INSTANCE_ON: True
+      SEMANTIC_ON: False
+      PANOPTIC_ON: False
+      SEM_SEG_POSTPROCESSING_BEFORE_INFERENCE : False
+  WEIGHTS: ""
+  PIXEL_MEAN: [0.0]
+  PIXEL_STD: [1.0]
+DATASETS:
+  TRAIN: ("cell_3d_train",)
+  IMAGE_DIR: "/media/yulab/26f9605d-186a-448a-a28a-495884a29801/zqh/embryo_data/u-net_train/FISH2_0417/imagesTr/"
+  LABEL_DIR: "/media/yulab/26f9605d-186a-448a-a28a-495884a29801/zqh/embryo_data/u-net_train/FISH2_0417/labelsTr/"
+SOLVER:
+  AMP:
+    ENABLED: True
+  CHECKPOINT_PERIOD: 1000
+  IMS_PER_BATCH: 12
+  LR_SCHEDULER_NAME: WarmupCosineLR
+  BACKBONE_MULTIPLIER: 0.1
+  VITADAPTER_MULTIPLIER: 1.0
+  BASE_LR: 0.0001
+  STEPS: (25000, 28000)
+  MAX_ITER: 40000
+  WARMUP_ITERS : 1000
+  WEIGHT_DECAY: 0.05
+  CLIP_GRADIENTS:
+    ENABLED: True
+    CLIP_TYPE: "full_model"
+    CLIP_VALUE: 1.0
+    NORM_TYPE: 2.0
+INPUT:
+  IMAGE_SIZE: [32, 96, 96]
+  MIN_SIZE_TRAIN: [32, 96, 96]
+  MIN_SIZE_TRAIN_SAMPLING: "choice"
+  CROP:
+    ENABLED: False
+  DATASET_MAPPER_NAME: MaskFormer3DInstanceDatasetMapper
+OUTPUT_DIR: ./output/output_0427_FISH2_denoise_vitadapter_pixel_decoder_layer6
+TEST:
+  EVAL_PERIOD: 30000
+  DETECTIONS_PER_IMAGE: 300
+VERSION: 2
