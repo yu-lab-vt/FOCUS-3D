@@ -202,3 +202,13 @@ If you encounter any problems, please [file an issue] along with a detailed desc
 [BSD-3]: http://opensource.org/licenses/BSD-3-Clause
 [pip]: https://pypi.org/project/pip/
 [PyPI]: https://pypi.org/
+
+## Citing
+```bibtex
+@article{wang2026high,
+  title={High-Fidelity Long-term Whole-embryo Lineage and Fate Reconstruction by Iterative Tracking with Error Correction},
+  author={Wang, Mengfan and Zhang, Qinghua and Wang, Congchao and Chi, Yunfeng and Zheng, Wei and Mu, Zeyu and Cao, Xiangyu and Zhang, Weizhan and Yang, Boao and Schier, Alexander F. and Acedo, Joaquin Navajas and Wan, Yinan and Yu, Guoqiang},
+  year={2026},
+  doi={10.64898/2026.03.12.711203}
+}
+```
