@@ -8,7 +8,7 @@
 [![napari hub](https://img.shields.io/endpoint?url=https://api.napari-hub.org/shields/cellseg)](https://napari-hub.org/plugins/cellseg)
 [![npe2](https://img.shields.io/badge/plugin-npe2-blue?link=https://napari.org/stable/plugins/index.html)](https://napari.org/stable/plugins/index.html)
 
-FOCUS-3D provides a user-friendly napari plugin for interactive 3D cell segmentation, manual curation, model fine-tuning, 3D reconstruction, and quantitative analysis. Users can run automatic 3D segmentation with pretrained FOCUS3D models, manually correct segmentation errors, perform one-click segmentation, prepare curated patches for human-in-the-loop fine-tuning, reconstruct selected 3D cell instances, and compute quantitative statistics within the same napari workflow.
+FOCUS-3D provides a user-friendly napari plugin for interactive 3D cell segmentation, manual curation, model fine-tuning, and analysis. Users can run automatic 3D segmentation with pretrained FOCUS-3D models, manually correct segmentation errors, perform one-click segmentation, prepare curated patches for human-in-the-loop fine-tuning, reconstruct selected 3D cell instances, and compute quantitative statistics within the same napari workflow.
 
 <img width="3839" height="2082" alt="image" src="https://github.com/user-attachments/assets/2a9ccc08-3109-4b73-bcae-0514bcec2a86" />
 
@@ -40,12 +40,8 @@ napari
 ## Usage
 
 1. Open FOCUS-3D from `Plugins -> FOCUS-3D`.
-2. Load the raw image from `File -> Open Folder` for a `.zarr` dataset, or `File -> Open File(s)` for `.tif` images.
-3. Use the `Basic`, `Segmentation`, and `Analysis` tabs to load labels, run FOCUS3D segmentation, manually curate results, fine-tune models, reconstruct 3D structures, and calculate quantitative statistics.
-
-## FOCUS-3D Overview
-
-FOCUS-3D provides an integrated workflow for 3D microscopy image analysis. It combines automatic segmentation, interactive correction, local one-click refinement, curated patch generation, model fine-tuning, 3D label reconstruction, and quantitative measurement in a single napari-based interface. This design allows users to move smoothly from raw 3D images to corrected segmentation results and downstream analysis, while also supporting human-in-the-loop improvement of FOCUS3D models using newly curated annotations.
+2. Load the raw image from `File -> Open Folder` for a `.zarr` dataset(recommend), or `File -> Open File(s)` for `.tif` images.
+3. Use the `Basic`, `Segmentation`, and `Analysis` tabs to load labels, run segmentation, manually curate results, fine-tune models, reconstruct 3D structures, and calculate quantitative statistics.
 
 ## Basic Menu
 
@@ -105,7 +101,7 @@ The `Basic` menu provides functions for loading segmentation labels, adjusting i
 
 ## Segmentation Menu
 
-The `Segmentation` menu provides automatic 3D segmentation with **FOCUS3D**, one-click local segmentation refinement, and human-in-the-loop fine-tuning based on curated labels.
+The `Segmentation` menu provides automatic 3D segmentation with **FOCUS-3D**, one-click local segmentation refinement, and human-in-the-loop fine-tuning based on curated labels.
 <img width="3839" height="2084" alt="image" src="https://github.com/user-attachments/assets/74b6b9ae-0a00-4b40-bb31-fb743709c725" />
 
 ### Run Segmentation
@@ -113,12 +109,12 @@ The `Segmentation` menu provides automatic 3D segmentation with **FOCUS3D**, one
 | Parameter / Operation | Description |
 |---|---|
 | Z Ratio | Set the physical Z-to-XY spacing ratio for anisotropic 3D data. |
-| Output Path | Set the output folder for FOCUS3D segmentation results. By default, the plugin creates an output folder based on the input image path. |
+| Output Path | Set the output folder for FOCUS-3D segmentation results. By default, the plugin creates an output folder based on the input image path. |
 | GPU IDs | Select the GPU device used for inference, such as `0`, `1`, or `0,1`. |
 | Refresh | Refresh the list of available GPU devices. |
 | Advanced | Expand or collapse advanced inference settings. |
-| Checkpoint | Select the pretrained FOCUS3D model checkpoint. The default path is relative to the FOCUS3D backend folder. |
-| Configure | Select the FOCUS3D configuration file. The default configuration is `configs/3d_test.yaml`. |
+| Checkpoint | Select the pretrained model checkpoint. The default path is relative to the backend folder. |
+| Configure | Select the configuration file. The default configuration is `configs/3d_test.yaml`. |
 | Lower / Upper Percentile | Set the intensity percentile range for image normalization before inference. |
 | Patch size (Z/Y/X) | Set the 3D patch size used for sliding-window inference. |
 | Stride (Z/Y/X) | Set the stride between neighboring inference patches. Smaller strides increase overlap but require more computation. |
@@ -129,7 +125,7 @@ The `Segmentation` menu provides automatic 3D segmentation with **FOCUS3D**, one
 | Min area (2D) | Remove small 2D components below the specified area threshold during stitching or post-processing. |
 | Min size (3D) | Remove 3D objects smaller than the specified voxel size. A value of `0` disables minimum-size filtering. |
 | Max size (3D) | Remove 3D objects larger than the specified voxel size. The default value is `100000`. |
-| Run 3D Segmentation | Run automatic 3D segmentation using FOCUS3D. The result is loaded back into napari as an editable label layer, and the confidence map can also be saved or visualized. |
+| Run 3D Segmentation | Run automatic 3D segmentation using FOCUS-3D. The result is loaded back into napari as an editable label layer, and the confidence map can also be saved or visualized. |
 
 ### One-click Segmentation
 
@@ -138,7 +134,7 @@ The `Segmentation` menu provides automatic 3D segmentation with **FOCUS3D**, one
 | Enter Inactive Mode | Load the one-click segmentation model and enter interactive local segmentation mode. After entering this mode, users can click on a target cell region to trigger local refinement. |
 | Exit Inactive Mode | Exit one-click segmentation mode and return to normal interaction. |
 | Status Label | Display the current status of the one-click segmentation module, such as inactive, loading, active, or busy. |
-| Local Refinement | Use the pretrained FOCUS3D model to refine a clicked cell or local region, supporting fast correction of missed or inaccurate instances. |
+| Local Refinement | Use the pretrained FOCUS-3D model to refine a clicked cell or local region, supporting fast correction of missed or inaccurate instances. |
 | Undo | Undo the latest one-click segmentation refinement result with `Ctrl + Z`. |
 
 ### Finetune with Current Labels
@@ -150,8 +146,8 @@ The `Segmentation` menu provides automatic 3D segmentation with **FOCUS3D**, one
 | Save Path | Set the folder for saving curated training patches. The expected structure is `imagesTr/` and `labelsTr/`. |
 | Curate Selected Patch | Open the selected 3D patch in a new napari viewer for focused manual correction. |
 | Save Curated Patch | Save the curated patch image and label into `imagesTr/` and `labelsTr/`. |
-| Checkpoint Dir | Set the output directory for fine-tuned FOCUS3D checkpoints. |
-| Run Fine-tune | Fine-tune the FOCUS3D model using the curated patches. After fine-tuning, the newly generated checkpoint can be used for subsequent segmentation. |
+| Checkpoint Dir | Set the output directory for fine-tuned FOCUS-3D checkpoints. |
+| Run Fine-tune | Fine-tune the FOCUS-3D model using the curated patches. After fine-tuning, the newly generated checkpoint can be used for subsequent segmentation. |
 
 ## Analysis Menu
 
@@ -186,12 +182,12 @@ The `Analysis` menu provides tools for 3D structure reconstruction, full-volume 
 A typical workflow is:
 
 1. Load the raw 3D microscopy image into napari.
-2. Run automatic 3D segmentation with **FOCUS3D** from the `Segmentation` menu.
+2. Run automatic 3D segmentation with **FOCUS-3D** from the `Segmentation` menu.
 3. Inspect the segmentation result in the `Basic` menu.
 4. Correct segmentation errors using manual curation tools such as **Add to Label**, **Subtract from Label**, **Add New Label**, and **Delete Inside ROI**.
 5. Use **One-click Segmentation** for fast local correction of difficult or missed cells.
 6. Save the curated labels as `.zarr` or `.tif`.
-7. Optionally select valid curated patches and fine-tune FOCUS3D with the corrected labels.
+7. Optionally select valid curated patches and fine-tune FOCUS-3D with the corrected labels.
 8. Use the `Analysis` menu for 3D reconstruction, full 3D visualization, and quantitative statistics.
 
 ## License
