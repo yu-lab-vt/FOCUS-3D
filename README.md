@@ -20,14 +20,14 @@ You can install `FOCUS-3D` with the following steps.
 
 ```bash
 cd your_path
-conda env create -n FOCUS3D -f environment.yml
+conda env create -n focus3d -f environment.yml
 ```
 
 ### 2. Install FOCUS-3D
 
 ```bash
-conda activate FOCUS3D
-pip install napari[all]
+conda activate focus3d
+pip install -U "focus-3d[all]"
 pip install -e .
 ```
 
