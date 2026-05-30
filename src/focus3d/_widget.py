@@ -1404,6 +1404,13 @@ class SegmentationWidget(QWidget):
         )
         finetune_layout.addWidget(self.btn_calc_valid_patches)
 
+        self.btn_clear_valid_patch_boxes = QPushButton('Clear Patch Boxes')
+        self.btn_clear_valid_patch_boxes.clicked.connect(
+            self._clear_valid_patch_overlay
+        )
+        self.btn_clear_valid_patch_boxes.setEnabled(False)
+        finetune_layout.addWidget(self.btn_clear_valid_patch_boxes)
+
         patch_id_layout = QHBoxLayout()
         patch_id_layout.addWidget(QLabel('Select Patch ID:'))
         self.patch_id_spin = QSpinBox()
@@ -3080,11 +3087,14 @@ class SegmentationWidget(QWidget):
 
         return super().eventFilter(obj, event)
 
-    def _get_active_image(self):
+    def _get_active_image(self, show_error=True):
         layer = self.viewer.layers.selection.active
         if isinstance(layer, Image):
             return layer
-        notifications.show_error('Please select an image layer.')
+
+        if show_error:
+            notifications.show_error('Please select an image layer.')
+
         return None
 
     def _get_labels_layer(self):
@@ -3093,6 +3103,49 @@ class SegmentationWidget(QWidget):
                 return layer
         # notifications.show_error('No Labels layer found.')
         return None
+
+    def _get_segmentation_labels_layer(self):
+        """
+        Return the main segmentation Labels layer, not temporary ROI/brush layers.
+
+        Priority:
+        1. Labels layer with editable_backend == 'zarr'
+        2. Labels layer whose name ends with '_seg' or contains 'seg'
+        3. First Labels layer excluding temporary brush/ROI layers
+        4. First Labels layer
+        """
+        labels_layers = [
+            layer for layer in self.viewer.layers if isinstance(layer, Labels)
+        ]
+
+        if len(labels_layers) == 0:
+            return None
+
+        # Most reliable: labels created by _on_segmentation_finished()
+        for layer in labels_layers:
+            try:
+                if layer.metadata.get('editable_backend', None) == 'zarr':
+                    return layer
+            except Exception:
+                pass
+
+        # Name-based fallback
+        for layer in labels_layers:
+            name = str(getattr(layer, 'name', '')).lower()
+            if name.endswith('_seg') or 'seg' in name or 'segmentation' in name:
+                return layer
+
+        # Avoid temporary brush layers if possible
+        for layer in labels_layers:
+            name = str(getattr(layer, 'name', '')).lower()
+            if (
+                'brush' not in name
+                and 'roi' not in name
+                and 'new label' not in name
+            ):
+                return layer
+
+        return labels_layers[0]
 
     # ---------- Segmentation actions ----------
     def _segment_3d(self):
@@ -3712,6 +3765,8 @@ class SegmentationWidget(QWidget):
 
     def _start_calculate_valid_patches(self):
         """Start valid patch calculation in a background thread."""
+        self._clear_valid_patch_overlay(restore_curation=False, notify=False)
+
         image_layer = self._get_first_image_layer()
         labels_layer = self._get_first_labels_layer()
 
@@ -3804,9 +3859,119 @@ class SegmentationWidget(QWidget):
         self._ensure_patch_overlay_hooks()
         self._update_patch_overlay_for_current_z()
 
+        if hasattr(self, 'btn_clear_valid_patch_boxes'):
+            self.btn_clear_valid_patch_boxes.setEnabled(True)
+
+        # After Calculate Valid Patches, keep valid_patch_boxes selected.
+        # This makes patch inspection/selection explicit.
+        if (
+            self.patch_overlay_layer is not None
+            and self.patch_overlay_layer in self.viewer.layers
+        ):
+            try:
+                self.viewer.layers.selection.active = self.patch_overlay_layer
+                self.patch_overlay_layer.visible = True
+                self.patch_overlay_layer.refresh()
+            except Exception:
+                pass
+
         notifications.show_info(
             f'Calculated {len(self.valid_patches)} valid patches.'
         )
+
+    def _clear_valid_patch_overlay(self, restore_curation=True, notify=True):
+        """
+        Remove valid patch overlay layers and stop automatic re-creation.
+
+        This resets the state created by Calculate Valid Patches:
+        - remove valid_patch_boxes / selected_patch_box / patch text layers
+        - clear valid_patches so _update_patch_overlay_for_current_z will not recreate them
+        - disconnect dims current_step hook
+        - restore the Labels layer as the active editable layer
+        """
+        # 1. Cancel running patch calculation if any.
+        try:
+            if self.patch_calc_worker is not None:
+                self.patch_calc_worker.cancel()
+        except Exception:
+            pass
+
+        # 2. Clear patch state first.
+        # This is critical: otherwise the dims callback will recreate valid_patch_boxes.
+        self.valid_patches = []
+        self.valid_patch_id_to_index = {}
+        self._current_overlay_patch_ids = []
+
+        # 3. Disconnect automatic slice-change refresh hook.
+        if getattr(self, '_patch_overlay_hook_installed', False):
+            try:
+                self.viewer.dims.events.current_step.disconnect(
+                    self._on_viewer_current_step_changed
+                )
+            except Exception:
+                pass
+            self._patch_overlay_hook_installed = False
+
+        # 4. Remove known overlay layer objects.
+        for attr in ['patch_text_layer', 'patch_overlay_layer', 'selected_patch_layer']:
+            layer = getattr(self, attr, None)
+            if layer is not None:
+                try:
+                    if layer in self.viewer.layers:
+                        self.viewer.layers.remove(layer)
+                except Exception:
+                    pass
+            setattr(self, attr, None)
+
+        # 5. Also remove orphan layers by name.
+        # This handles the case where the user deleted/recreated layers manually
+        # and the Python object reference is stale.
+        for layer_name in ['valid_patch_boxes', 'selected_patch_box']:
+            try:
+                if layer_name in self.viewer.layers:
+                    self.viewer.layers.remove(layer_name)
+            except Exception:
+                pass
+
+        # 6. Reset patch ID spinbox without triggering overlay redraw.
+        if hasattr(self, 'patch_id_spin'):
+            try:
+                self.patch_id_spin.blockSignals(True)
+                self.patch_id_spin.setRange(0, 0)
+                self.patch_id_spin.setValue(0)
+                self.patch_id_spin.blockSignals(False)
+            except Exception:
+                try:
+                    self.patch_id_spin.blockSignals(False)
+                except Exception:
+                    pass
+
+        # 7. Disable clear button until patches are calculated again.
+        if hasattr(self, 'btn_clear_valid_patch_boxes'):
+            self.btn_clear_valid_patch_boxes.setEnabled(False)
+
+        # 8. Restore the main segmentation layer explicitly.
+        # Do not leave napari with no active layer after removing valid_patch_boxes.
+        if restore_curation:
+            labels_layer = self._get_segmentation_labels_layer()
+            if labels_layer is not None and labels_layer in self.viewer.layers:
+                try:
+                    self.viewer.layers.selection.active = labels_layer
+                    labels_layer.visible = True
+
+                    if getattr(self, '_pick_mode_active', False):
+                        labels_layer.mode = 'pick'
+                    else:
+                        labels_layer.mode = 'pan_zoom'
+
+                    labels_layer.refresh()
+                except Exception as e:
+                    notifications.show_warning(
+                        f'Patch boxes cleared, but failed to activate segmentation layer: {e}'
+                    )
+
+        if notify:
+            notifications.show_info('Valid patch boxes cleared. Curation state restored.')
 
     def _on_calculate_valid_patches_error(self, error_msg):
         """Handle patch calculation failure."""
@@ -3931,6 +4096,15 @@ class SegmentationWidget(QWidget):
                 features=features,
                 name='valid_patch_boxes',
             )
+            try:
+                self.patch_overlay_layer.editable = False
+            except Exception:
+                pass
+
+            try:
+                self.patch_overlay_layer.mode = 'pan_zoom'
+            except Exception:
+                pass
 
             if (
                 self._on_patch_overlay_click
