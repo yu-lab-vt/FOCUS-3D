@@ -5,7 +5,7 @@ import sys
 import traceback
 
 sys.path.insert(0, os.path.dirname(__file__))
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from pathlib import Path
 
 import dask.array as da
@@ -27,13 +27,14 @@ class DeleteAllWorker(QObject):
     error = Signal(str)
     progress = Signal(int, str)  # percent, message
 
-    def __init__(self, data, label_val, current_z):
+    def __init__(self, data, label_val, current_z, write_lock=None):
         super().__init__()
         self.data = data
         self.label_val = label_val
         self.current_z = (
             current_z  # Store the current slice index for range limiting
         )
+        self.write_lock = write_lock
 
     def run(self):
         try:
@@ -52,12 +53,19 @@ class DeleteAllWorker(QObject):
                 for idx, z in enumerate(range(z_start, z_end)):
                     if QThread.currentThread().isInterruptionRequested():
                         return
-                    slice_data = self.data[z]
-                    mask = slice_data == self.label_val
-                    if np.any(mask):
-                        slice_data[mask] = 0
-                        # For numpy, slice_data is a view, so changes are in-place
-                        found = True
+
+                    with (
+                        self.write_lock
+                        if self.write_lock is not None
+                        else nullcontext()
+                    ):
+                        slice_data = np.asarray(self.data[z]).copy()
+                        mask = slice_data == self.label_val
+                        if np.any(mask):
+                            slice_data[mask] = 0
+                            self.data[z] = slice_data
+                            found = True
+
                     # Emit progress based on processed slices within the range
                     progress_percent = int(100 * (idx + 1) / slices_to_process)
                     self.progress.emit(
@@ -66,16 +74,24 @@ class DeleteAllWorker(QObject):
                     )
 
             elif isinstance(self.data, zarr.Array):
-                # For zarr, process slice by slice within the range (simpler than chunk-based)
+                # For zarr, process slice by slice within the range.
+                # The read-modify-write cycle must be locked.
                 for idx, z in enumerate(range(z_start, z_end)):
                     if QThread.currentThread().isInterruptionRequested():
                         return
-                    slice_data = self.data[z]  # returns a numpy array
-                    mask = slice_data == self.label_val
-                    if np.any(mask):
-                        slice_data[mask] = 0
-                        self.data[z] = slice_data
-                        found = True
+
+                    with (
+                        self.write_lock
+                        if self.write_lock is not None
+                        else nullcontext()
+                    ):
+                        slice_data = np.asarray(self.data[z]).copy()
+                        mask = slice_data == self.label_val
+                        if np.any(mask):
+                            slice_data[mask] = 0
+                            self.data[z] = slice_data
+                            found = True
+
                     progress_percent = int(100 * (idx + 1) / slices_to_process)
                     self.progress.emit(
                         progress_percent,
@@ -101,11 +117,12 @@ class DeleteInsideWorker(QObject):
     error = Signal(str)
     progress = Signal(int, str)
 
-    def __init__(self, data, shapes, current_z):
+    def __init__(self, data, shapes, current_z, write_lock=None):
         super().__init__()
         self.data = data
         self.shapes = shapes  # list of polygons (each as (N,2) or (N,3) if 3D)
         self.current_z = current_z
+        self.write_lock = write_lock
         self._is_cancelled = False
 
     def cancel(self):
@@ -134,11 +151,16 @@ class DeleteInsideWorker(QObject):
                 combined_mask[rr, cc] = True
 
             # --- Step 2: Identify which labels are inside the polygon on the current slice ---
-            current_slice = self.data[self.current_z]
-            labels_in_mask = np.unique(current_slice[combined_mask])
-            labels_in_mask = labels_in_mask[
-                labels_in_mask != 0
-            ]  # exclude background
+            with (
+                self.write_lock
+                if self.write_lock is not None
+                else nullcontext()
+            ):
+                current_slice = np.asarray(self.data[self.current_z]).copy()
+                labels_in_mask = np.unique(current_slice[combined_mask])
+                labels_in_mask = labels_in_mask[
+                    labels_in_mask != 0
+                ]  # exclude background
 
             if len(labels_in_mask) == 0:
                 self.finished.emit(0)  # no labels to delete
@@ -155,22 +177,21 @@ class DeleteInsideWorker(QObject):
                 if QThread.currentThread().isInterruptionRequested():
                     return
 
-                # Get the current slice data (as a numpy array; for zarr this is a copy)
-                slice_data = self.data[z]
+                # Read-modify-write must be locked.
+                with (
+                    self.write_lock
+                    if self.write_lock is not None
+                    else nullcontext()
+                ):
+                    slice_data = np.asarray(self.data[z]).copy()
 
-                # Create a boolean mask marking all pixels that belong to any label in labels_in_mask
-                # np.isin is efficient for a small set of labels and returns a boolean array of same shape
-                mask = np.isin(slice_data, labels_in_mask)
+                    # Create a boolean mask marking all pixels that belong to any label in labels_in_mask
+                    mask = np.isin(slice_data, labels_in_mask)
 
-                if np.any(mask):
-                    # Set those pixels to background (0)
-                    slice_data[mask] = 0
-
-                    # If the underlying data is a zarr array, we need to write the modified slice back
-                    if isinstance(self.data, zarr.Array):
+                    if np.any(mask):
+                        # Set those pixels to background (0)
+                        slice_data[mask] = 0
                         self.data[z] = slice_data
-                    # For numpy arrays, slice_data is a view (if contiguous) and changes are already in‑place,
-                    # so no explicit write‑back is needed.
 
                 # Update progress
                 self.progress.emit(
@@ -280,6 +301,28 @@ class RefineSelectedCellWorker(QObject):
             tb = traceback.format_exc()
             print('\n[ClickedLocalRefineWorker ERROR]\n', tb, flush=True)
             self.error.emit(tb)
+
+
+def _label_write_lock_context(self):
+    """
+    Return the shared label write lock.
+
+    This lock serializes all write operations to the editable label array.
+    It protects zarr writes from overlapping operations inside the same
+    napari process.
+    """
+    lock = getattr(self, '_zarr_write_lock', None)
+    if lock is None:
+        return nullcontext()
+    return lock
+
+
+def _label_io_busy(self):
+    return bool(getattr(self, '_label_io_busy', False))
+
+
+def _set_label_io_busy(self, busy: bool):
+    self._label_io_busy = bool(busy)
 
 
 def _get_one_click_backend_name():
@@ -736,7 +779,9 @@ def _on_refine_selected_cell_finished(self, result):
     if len(self._cell_refine_undo_stack) > max_undo:
         self._cell_refine_undo_stack.pop(0)
 
-    labels_layer.data[z0:z1, y0:y1, x0:x1] = new_label_crop
+    with _label_write_lock_context(self):
+        labels_layer.data[z0:z1, y0:y1, x0:x1] = new_label_crop
+
     labels_layer.selected_label = label_val
     labels_layer.refresh()
 
@@ -816,7 +861,9 @@ def _undo_cell_refinement(self, viewer=None):
 
     z0, z1, y0, y1, x0, x1 = bbox
 
-    labels_layer.data[z0:z1, y0:y1, x0:x1] = old_crop
+    with _label_write_lock_context(self):
+        labels_layer.data[z0:z1, y0:y1, x0:x1] = old_crop
+
     labels_layer.selected_label = label_val
     labels_layer.refresh()
 
@@ -894,7 +941,7 @@ def _prepare_labels_for_curation(
 
         if len(labels.shape) == 3:
             chunks = (
-                min(4, labels.shape[0]),
+                min(1, labels.shape[0]),
                 min(512, labels.shape[1]),
                 min(512, labels.shape[2]),
             )
@@ -913,7 +960,7 @@ def _prepare_labels_for_curation(
 
     if labels_np.ndim == 3:
         chunks = (
-            min(4, labels_np.shape[0]),
+            min(1, labels_np.shape[0]),
             min(512, labels_np.shape[1]),
             min(512, labels_np.shape[2]),
         )
@@ -1779,7 +1826,8 @@ def _on_clicked_local_refinement_finished(self, result):
     # 5. Write local crop back.
     #    Works for both numpy and zarr.
     # ------------------------------------------------------------
-    label_data[z0:z1, y0:y1, x0:x1] = new_crop
+    with _label_write_lock_context(self):
+        label_data[z0:z1, y0:y1, x0:x1] = new_crop
 
     labels_layer.selected_label = target_label
     labels_layer.refresh()
@@ -1917,14 +1965,10 @@ def _install_local_refinement_callbacks(self):
     the user has selected the image layer or the labels layer.
     """
     for layer in self.viewer.layers:
-        if isinstance(layer, (Image, Labels)):
-            if (
-                self._on_local_refinement_click
-                not in layer.mouse_drag_callbacks
-            ):
-                layer.mouse_drag_callbacks.append(
-                    self._on_local_refinement_click
-                )
+        if isinstance(layer, (Image, Labels)) and (
+            self._on_local_refinement_click not in layer.mouse_drag_callbacks
+        ):
+            layer.mouse_drag_callbacks.append(self._on_local_refinement_click)
 
 
 def _remove_local_refinement_callbacks(self):
@@ -2138,10 +2182,10 @@ def _change_selected_label_id(self):
         return
 
     # Get current slice data (supports numpy/zarr arrays)
-    slice_data = labels_layer.data[current_z]
+    # Read-modify-write current slice under lock.
+    with _label_write_lock_context(self):
+        slice_data = np.asarray(labels_layer.data[current_z]).copy()
 
-    # Validate data type and replace label IDs
-    if isinstance(slice_data, np.ndarray):
         # Create mask for pixels with source label
         mask = slice_data == source_label
 
@@ -2155,17 +2199,14 @@ def _change_selected_label_id(self):
         # Replace source label with new ID
         slice_data[mask] = new_label
 
-        # Update the slice in labels layer (critical for zarr compatibility)
+        # Update the slice in labels layer
         labels_layer.data[current_z] = slice_data
-        labels_layer.refresh()  # Refresh viewer display
 
-        notifications.show_info(
-            f'Success! Label {source_label} → {new_label} (slice {current_z}).'
-        )
-    else:
-        notifications.show_error(
-            f'Unsupported data type: {type(slice_data)} (only numpy/zarr supported).'
-        )
+    labels_layer.refresh()
+
+    notifications.show_info(
+        f'Success! Label {source_label} → {new_label} (slice {current_z}).'
+    )
 
 
 def _delete_selected_label_slice(self):
@@ -2205,9 +2246,10 @@ def _delete_selected_label_slice(self):
     x1 = int(xx.max()) + 1
 
     # Read/write only the bbox region.
-    region = np.asarray(data[z_idx, y0:y1, x0:x1]).copy()
-    region[region == label_val] = 0
-    data[z_idx, y0:y1, x0:x1] = region
+    with _label_write_lock_context(self):
+        region = np.asarray(data[z_idx, y0:y1, x0:x1]).copy()
+        region[region == label_val] = 0
+        data[z_idx, y0:y1, x0:x1] = region
 
     labels_layer.refresh()
 
@@ -2261,7 +2303,12 @@ def _delete_selected_label_all(self):
     self._update_curation_controls()  # This will disable relevant buttons
 
     self.delete_all_thread = QThread()
-    self.delete_all_worker = DeleteAllWorker(data, label_val, current_z)
+    self.delete_all_worker = DeleteAllWorker(
+        data,
+        label_val,
+        current_z,
+        write_lock=getattr(self, '_zarr_write_lock', None),
+    )
     self.delete_all_worker.moveToThread(self.delete_all_thread)
 
     self.delete_all_progress = QProgressDialog(
@@ -2564,12 +2611,27 @@ def _apply_roi(self):
     # ------------------------------------------------------------
     # 3. Read/write only this local region
     # ------------------------------------------------------------
-    region = np.asarray(data[z_idx, y0:y1, x0:x1]).copy()
+    with _label_write_lock_context(self):
+        region = np.asarray(data[z_idx, y0:y1, x0:x1]).copy()
+
+        if self._current_roi_mode == 'add':
+            region[mask_crop] = target_label
+            data[z_idx, y0:y1, x0:x1] = region
+
+        elif self._current_roi_mode == 'subtract':
+            # Only remove target_label pixels inside the ROI.
+            target_pixels = mask_crop & (region == target_label)
+
+            if np.any(target_pixels):
+                region[target_pixels] = 0
+                data[z_idx, y0:y1, x0:x1] = region
+
+        else:
+            notifications.show_error('Unknown ROI mode.')
+            self._cancel_roi()
+            return
 
     if self._current_roi_mode == 'add':
-        region[mask_crop] = target_label
-        data[z_idx, y0:y1, x0:x1] = region
-
         self._append_log_entry(
             operation='add to label',
             label_id_or_count=target_label,
@@ -2584,13 +2646,6 @@ def _apply_roi(self):
         )
 
     elif self._current_roi_mode == 'subtract':
-        # Only remove target_label pixels inside the ROI.
-        target_pixels = mask_crop & (region == target_label)
-
-        if np.any(target_pixels):
-            region[target_pixels] = 0
-            data[z_idx, y0:y1, x0:x1] = region
-
         self._append_log_entry(
             operation='subtract from label',
             label_id_or_count=target_label,
@@ -2603,11 +2658,6 @@ def _apply_roi(self):
         notifications.show_info(
             f'Subtracted label {target_label} inside ROI on slice {z_idx}.'
         )
-
-    else:
-        notifications.show_error('Unknown ROI mode.')
-        self._cancel_roi()
-        return
 
     labels_layer.refresh()
     self._cancel_roi(labels_layer_to_activate=labels_layer)
@@ -2671,15 +2721,40 @@ def _apply_new_label(self):
             self._cancel_roi()
             return
 
-        for z, mask in slice_masks.items():
-            if not np.any(mask):
-                continue
+        # with _label_write_lock_context(self):
+        #     for z, mask in slice_masks.items():
+        #         if not np.any(mask):
+        #             continue
 
-            z = int(z)
-            slice_data = np.asarray(data[z]).copy()
-            slice_data[mask] = target_label
-            data[z] = slice_data
-            modified_slices.add(z)
+        #         z = int(z)
+
+        #         # read-modify-write must be locked as one unit
+        #         slice_data = np.asarray(data[z]).copy()
+        #         slice_data[mask] = target_label
+        #         data[z] = slice_data
+
+        #         modified_slices.add(z)
+        with _label_write_lock_context(self):
+            for z, mask in slice_masks.items():
+                if not np.any(mask):
+                    continue
+
+                z = int(z)
+
+                yy, xx = np.where(mask)
+                y0 = int(yy.min())
+                y1 = int(yy.max()) + 1
+                x0 = int(xx.min())
+                x1 = int(xx.max()) + 1
+
+                mask_crop = mask[y0:y1, x0:x1]
+
+                # Only read/write the local bbox, not the whole slice.
+                region = np.asarray(data[z, y0:y1, x0:x1]).copy()
+                region[mask_crop] = target_label
+                data[z, y0:y1, x0:x1] = region
+
+                modified_slices.add(z)
     else:
         if (
             self._roi_brush_layer is None
@@ -2699,31 +2774,31 @@ def _apply_new_label(self):
             self._cancel_roi()
             return
 
-        for z, saved in self._roi_brush_masks.items():
-            z = int(z)
+        with _label_write_lock_context(self):
+            for z, saved in self._roi_brush_masks.items():
+                z = int(z)
 
-            if isinstance(saved, dict):
-                y0, y1, x0, x1 = saved['bbox']
-                mask_crop = saved['mask']
+                if isinstance(saved, dict):
+                    y0, y1, x0, x1 = saved['bbox']
+                    mask_crop = saved['mask']
 
-                if mask_crop is None or not np.any(mask_crop):
-                    continue
+                    if mask_crop is None or not np.any(mask_crop):
+                        continue
 
-                # Read only the local bbox region.
-                region = np.asarray(data[z, y0:y1, x0:x1]).copy()
-                region[mask_crop] = target_label
-                data[z, y0:y1, x0:x1] = region
+                    region = np.asarray(data[z, y0:y1, x0:x1]).copy()
+                    region[mask_crop] = target_label
+                    data[z, y0:y1, x0:x1] = region
 
-            else:
-                # Backward compatibility if old full-size masks still exist.
-                slice_mask = saved
-                if not np.any(slice_mask):
-                    continue
-                slice_data = np.asarray(data[z]).copy()
-                slice_data[slice_mask] = target_label
-                data[z] = slice_data
+                else:
+                    slice_mask = saved
+                    if not np.any(slice_mask):
+                        continue
 
-            modified_slices.add(z)
+                    slice_data = np.asarray(data[z]).copy()
+                    slice_data[slice_mask] = target_label
+                    data[z] = slice_data
+
+                modified_slices.add(z)
 
     self._append_log_entry(
         operation='add new label',
@@ -3013,7 +3088,10 @@ def _apply_delete_inside(self):
     # Create thread and worker
     self.delete_inside_thread = QThread()
     self.delete_inside_worker = DeleteInsideWorker(
-        data, shapes_data, current_z
+        data,
+        shapes_data,
+        current_z,
+        write_lock=getattr(self, '_zarr_write_lock', None),
     )
     self.delete_inside_worker.moveToThread(self.delete_inside_thread)
 
@@ -3302,7 +3380,9 @@ def _undo_local_refinement(self, viewer=None):
 
     z0, z1, y0, y1, x0, x1 = bbox
 
-    labels_layer.data[z0:z1, y0:y1, x0:x1] = old_crop
+    with _label_write_lock_context(self):
+        labels_layer.data[z0:z1, y0:y1, x0:x1] = old_crop
+
     labels_layer.refresh()
 
     notifications.show_info(

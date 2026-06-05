@@ -13,6 +13,8 @@ import zarr
 from scipy import ndimage as ndi
 from skimage.measure import label as sk_label
 from tqdm.auto import tqdm
+from scipy.ndimage import find_objects
+from scipy.sparse import coo_matrix
 
 _FOCUS3D_DIR = Path(__file__).resolve().parent
 if str(_FOCUS3D_DIR) not in sys.path:
@@ -228,7 +230,7 @@ def infer_volume(
     # Build model
     # --------------------------------------------------------
     print('\n[Step 1] "Building config and loading model..."')
-    cfg = setup_cfg(config_file, weights_path)
+    cfg = setup_cfg(config_file, weights_path, device=device)
     model = build_predictor(cfg)
     device = cfg.MODEL.DEVICE if device is None else device
 
@@ -332,6 +334,7 @@ def infer_volume(
     # Batch inference
     # --------------------------------------------------------
     print('\n[Step 4] "Batch inference..."')
+    uf_tracker = UnionFind()
     patch_dataset = PatchDataset(
         padded_volume=padded_volume,
         infer_coords=infer_coords,
@@ -424,7 +427,7 @@ def infer_volume(
             patch_instance_map = post['patch_instance_map']
             patch_confidence = post['patch_confidence']
 
-            next_instance_id = stitch_patch_instance_results_v4(
+            next_instance_id = stitch_patch_instance_results_v8(
                 global_instance_map=global_instance_map,
                 confidence_sum=confidence_sum,
                 confidence_count=confidence_count,
@@ -437,6 +440,7 @@ def infer_volume(
                 max_coords=max_coords,
                 patch_size=patch_size,
                 stride=stride,
+                uf_tracker=uf_tracker,
             )
 
             processed_patches += 1
@@ -513,17 +517,19 @@ def infer_volume(
     z_raw, y_raw, x_raw = raw_volume.shape
     pre_post_instance = pre_post_instance_padded[:z_raw, :y_raw, :x_raw]
     pre_post_confidence = pre_post_confidence_padded[:z_raw, :y_raw, :x_raw]
+    if save_intermediate:
+        save_volume(
+            output_dir
+            / f'{Path(image_path).stem}_instance_map_before_postprocess.tif',
+            pre_post_instance.astype(np.uint32),
+        )
 
-    save_volume(
-        output_dir
-        / f'{Path(image_path).stem}_instance_map_before_postprocess.tif',
-        pre_post_instance.astype(np.uint32),
-    )
-    save_volume(
-        output_dir
-        / f'{Path(image_path).stem}_confidence_map_before_postprocess.tif',
-        pre_post_confidence.astype(np.float32),
-    )
+        save_volume(
+            output_dir
+            / f'{Path(image_path).stem}_confidence_map_before_postprocess.tif',
+            pre_post_confidence.astype(np.float32),
+        )
+    finalize_global_bridge_resolution(global_instance_map, uf_tracker)
 
     instance_map_padded, confidence_map_padded = filter_instances_by_size(
         instance_map=instance_map_padded,
@@ -569,6 +575,48 @@ def infer_volume(
         'log_info': log_info,
     }
     return result
+
+
+class UnionFind:
+    def __init__(self):
+        self.parent: Dict[int, int] = {}
+
+    def find(self, i: int) -> int:
+        if i not in self.parent:
+            self.parent[i] = i
+            return i
+        path = []
+        while self.parent[i] != i:
+            path.append(i)
+            i = self.parent[i]
+        for node in path:
+            self.parent[node] = i
+        return i
+
+    def union(self, i: int, j: int):
+        root_i = self.find(i)
+        root_j = self.find(j)
+        if root_i != root_j:
+            self.parent[root_i] = root_j
+
+
+def finalize_global_bridge_resolution(
+    global_instance_map: np.ndarray, uf_tracker: UnionFind
+):
+    if not uf_tracker.parent:
+        return
+
+    max_global_id = int(global_instance_map.max())
+    if max_global_id == 0:
+        return
+
+    global_lut = np.arange(max_global_id + 1, dtype=np.uint32)
+
+    for gid in list(uf_tracker.parent.keys()):
+        if gid <= max_global_id:
+            global_lut[gid] = uf_tracker.find(gid)
+
+    global_instance_map[:] = global_lut[global_instance_map]
 
 
 # ============================================================
@@ -1101,151 +1149,53 @@ def patch_postprocess_argmax(
     }
 
 
-def stitch_patch_instance_results_v4_fixed(
-    global_instance_map,
-    confidence_sum,
-    confidence_count,
-    patch_instance_map,
-    patch_confidence,
-    z0,
-    y0,
-    x0,
-    next_instance_id,
-    max_coords,
-    patch_size=(32, 256, 256),
-    stride=(16, 224, 224),
-    face_iom_thresh=0.2,
-):
-    dz, dy, dx = patch_size
-    sz, sy, sx = stride
-    mz, my, mx = (dz - sz) // 2, (dy - sy) // 2, (dx - sx) // 2
+def stitch_patch_instance_results_v8(
+    global_instance_map: np.ndarray,
+    confidence_sum: np.ndarray,
+    confidence_count: np.ndarray,
+    patch_instance_map: np.ndarray,
+    patch_confidence: np.ndarray,
+    z0: int,
+    y0: int,
+    x0: int,
+    next_instance_id: int,
+    max_coords: Tuple[int, int, int],
+    patch_size: Tuple[int, int, int] = (32, 256, 256),
+    stride: Tuple[int, int, int] = (16, 224, 224),
+    face_iom_thresh: float = 0.6,
+    uf_tracker=None,
+) -> int:
+    # Copy to avoid modifying the input patch array in-place
+    patch_instance_map = patch_instance_map.copy()
 
-    max_z, max_y, max_x = max_coords
+    # =========================================================================
+    # 1. [Multi-connected Component Splitting] Method A - Strict Logic Unchanged
+    # =========================================================================
+    max_lid = int(patch_instance_map.max())
+    if max_lid > 0:
+        instance_slices = find_objects(patch_instance_map, max_lid)
+        current_max_local_id = max_lid
 
-    limit_z, limit_y, limit_x = global_instance_map.shape
+        for lid_minus_1, sub_slice in enumerate(instance_slices):
+            if sub_slice is None:
+                continue
 
-    # --- Step 1: dynamic core boundary ---
-    z_start = 0 if z0 == 0 else mz
-    z_end = dz if z0 == max_z else mz + sz
+            lid = lid_minus_1 + 1
+            sub_map = patch_instance_map[sub_slice]
+            mask = sub_map == lid
 
-    y_start = 0 if y0 == 0 else my
-    y_end = dy if y0 == max_y else my + sy
+            # Use C++ level optimized 3D labeling stream
+            labeled_mask, num_features = sk_label(mask, return_num=True)
 
-    x_start = 0 if x0 == 0 else mx
-    x_end = dx if x0 == max_x else mx + sx
+            if num_features > 1:
+                for feat_id in range(2, num_features + 1):
+                    current_max_local_id += 1
+                    sub_map[labeled_mask == feat_id] = current_max_local_id
 
-    core_instance = patch_instance_map[
-        z_start:z_end, y_start:y_end, x_start:x_end
-    ]
+    # Update the maximum local ID after splitting
+    max_local_id = int(patch_instance_map.max())
+    # =========================================================================
 
-    gz0, gy0, gx0 = z0 + z_start, y0 + y_start, x0 + x_start
-    gz1, gy1, gx1 = z0 + z_end, y0 + y_end, x0 + x_end
-
-    #  --- Step 2: face matching ---
-    b_local, b_global = [], []
-    if gz0 > 0:
-        b_local.append(core_instance[0, :, :].flatten())
-        b_global.append(
-            global_instance_map[gz0 - 1, gy0:gy1, gx0:gx1].flatten()
-        )
-    if gy0 > 0:
-        b_local.append(core_instance[:, 0, :].flatten())
-        b_global.append(
-            global_instance_map[gz0:gz1, gy0 - 1, gx0:gx1].flatten()
-        )
-    if gx0 > 0:
-        b_local.append(core_instance[:, :, 0].flatten())
-        b_global.append(
-            global_instance_map[gz0:gz1, gy0:gy1, gx0 - 1].flatten()
-        )
-
-    b_local_arr = np.concatenate(b_local) if b_local else np.array([])
-    b_global_arr = np.concatenate(b_global) if b_global else np.array([])
-
-    global_area_dict = {}
-    if b_global_arr.size > 0:
-        g_ids, g_counts = np.unique(b_global_arr, return_counts=True)
-        global_area_dict = dict(zip(g_ids, g_counts))
-
-    # --- Step 3: id remap on local ids that appear in core ---
-    local_ids_in_core = np.unique(core_instance)
-    local_ids_in_core = local_ids_in_core[local_ids_in_core > 0]
-    id_remap = {}
-
-    for lid in local_ids_in_core:
-        matched_gid = None
-        if b_local_arr.size > 0:
-            mask_l = b_local_arr == lid
-            area_l = mask_l.sum()
-            if area_l > 0:
-                overlapping_gids, counts = np.unique(
-                    b_global_arr[mask_l], return_counts=True
-                )
-                best_gid, best_iom = None, 0
-                for gid, inter in zip(overlapping_gids, counts):
-                    if gid == 0:
-                        continue
-                    area_g = global_area_dict.get(gid, 0)
-                    iom = inter / min(area_l, area_g)
-                    if iom > best_iom:
-                        best_iom, best_gid = iom, gid
-                if best_iom >= face_iom_thresh:
-                    matched_gid = best_gid
-
-        if matched_gid is not None:
-            id_remap[lid] = matched_gid
-        else:
-            id_remap[lid] = next_instance_id
-            next_instance_id += 1
-
-    # --- Step 4: fast rendering write-back with LUT ---
-    if len(id_remap) > 0:
-        max_lid = int(patch_instance_map.max())
-        lut = np.zeros(max_lid + 1, dtype=np.uint32)
-        for lid, gid in id_remap.items():
-            lut[lid] = gid
-
-        remapped_patch = lut[patch_instance_map]
-
-        gz1_full = min(z0 + dz, limit_z)
-        gy1_full = min(y0 + dy, limit_y)
-        gx1_full = min(x0 + dx, limit_x)
-
-        lz1, ly1, lx1 = gz1_full - z0, gy1_full - y0, gx1_full - x0
-
-        remapped_crop = remapped_patch[:lz1, :ly1, :lx1]
-        conf_crop = patch_confidence[:lz1, :ly1, :lx1]
-
-        valid_mask = remapped_crop > 0
-        if valid_mask.any():
-            global_instance_map[z0:gz1_full, y0:gy1_full, x0:gx1_full][
-                valid_mask
-            ] = remapped_crop[valid_mask]
-            confidence_sum[z0:gz1_full, y0:gy1_full, x0:gx1_full][
-                valid_mask
-            ] += conf_crop[valid_mask]
-            confidence_count[z0:gz1_full, y0:gy1_full, x0:gx1_full][
-                valid_mask
-            ] += 1
-
-    return next_instance_id
-
-
-def stitch_patch_instance_results_v4(
-    global_instance_map,
-    confidence_sum,
-    confidence_count,
-    patch_instance_map,
-    patch_confidence,
-    z0,
-    y0,
-    x0,
-    next_instance_id,
-    max_coords,
-    patch_size=(32, 256, 256),
-    stride=(16, 224, 224),
-    face_iom_thresh=0.2,
-):
     dz, dy, dx = patch_size
     sz, sy, sx = stride
     mz, my, mx = (dz - sz) // 2, (dy - sy) // 2, (dx - sx) // 2
@@ -1253,24 +1203,30 @@ def stitch_patch_instance_results_v4(
     max_z, max_y, max_x = max_coords
     limit_z, limit_y, limit_x = global_instance_map.shape
 
-    # --- Step 1: dynamic core boundary ---
     z_start = 0 if z0 == 0 else mz
     z_end = dz if z0 == max_z else mz + sz
-
     y_start = 0 if y0 == 0 else my
     y_end = dy if y0 == max_y else my + sy
-
     x_start = 0 if x0 == 0 else mx
     x_end = dx if x0 == max_x else mx + sx
 
     core_instance = patch_instance_map[
         z_start:z_end, y_start:y_end, x_start:x_end
     ]
-
     gz0, gy0, gx0 = z0 + z_start, y0 + y_start, x0 + x_start
     gz1, gy1, gx1 = z0 + z_end, y0 + y_end, x0 + x_end
 
-    # --- Step 2: face matching ---
+    # =========================================================================
+    # 2. [Core Region ID Extraction] Use np.bincount (O(N)) instead of np.unique (O(N log N))
+    # =========================================================================
+    core_counts_all = np.bincount(core_instance.ravel())
+    if core_counts_all.size > 1:
+        core_ids = np.nonzero(core_counts_all)[0]
+        core_ids = core_ids[core_ids > 0]  # Exclude background 0
+        local_ids_in_core = core_ids[core_counts_all[core_ids] >= 64]
+    else:
+        local_ids_in_core = np.array([], dtype=np.int32)
+
     b_local, b_global = [], []
     if gz0 > 0:
         b_local.append(core_instance[0, :, :].reshape(-1))
@@ -1299,55 +1255,83 @@ def stitch_patch_instance_results_v4(
         else np.array([], dtype=global_instance_map.dtype)
     )
 
-    global_area_dict = {}
-    if b_global_arr.size > 0:
-        g_ids, g_counts = np.unique(b_global_arr, return_counts=True)
-        global_area_dict = dict(zip(g_ids.tolist(), g_counts.tolist()))
+    # =========================================================================
+    # 3. [Boundary Intersection Optimization] Compute all overlaps via Sparse Matrix
+    # =========================================================================
+    b_local_counts = (
+        np.bincount(b_local_arr) if b_local_arr.size > 0 else np.array([])
+    )
+    g_counts_all = (
+        np.bincount(b_global_arr) if b_global_arr.size > 0 else np.array([])
+    )
 
-    # --- Step 3: id remap on local ids that appear in core ---
-    local_ids_in_core = np.unique(core_instance)
-    local_ids_in_core = local_ids_in_core[local_ids_in_core > 0]
+    overlap_matrix = None
+    if b_local_arr.size > 0 and b_global_arr.size > 0:
+        valid_b = (b_local_arr > 0) & (b_global_arr > 0)
+        if valid_b.any():
+            bl_valid = b_local_arr[valid_b]
+            bg_valid = b_global_arr[valid_b]
+            max_l = int(bl_valid.max())
+            max_g = int(bg_valid.max())
+
+            # Construct a sparse co-occurrence matrix:
+            # rows = local_id, cols = global_id, values = intersection area
+            ones = np.ones_like(bl_valid, dtype=np.int32)
+            overlap_matrix = coo_matrix(
+                (ones, (bl_valid, bg_valid)),
+                shape=(max(max_l, max_local_id) + 1, max_g + 1),
+            ).tocsr()
+
     id_remap = {}
-
     for lid in local_ids_in_core:
-        matched_gid = None
-        if b_local_arr.size > 0:
-            mask_l = b_local_arr == lid
-            area_l = int(mask_l.sum())
-            if area_l > 0:
-                overlapping_gids, counts = np.unique(
-                    b_global_arr[mask_l], return_counts=True
-                )
-                best_gid, best_iom = None, 0.0
-                for gid, inter in zip(overlapping_gids, counts):
-                    if gid == 0:
-                        continue
-                    area_g = global_area_dict.get(int(gid), 0)
-                    if area_g <= 0:
-                        continue
-                    iom = float(inter) / float(min(area_l, area_g))
-                    if iom > best_iom:
-                        best_iom = iom
-                        best_gid = int(gid)
-                if best_iom >= face_iom_thresh:
-                    matched_gid = best_gid
+        matched_gids = []
+        area_l = int(b_local_counts[lid]) if lid < b_local_counts.size else 0
 
-        if matched_gid is not None:
-            id_remap[int(lid)] = int(matched_gid)
+        # O(1) slice via CSR row pointer to fetch all intersecting global_ids and voxel counts
+        if (
+            area_l > 0
+            and overlap_matrix is not None
+            and lid < overlap_matrix.shape[0]
+        ):
+            row = overlap_matrix[lid]
+            for gid, inter in zip(row.indices, row.data):
+                if gid == 0:
+                    continue
+                area_g = (
+                    int(g_counts_all[gid]) if gid < g_counts_all.size else 0
+                )
+                if area_g <= 0:
+                    continue
+
+                iom = float(inter) / float(min(area_l, area_g))
+                if iom >= face_iom_thresh:
+                    matched_gids.append(int(gid))
+
+        if len(matched_gids) > 0:
+            base_gid = matched_gids[0]
+            id_remap[int(lid)] = base_gid
+            if len(matched_gids) > 1 and uf_tracker is not None:
+                for other_gid in matched_gids[1:]:
+                    uf_tracker.union(base_gid, other_gid)
         else:
             id_remap[int(lid)] = int(next_instance_id)
             next_instance_id += 1
+    # =========================================================================
 
-    if len(id_remap) == 0:
+    num_small = (
+        np.sum((core_ids > 0) & (core_counts_all[core_ids] < 64))
+        if core_counts_all.size > 1
+        else 0
+    )
+    if len(id_remap) == 0 and num_small > 0:
+        remapped_patch = np.zeros_like(patch_instance_map)
+    elif len(id_remap) == 0:
         return next_instance_id
-
-    # --- Step 4: fast rendering write-back with LUT ---
-    max_local_id = int(patch_instance_map.max())
-    lut = np.zeros(max_local_id + 1, dtype=np.uint32)
-    for lid, gid in id_remap.items():
-        lut[lid] = gid
-
-    remapped_patch = lut[patch_instance_map]
+    else:
+        lut = np.zeros(max_local_id + 1, dtype=np.uint32)
+        for lid, gid in id_remap.items():
+            lut[lid] = gid
+        remapped_patch = lut[patch_instance_map]
 
     gz1_full = min(z0 + patch_instance_map.shape[0], limit_z)
     gy1_full = min(y0 + patch_instance_map.shape[1], limit_y)
@@ -1476,8 +1460,8 @@ def filter_instances_by_size(
 
     if verbose:
         print(
-            f'[2D same-ID CC filtering] Removed {removed_2d_cc} small CCs, '
-            f'{removed_2d_voxels} pixels/voxels in total.'
+            f'[2D filtering] Removed {removed_2d_cc} small components, '
+            f'{removed_2d_voxels} voxels in total.'
         )
 
     # ============================================================
@@ -1563,7 +1547,6 @@ def filter_instances_by_size(
             f'[ID filtering] Kept {valid_ids.size} instances. '
             f'Removed by size: {removed_by_size}. '
             f'Removed by intensity: {removed_by_intensity}. '
-            f'Final IDs: 1 ~ {valid_ids.size}'
         )
 
     return new_instance.astype(np.uint32), new_confidence.astype(np.float32)

@@ -36,8 +36,10 @@ import sys
 import traceback
 
 sys.path.insert(0, os.path.dirname(__file__))
+import contextlib
 from datetime import datetime
 from pathlib import Path
+from threading import RLock
 
 import dask.array as da
 import napari
@@ -492,7 +494,8 @@ class SegmentationWidget(QWidget):
         self._pick_mode_active = False  # Toggle state for pick mode
         self._delete_inside_mode_active = False
         self._delete_all_active = False
-
+        self._zarr_write_lock = RLock()
+        self._label_io_busy = False
         self._cell_refine_active = False
         self._cell_refine_undo_stack = []
         self.cell_refine_thread = None
@@ -568,12 +571,10 @@ class SegmentationWidget(QWidget):
         self.viewer.layers.events.removed.connect(
             self._on_layers_changed_for_channel_display
         )
-        try:
+        with contextlib.suppress(Exception):
             self.viewer.layers.selection.events.active.connect(
                 self._on_active_layer_changed_for_display
             )
-        except Exception:
-            pass
 
     def _section_group_style(self):
         """
@@ -1819,19 +1820,15 @@ class SegmentationWidget(QWidget):
 
         self._set_display_contrast_controls_enabled(True)
 
-        try:
-            cmap_name = layer.colormap.name
-        except Exception:
-            cmap_name = '-'
+        with contextlib.suppress(Exception):
+            pass
 
         data_min, data_max = self._estimate_display_data_range(layer)
         self._display_data_min = data_min
         self._display_data_max = data_max
 
-        try:
+        with contextlib.suppress(Exception):
             layer.contrast_limits_range = [data_min, data_max]
-        except Exception:
-            pass
 
         try:
             lo, hi = layer.contrast_limits
@@ -2343,14 +2340,10 @@ class SegmentationWidget(QWidget):
         for layer in self.viewer.layers:
             if isinstance(layer, Image):
                 layer.visible = True
-                try:
+                with contextlib.suppress(Exception):
                     layer.colormap = 'gray'
-                except Exception:
-                    pass
-                try:
+                with contextlib.suppress(Exception):
                     layer.blending = 'translucent'
-                except Exception:
-                    pass
                 layer.refresh()
 
         self._refresh_channel_rows()
@@ -3132,7 +3125,11 @@ class SegmentationWidget(QWidget):
         # Name-based fallback
         for layer in labels_layers:
             name = str(getattr(layer, 'name', '')).lower()
-            if name.endswith('_seg') or 'seg' in name or 'segmentation' in name:
+            if (
+                name.endswith('_seg')
+                or 'seg' in name
+                or 'segmentation' in name
+            ):
                 return layer
 
         # Avoid temporary brush layers if possible
@@ -3394,7 +3391,7 @@ class SegmentationWidget(QWidget):
         def _make_chunks(shape):
             if len(shape) == 3:
                 return (
-                    min(4, int(shape[0])),
+                    1,
                     min(512, int(shape[1])),
                     min(512, int(shape[2])),
                 )
@@ -3528,10 +3525,8 @@ class SegmentationWidget(QWidget):
 
         self.current_label_path = str(editable_zarr_path)
 
-        try:
+        with contextlib.suppress(Exception):
             self.viewer.layers.selection.active = layer
-        except Exception:
-            pass
 
         # ------------------------------------------------------------
         # 4. Optionally add confidence map as hidden image layer
@@ -3556,10 +3551,8 @@ class SegmentationWidget(QWidget):
                     name=conf_name,
                     visible=False,
                 )
-                try:
+                with contextlib.suppress(Exception):
                     conf_layer.colormap = 'magma'
-                except Exception:
-                    pass
             except Exception as e:
                 notifications.show_warning(
                     f'Failed to add confidence map: {e}'
@@ -3904,16 +3897,18 @@ class SegmentationWidget(QWidget):
 
         # 3. Disconnect automatic slice-change refresh hook.
         if getattr(self, '_patch_overlay_hook_installed', False):
-            try:
+            with contextlib.suppress(Exception):
                 self.viewer.dims.events.current_step.disconnect(
                     self._on_viewer_current_step_changed
                 )
-            except Exception:
-                pass
             self._patch_overlay_hook_installed = False
 
         # 4. Remove known overlay layer objects.
-        for attr in ['patch_text_layer', 'patch_overlay_layer', 'selected_patch_layer']:
+        for attr in [
+            'patch_text_layer',
+            'patch_overlay_layer',
+            'selected_patch_layer',
+        ]:
             layer = getattr(self, attr, None)
             if layer is not None:
                 try:
@@ -3941,10 +3936,8 @@ class SegmentationWidget(QWidget):
                 self.patch_id_spin.setValue(0)
                 self.patch_id_spin.blockSignals(False)
             except Exception:
-                try:
+                with contextlib.suppress(Exception):
                     self.patch_id_spin.blockSignals(False)
-                except Exception:
-                    pass
 
         # 7. Disable clear button until patches are calculated again.
         if hasattr(self, 'btn_clear_valid_patch_boxes'):
@@ -3971,7 +3964,9 @@ class SegmentationWidget(QWidget):
                     )
 
         if notify:
-            notifications.show_info('Valid patch boxes cleared. Curation state restored.')
+            notifications.show_info(
+                'Valid patch boxes cleared. Curation state restored.'
+            )
 
     def _on_calculate_valid_patches_error(self, error_msg):
         """Handle patch calculation failure."""
@@ -4096,15 +4091,11 @@ class SegmentationWidget(QWidget):
                 features=features,
                 name='valid_patch_boxes',
             )
-            try:
+            with contextlib.suppress(Exception):
                 self.patch_overlay_layer.editable = False
-            except Exception:
-                pass
 
-            try:
+            with contextlib.suppress(Exception):
                 self.patch_overlay_layer.mode = 'pan_zoom'
-            except Exception:
-                pass
 
             if (
                 self._on_patch_overlay_click
@@ -4202,10 +4193,8 @@ class SegmentationWidget(QWidget):
         self.current_patch_info = info
 
         if self.curated_patch_viewer is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self.curated_patch_viewer.close()
-            except Exception:
-                pass
 
         self.curated_patch_viewer = napari.Viewer(
             title=f'Curate Patch {patch_id}'

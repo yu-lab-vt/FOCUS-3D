@@ -1,6 +1,6 @@
 [project]
 name = "focus-3d"
-dynamic = ["version"]
+version = "0.1.1"
 description = "FOCUS-3D: a user-friendly napari plugin for interactive 3D cell segmentation, curation, and analysis"
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -34,12 +34,26 @@ dependencies = [
     "magicgui",
     "qtpy",
     "scikit-image",
+    "scipy",
+    "pandas",
+    "tifffile",
+    "zarr",
+    "imageio",
+    "pyyaml",
+    "requests",
+    "dask",
+    "fsspec",
+    "numcodecs",
+    "pillow",
+    "matplotlib",
 ]
 
 [project.optional-dependencies]
-# Allow easy installation with the full, default napari installation
-# including a Qt backend using focus-3d[all].
-all = ["napari[all]"]
+all = [
+    "napari[all]",
+    "torch",
+    "torchvision",
+]
 
 [dependency-groups]
 dev = [
@@ -56,7 +70,7 @@ focus-3d = "focus3d:napari.yaml"
 
 
 [build-system]
-requires = ["setuptools>=77.0.3", "setuptools_scm"]
+requires = ["setuptools>=77.0.3", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -74,10 +88,6 @@ focus3d = [
     "segmentation/FOCUS3D/*.yml",
     "segmentation/FOCUS3D/LICENSE",
 ]
-
-[tool.setuptools_scm]
-write_to = "src/focus3d/_version.py"
-fallback_version = "0.0.1+nogit"
 
 [tool.pytest.ini_options]
 minversion = "6.0"

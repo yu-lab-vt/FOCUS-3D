@@ -1,69 +1,24 @@
+import os
 import json
 import math
 import time
-from collections.abc import Callable
+import csv
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
-
-import numpy as np
-import tifffile
-import torch
-import zarr
-from detectron2.checkpoint import DetectionCheckpointer
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from mask2former import add_maskformer2_config
 from detectron2.config import get_cfg
 from detectron2.modeling import build_model
-from mask2former import add_maskformer2_config
+from detectron2.checkpoint import DetectionCheckpointer
+import numpy as np
+import torch
+import tifffile
+import zarr
 from scipy import ndimage as ndi
-from skimage.measure import label as sk_label
 from tqdm.auto import tqdm
-
-
-def _format_eta(seconds: float | None) -> str:
-    if seconds is None or seconds < 0 or not math.isfinite(seconds):
-        return 'estimating...'
-
-    seconds = int(seconds)
-
-    if seconds < 60:
-        return f'{seconds}s'
-
-    minutes, sec = divmod(seconds, 60)
-    if minutes < 60:
-        return f'{minutes}m {sec}s'
-
-    hours, minutes = divmod(minutes, 60)
-    return f'{hours}h {minutes}m'
-
-
-def _emit_status(progress_callback, message: str) -> None:
-    """
-    Emit status-only message.
-
-    Convention:
-        value = -1 means: update text only, do not update progress bar.
-    """
-    if progress_callback is None:
-        return
-
-    progress_callback(-1, str(message))
-
-
-def _emit_progress(progress_callback, value: int, message: str) -> None:
-    """
-    Emit real patch-level progress.
-
-    Only use this during patch inference.
-    """
-    if progress_callback is None:
-        return
-
-    value = max(0, min(100, int(value)))
-    progress_callback(value, str(message))
-
-
-def _check_cancelled(cancel_callback) -> None:
-    if cancel_callback is not None and cancel_callback():
-        raise RuntimeError('__SEG_CANCELLED__')
+from scipy.ndimage import gaussian_filter
+from skimage.measure import label as sk_label
+from scipy.ndimage import find_objects
+from scipy.sparse import coo_matrix
 
 
 # ============================================================
@@ -99,7 +54,7 @@ def infer_volume(
     image_path: Union[str, Path],
     config_file: Union[str, Path],
     weights_path: Union[str, Path],
-    device: str | None = None,
+    device: Optional[str] = None,
     z_ratio: float = 1.0,
     output_dir: Union[str, Path] = None,
     lower_percentile: float = 1.0,
@@ -115,13 +70,11 @@ def infer_volume(
     # Exposed patch_postprocess parameters
     min_edge_area: int = 20,
     size_filter_min_size: int = 0,
-    size_filter_max_size: int | None = None,
+    size_filter_max_size: Optional[int] = None,
     use_amp: bool = True,
     amp_dtype: str = 'float16',
     patch_size: Tuple[int, int, int] = (32, 96, 96),  # (Z, Y, X)
-    stride: Tuple[int, int, int] | None = None,
-    progress_callback: Callable[[int, str], None] | None = None,
-    cancel_callback: Callable[[], bool] | None = None,
+    stride: Optional[Tuple[int, int, int]] = None,
 ) -> Dict:
     """
     Inference on an arbitrarily-sized 3D volume:
@@ -137,15 +90,15 @@ def infer_volume(
     t_total_start = time.time()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    _emit_status(progress_callback, 'Loading segmentation model...')
-    _check_cancelled(cancel_callback)
+
     # --------------------------------------------------------
     # Build model
     # --------------------------------------------------------
-    print('\n[Step 1] "Building config and loading model..."')
+    print(f'\n[Step 1] "Building config and loading model..."')
     cfg = setup_cfg(config_file, weights_path)
     model = build_predictor(cfg)
     device = cfg.MODEL.DEVICE if device is None else device
+
     amp_enabled = bool(use_amp and str(device).startswith('cuda'))
     if amp_dtype == 'bfloat16':
         autocast_dtype = torch.bfloat16
@@ -180,9 +133,7 @@ def infer_volume(
     # --------------------------------------------------------
     # Read image
     # --------------------------------------------------------
-    print('\n[Step 2] "Reading image..."')
-    _emit_status(progress_callback, 'Reading and normalizing image...')
-    _check_cancelled(cancel_callback)
+    print(f'\n[Step 2] "Reading image..."')
     raw_volume = read_volume(image_path)
     norm_volume, norm_stats = normalize_img(
         raw_volume,
@@ -204,9 +155,7 @@ def infer_volume(
     # --------------------------------------------------------
     # Patch / stride planning and padding
     # --------------------------------------------------------
-    _emit_status(progress_callback, 'Preparing sliding-window patches...')
-    _check_cancelled(cancel_callback)
-    print('\n[Step 3] "Generating patches..."')
+    print(f'\n[Step 3] "Generating patches..."')
     if stride is None:
         stride = tuple(s // 2 for s in patch_size)
     else:
@@ -241,19 +190,11 @@ def infer_volume(
     log_info['num_infer_patches'] = int(len(infer_coords))
     log_info['num_skipped_background_patches'] = int(len(skipped_coords))
 
-    _emit_status(
-        progress_callback,
-        (
-            f'Prepared {len(infer_coords)} inference patches '
-            f'and skipped {len(skipped_coords)} background patches.'
-        ),
-    )
-    _check_cancelled(cancel_callback)
-
     # --------------------------------------------------------
     # Batch inference
     # --------------------------------------------------------
-    print('\n[Step 4] "Batch inference..."')
+    print(f'\n[Step 4] "Batch inference..."')
+    uf_tracker = UnionFind()
     patch_dataset = PatchDataset(
         padded_volume=padded_volume,
         infer_coords=infer_coords,
@@ -293,43 +234,19 @@ def infer_volume(
         total=len(patch_loader),
         desc='Inferencing patches',
         unit='batch',
-        disable=(progress_callback is not None),
     )
 
-    total_patches = len(infer_coords)
-    total_batches = len(patch_loader)
-    processed_patches = 0
-    progress_update_every = max(1, total_patches // 100)
-    t_patch_start = time.time()
-
-    if total_patches == 0:
-        _emit_progress(
-            progress_callback,
-            100,
-            'No foreground patches found. Patch inference skipped.',
-        )
-    else:
-        _emit_progress(
-            progress_callback,
-            0,
-            f'Patch inference: 0/{total_patches} patches',
-        )
-
-    for batch_idx, inputs in enumerate(patch_pbar, start=1):
-        _check_cancelled(cancel_callback)
-
+    for inputs in patch_pbar:
         for sample in inputs:
             sample['image'] = sample['image'].to(device, non_blocking=True)
 
-        with (
-            torch.inference_mode(),
-            torch.autocast(
+        with torch.inference_mode():
+            with torch.autocast(
                 device_type='cuda',
                 dtype=autocast_dtype,
                 enabled=amp_enabled,
-            ),
-        ):
-            batch_outputs = model(inputs)
+            ):
+                batch_outputs = model(inputs)
 
         for sample, model_output in zip(inputs, batch_outputs):
             z0, y0, x0 = sample['coord']
@@ -346,7 +263,7 @@ def infer_volume(
             patch_instance_map = post['patch_instance_map']
             patch_confidence = post['patch_confidence']
 
-            next_instance_id = stitch_patch_instance_results_v4(
+            next_instance_id = stitch_patch_instance_results_v8(
                 global_instance_map=global_instance_map,
                 confidence_sum=confidence_sum,
                 confidence_count=confidence_count,
@@ -359,35 +276,9 @@ def infer_volume(
                 max_coords=max_coords,
                 patch_size=patch_size,
                 stride=stride,
+                uf_tracker=uf_tracker,
             )
-            processed_patches += 1
 
-            if (
-                processed_patches == 1
-                or processed_patches % progress_update_every == 0
-                or processed_patches == total_patches
-            ):
-                elapsed = time.time() - t_patch_start
-                eta = (
-                    elapsed
-                    / max(1, processed_patches)
-                    * max(0, total_patches - processed_patches)
-                )
-
-                percent = int(100 * processed_patches / max(1, total_patches))
-
-                _emit_progress(
-                    progress_callback,
-                    percent,
-                    (
-                        f'Patch inference: '
-                        f'{processed_patches}/{total_patches} patches '
-                        f'| batch {batch_idx}/{total_batches} '
-                        f'| ETA {_format_eta(eta)}'
-                    ),
-                )
-
-                _check_cancelled(cancel_callback)
             if save_intermediate:
                 patch_tag = f'z{z0:04d}_y{y0:04d}_x{x0:04d}'
 
@@ -396,9 +287,7 @@ def infer_volume(
                     patch_instance_map.astype(np.uint16),
                 )
 
-    print('\n[Step 5] "Post-processing and save results..."')
-    _emit_status(progress_callback, 'Post-processing segmentation result...')
-    _check_cancelled(cancel_callback)
+    print(f'\n[Step 5] "Post-processing and save results..."')
     infer_time_sec = time.time() - t_infer_start
     log_info['inference_time_sec'] = infer_time_sec
 
@@ -434,18 +323,18 @@ def infer_volume(
     z_raw, y_raw, x_raw = raw_volume.shape
     pre_post_instance = pre_post_instance_padded[:z_raw, :y_raw, :x_raw]
     pre_post_confidence = pre_post_confidence_padded[:z_raw, :y_raw, :x_raw]
-
-    save_volume(
-        output_dir
-        / f'{Path(image_path).stem}_instance_map_before_postprocess.tif',
-        pre_post_instance.astype(np.uint32),
-    )
-    save_volume(
-        output_dir
-        / f'{Path(image_path).stem}_confidence_map_before_postprocess.tif',
-        pre_post_confidence.astype(np.float32),
-    )
-
+    if save_intermediate:
+        save_volume(
+            output_dir
+            / f'{Path(image_path).stem}_instance_map_before_postprocess.tif',
+            pre_post_instance.astype(np.uint32),
+        )
+        save_volume(
+            output_dir
+            / f'{Path(image_path).stem}_confidence_map_before_postprocess.tif',
+            pre_post_confidence.astype(np.float32),
+        )
+    finalize_global_bridge_resolution(global_instance_map, uf_tracker)
     instance_map_padded, confidence_map_padded = filter_instances_by_size(
         instance_map=instance_map_padded,
         confidence_map=confidence_map_padded,
@@ -1022,151 +911,76 @@ def patch_postprocess_argmax(
     }
 
 
-def stitch_patch_instance_results_v4_fixed(
-    global_instance_map,
-    confidence_sum,
-    confidence_count,
-    patch_instance_map,
-    patch_confidence,
-    z0,
-    y0,
-    x0,
-    next_instance_id,
-    max_coords,
-    patch_size=(32, 256, 256),
-    stride=(16, 224, 224),
-    face_iom_thresh=0.2,
-):
-    dz, dy, dx = patch_size
-    sz, sy, sx = stride
-    mz, my, mx = (dz - sz) // 2, (dy - sy) // 2, (dx - sx) // 2
+class UnionFind:
+    def __init__(self):
+        self.parent: Dict[int, int] = {}
 
-    max_z, max_y, max_x = max_coords
+    def find(self, i: int) -> int:
+        if i not in self.parent:
+            self.parent[i] = i
+            return i
+        path = []
+        while self.parent[i] != i:
+            path.append(i)
+            i = self.parent[i]
+        for node in path:
+            self.parent[node] = i
+        return i
 
-    limit_z, limit_y, limit_x = global_instance_map.shape
-
-    # --- Step 1: dynamic core boundary ---
-    z_start = 0 if z0 == 0 else mz
-    z_end = dz if z0 == max_z else mz + sz
-
-    y_start = 0 if y0 == 0 else my
-    y_end = dy if y0 == max_y else my + sy
-
-    x_start = 0 if x0 == 0 else mx
-    x_end = dx if x0 == max_x else mx + sx
-
-    core_instance = patch_instance_map[
-        z_start:z_end, y_start:y_end, x_start:x_end
-    ]
-
-    gz0, gy0, gx0 = z0 + z_start, y0 + y_start, x0 + x_start
-    gz1, gy1, gx1 = z0 + z_end, y0 + y_end, x0 + x_end
-
-    #  --- Step 2: face matching ---
-    b_local, b_global = [], []
-    if gz0 > 0:
-        b_local.append(core_instance[0, :, :].flatten())
-        b_global.append(
-            global_instance_map[gz0 - 1, gy0:gy1, gx0:gx1].flatten()
-        )
-    if gy0 > 0:
-        b_local.append(core_instance[:, 0, :].flatten())
-        b_global.append(
-            global_instance_map[gz0:gz1, gy0 - 1, gx0:gx1].flatten()
-        )
-    if gx0 > 0:
-        b_local.append(core_instance[:, :, 0].flatten())
-        b_global.append(
-            global_instance_map[gz0:gz1, gy0:gy1, gx0 - 1].flatten()
-        )
-
-    b_local_arr = np.concatenate(b_local) if b_local else np.array([])
-    b_global_arr = np.concatenate(b_global) if b_global else np.array([])
-
-    global_area_dict = {}
-    if b_global_arr.size > 0:
-        g_ids, g_counts = np.unique(b_global_arr, return_counts=True)
-        global_area_dict = dict(zip(g_ids, g_counts))
-
-    # --- Step 3: id remap on local ids that appear in core ---
-    local_ids_in_core = np.unique(core_instance)
-    local_ids_in_core = local_ids_in_core[local_ids_in_core > 0]
-    id_remap = {}
-
-    for lid in local_ids_in_core:
-        matched_gid = None
-        if b_local_arr.size > 0:
-            mask_l = b_local_arr == lid
-            area_l = mask_l.sum()
-            if area_l > 0:
-                overlapping_gids, counts = np.unique(
-                    b_global_arr[mask_l], return_counts=True
-                )
-                best_gid, best_iom = None, 0
-                for gid, inter in zip(overlapping_gids, counts):
-                    if gid == 0:
-                        continue
-                    area_g = global_area_dict.get(gid, 0)
-                    iom = inter / min(area_l, area_g)
-                    if iom > best_iom:
-                        best_iom, best_gid = iom, gid
-                if best_iom >= face_iom_thresh:
-                    matched_gid = best_gid
-
-        if matched_gid is not None:
-            id_remap[lid] = matched_gid
-        else:
-            id_remap[lid] = next_instance_id
-            next_instance_id += 1
-
-    # --- Step 4: fast rendering write-back with LUT ---
-    if len(id_remap) > 0:
-        max_lid = int(patch_instance_map.max())
-        lut = np.zeros(max_lid + 1, dtype=np.uint32)
-        for lid, gid in id_remap.items():
-            lut[lid] = gid
-
-        remapped_patch = lut[patch_instance_map]
-
-        gz1_full = min(z0 + dz, limit_z)
-        gy1_full = min(y0 + dy, limit_y)
-        gx1_full = min(x0 + dx, limit_x)
-
-        lz1, ly1, lx1 = gz1_full - z0, gy1_full - y0, gx1_full - x0
-
-        remapped_crop = remapped_patch[:lz1, :ly1, :lx1]
-        conf_crop = patch_confidence[:lz1, :ly1, :lx1]
-
-        valid_mask = remapped_crop > 0
-        if valid_mask.any():
-            global_instance_map[z0:gz1_full, y0:gy1_full, x0:gx1_full][
-                valid_mask
-            ] = remapped_crop[valid_mask]
-            confidence_sum[z0:gz1_full, y0:gy1_full, x0:gx1_full][
-                valid_mask
-            ] += conf_crop[valid_mask]
-            confidence_count[z0:gz1_full, y0:gy1_full, x0:gx1_full][
-                valid_mask
-            ] += 1
-
-    return next_instance_id
+    def union(self, i: int, j: int):
+        root_i = self.find(i)
+        root_j = self.find(j)
+        if root_i != root_j:
+            self.parent[root_i] = root_j
 
 
-def stitch_patch_instance_results_v4(
-    global_instance_map,
-    confidence_sum,
-    confidence_count,
-    patch_instance_map,
-    patch_confidence,
-    z0,
-    y0,
-    x0,
-    next_instance_id,
-    max_coords,
-    patch_size=(32, 256, 256),
-    stride=(16, 224, 224),
-    face_iom_thresh=0.2,
-):
+def stitch_patch_instance_results_v8(
+    global_instance_map: np.ndarray,
+    confidence_sum: np.ndarray,
+    confidence_count: np.ndarray,
+    patch_instance_map: np.ndarray,
+    patch_confidence: np.ndarray,
+    z0: int,
+    y0: int,
+    x0: int,
+    next_instance_id: int,
+    max_coords: Tuple[int, int, int],
+    patch_size: Tuple[int, int, int] = (32, 256, 256),
+    stride: Tuple[int, int, int] = (16, 224, 224),
+    face_iom_thresh: float = 0.6,
+    uf_tracker=None,
+) -> int:
+    # Copy to avoid modifying the input patch array in-place
+    patch_instance_map = patch_instance_map.copy()
+
+    # =========================================================================
+    # 1. [Multi-connected Component Splitting] Method A - Strict Logic Unchanged
+    # =========================================================================
+    max_lid = int(patch_instance_map.max())
+    if max_lid > 0:
+        instance_slices = find_objects(patch_instance_map, max_lid)
+        current_max_local_id = max_lid
+
+        for lid_minus_1, sub_slice in enumerate(instance_slices):
+            if sub_slice is None:
+                continue
+
+            lid = lid_minus_1 + 1
+            sub_map = patch_instance_map[sub_slice]
+            mask = sub_map == lid
+
+            # Use C++ level optimized 3D labeling stream
+            labeled_mask, num_features = sk_label(mask, return_num=True)
+
+            if num_features > 1:
+                for feat_id in range(2, num_features + 1):
+                    current_max_local_id += 1
+                    sub_map[labeled_mask == feat_id] = current_max_local_id
+
+    # Update the maximum local ID after splitting
+    max_local_id = int(patch_instance_map.max())
+    # =========================================================================
+
     dz, dy, dx = patch_size
     sz, sy, sx = stride
     mz, my, mx = (dz - sz) // 2, (dy - sy) // 2, (dx - sx) // 2
@@ -1174,24 +988,30 @@ def stitch_patch_instance_results_v4(
     max_z, max_y, max_x = max_coords
     limit_z, limit_y, limit_x = global_instance_map.shape
 
-    # --- Step 1: dynamic core boundary ---
     z_start = 0 if z0 == 0 else mz
     z_end = dz if z0 == max_z else mz + sz
-
     y_start = 0 if y0 == 0 else my
     y_end = dy if y0 == max_y else my + sy
-
     x_start = 0 if x0 == 0 else mx
     x_end = dx if x0 == max_x else mx + sx
 
     core_instance = patch_instance_map[
         z_start:z_end, y_start:y_end, x_start:x_end
     ]
-
     gz0, gy0, gx0 = z0 + z_start, y0 + y_start, x0 + x_start
     gz1, gy1, gx1 = z0 + z_end, y0 + y_end, x0 + x_end
 
-    # --- Step 2: face matching ---
+    # =========================================================================
+    # 2. [Core Region ID Extraction] Use np.bincount (O(N)) instead of np.unique (O(N log N))
+    # =========================================================================
+    core_counts_all = np.bincount(core_instance.ravel())
+    if core_counts_all.size > 1:
+        core_ids = np.nonzero(core_counts_all)[0]
+        core_ids = core_ids[core_ids > 0]  # Exclude background 0
+        local_ids_in_core = core_ids[core_counts_all[core_ids] >= 64]
+    else:
+        local_ids_in_core = np.array([], dtype=np.int32)
+
     b_local, b_global = [], []
     if gz0 > 0:
         b_local.append(core_instance[0, :, :].reshape(-1))
@@ -1220,55 +1040,83 @@ def stitch_patch_instance_results_v4(
         else np.array([], dtype=global_instance_map.dtype)
     )
 
-    global_area_dict = {}
-    if b_global_arr.size > 0:
-        g_ids, g_counts = np.unique(b_global_arr, return_counts=True)
-        global_area_dict = dict(zip(g_ids.tolist(), g_counts.tolist()))
+    # =========================================================================
+    # 3. [Boundary Intersection Optimization] Compute all overlaps via Sparse Matrix
+    # =========================================================================
+    b_local_counts = (
+        np.bincount(b_local_arr) if b_local_arr.size > 0 else np.array([])
+    )
+    g_counts_all = (
+        np.bincount(b_global_arr) if b_global_arr.size > 0 else np.array([])
+    )
 
-    # --- Step 3: id remap on local ids that appear in core ---
-    local_ids_in_core = np.unique(core_instance)
-    local_ids_in_core = local_ids_in_core[local_ids_in_core > 0]
+    overlap_matrix = None
+    if b_local_arr.size > 0 and b_global_arr.size > 0:
+        valid_b = (b_local_arr > 0) & (b_global_arr > 0)
+        if valid_b.any():
+            bl_valid = b_local_arr[valid_b]
+            bg_valid = b_global_arr[valid_b]
+            max_l = int(bl_valid.max())
+            max_g = int(bg_valid.max())
+
+            # Construct a sparse co-occurrence matrix:
+            # rows = local_id, cols = global_id, values = intersection area
+            ones = np.ones_like(bl_valid, dtype=np.int32)
+            overlap_matrix = coo_matrix(
+                (ones, (bl_valid, bg_valid)),
+                shape=(max(max_l, max_local_id) + 1, max_g + 1),
+            ).tocsr()
+
     id_remap = {}
-
     for lid in local_ids_in_core:
-        matched_gid = None
-        if b_local_arr.size > 0:
-            mask_l = b_local_arr == lid
-            area_l = int(mask_l.sum())
-            if area_l > 0:
-                overlapping_gids, counts = np.unique(
-                    b_global_arr[mask_l], return_counts=True
-                )
-                best_gid, best_iom = None, 0.0
-                for gid, inter in zip(overlapping_gids, counts):
-                    if gid == 0:
-                        continue
-                    area_g = global_area_dict.get(int(gid), 0)
-                    if area_g <= 0:
-                        continue
-                    iom = float(inter) / float(min(area_l, area_g))
-                    if iom > best_iom:
-                        best_iom = iom
-                        best_gid = int(gid)
-                if best_iom >= face_iom_thresh:
-                    matched_gid = best_gid
+        matched_gids = []
+        area_l = int(b_local_counts[lid]) if lid < b_local_counts.size else 0
 
-        if matched_gid is not None:
-            id_remap[int(lid)] = int(matched_gid)
+        # O(1) slice via CSR row pointer to fetch all intersecting global_ids and voxel counts
+        if (
+            area_l > 0
+            and overlap_matrix is not None
+            and lid < overlap_matrix.shape[0]
+        ):
+            row = overlap_matrix[lid]
+            for gid, inter in zip(row.indices, row.data):
+                if gid == 0:
+                    continue
+                area_g = (
+                    int(g_counts_all[gid]) if gid < g_counts_all.size else 0
+                )
+                if area_g <= 0:
+                    continue
+
+                iom = float(inter) / float(min(area_l, area_g))
+                if iom >= face_iom_thresh:
+                    matched_gids.append(int(gid))
+
+        if len(matched_gids) > 0:
+            base_gid = matched_gids[0]
+            id_remap[int(lid)] = base_gid
+            if len(matched_gids) > 1 and uf_tracker is not None:
+                for other_gid in matched_gids[1:]:
+                    uf_tracker.union(base_gid, other_gid)
         else:
             id_remap[int(lid)] = int(next_instance_id)
             next_instance_id += 1
+    # =========================================================================
 
-    if len(id_remap) == 0:
+    num_small = (
+        np.sum((core_ids > 0) & (core_counts_all[core_ids] < 64))
+        if core_counts_all.size > 1
+        else 0
+    )
+    if len(id_remap) == 0 and num_small > 0:
+        remapped_patch = np.zeros_like(patch_instance_map)
+    elif len(id_remap) == 0:
         return next_instance_id
-
-    # --- Step 4: fast rendering write-back with LUT ---
-    max_local_id = int(patch_instance_map.max())
-    lut = np.zeros(max_local_id + 1, dtype=np.uint32)
-    for lid, gid in id_remap.items():
-        lut[lid] = gid
-
-    remapped_patch = lut[patch_instance_map]
+    else:
+        lut = np.zeros(max_local_id + 1, dtype=np.uint32)
+        for lid, gid in id_remap.items():
+            lut[lid] = gid
+        remapped_patch = lut[patch_instance_map]
 
     gz1_full = min(z0 + patch_instance_map.shape[0], limit_z)
     gy1_full = min(y0 + patch_instance_map.shape[1], limit_y)
@@ -1296,14 +1144,33 @@ def stitch_patch_instance_results_v4(
     return next_instance_id
 
 
+def finalize_global_bridge_resolution(
+    global_instance_map: np.ndarray, uf_tracker: UnionFind
+):
+    if not uf_tracker.parent:
+        return
+
+    max_global_id = int(global_instance_map.max())
+    if max_global_id == 0:
+        return
+
+    global_lut = np.arange(max_global_id + 1, dtype=np.uint32)
+
+    for gid in list(uf_tracker.parent.keys()):
+        if gid <= max_global_id:
+            global_lut[gid] = uf_tracker.find(gid)
+
+    global_instance_map[:] = global_lut[global_instance_map]
+
+
 def filter_instances_by_size(
     instance_map: np.ndarray,
     confidence_map: np.ndarray,
     min_area: int,
-    intensity_volume: np.ndarray | None = None,
+    intensity_volume: Optional[np.ndarray] = None,
     min_size: int = 0,
-    max_size: int | None = None,
-    background_threshold: float | None = None,
+    max_size: Optional[int] = None,
+    background_threshold: Optional[float] = None,
     verbose: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -1396,10 +1263,7 @@ def filter_instances_by_size(
                 conf_sl[remove_mask] = 0.0
 
     if verbose:
-        print(
-            f'[2D same-ID CC filtering] Removed {removed_2d_cc} small CCs, '
-            f'{removed_2d_voxels} pixels/voxels in total.'
-        )
+        print(f'[2D filtering] Removed {removed_2d_cc} small components, ')
 
     # ============================================================
     # Step 2: vectorized ID-wise 3D size / intensity filtering
@@ -1484,7 +1348,6 @@ def filter_instances_by_size(
             f'[ID filtering] Kept {valid_ids.size} instances. '
             f'Removed by size: {removed_by_size}. '
             f'Removed by intensity: {removed_by_intensity}. '
-            f'Final IDs: 1 ~ {valid_ids.size}'
         )
 
     return new_instance.astype(np.uint32), new_confidence.astype(np.float32)
