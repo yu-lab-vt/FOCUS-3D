@@ -14,10 +14,10 @@ MODEL:
     NORM_PIX_LOSS: False
     PRETRAINED: "./MAE_checkpoint_0510/checkpoint-399.pth"
     VIT_ADAPTER:
-      PRETRAIN_SIZE: [32,96,96]          # 预训练图像尺寸
-      NUM_HEADS: 16               # 交互层的头数
-      ITERATIONS: 4               # 交互层迭代次数（实际上由 interaction_indexes 决定）
-      INTERACTION_INDEXES: [[0, 5], [6, 11], [12, 17], [18, 23]]   # 可选，指定 MAE 哪些层参与交互
+      PRETRAIN_SIZE: [32,96,96]         
+      NUM_HEADS: 16             
+      ITERATIONS: 4             
+      INTERACTION_INDEXES: [[0, 5], [6, 11], [12, 17], [18, 23]]  
       ADD_VIT_FEATURE: True
       EMBEDED_DIM : 1008
   SEM_SEG_HEAD:
