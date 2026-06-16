@@ -188,31 +188,120 @@ The `Segmentation` menu provides automatic 3D segmentation with **FOCUS-3D**, on
 
 ## Analysis Menu
 
-The `Analysis` menu provides tools for 3D structure reconstruction, full-volume 3D visualization, and quantitative statistics.
+The `Analysis` menu provides tools for selected-label 3D reconstruction, full-volume 3D visualization, and task-based morphometry analysis.
 
-<img width="3839" height="2087" alt="image" src="https://github.com/user-attachments/assets/7d499c7c-952c-4ad0-a2a4-5f1b9896d0f3" />
+![Uploading image.png…]()
 
 ### 3D Label Reconstruction
 
-| Operation | Description |
-|---|---|
-| Z Ratio | Set the physical Z-to-XY ratio for 3D reconstruction. This is important for anisotropic microscopy volumes. |
-| Reconstruct Selected Label | Reconstruct the selected label as a 3D mesh for visualization and downstream analysis. |
-| Load Mesh | Load a previously saved 3D mesh file. |
-| Save Mesh | Save the reconstructed 3D mesh. |
+This module reconstructs one selected non-background label into a 3D surface mesh. The mesh is generated from the selected label mask and displayed in a separate napari 3D viewer as a `Surface` layer. The Z scaling factor is applied during mesh generation, which is important for anisotropic microscopy volumes.
+
+| Operation                  | Description                                                                                                                                                  |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Z Ratio                    | Set the physical Z-to-XY scaling ratio used during mesh reconstruction. A larger value stretches the reconstructed mesh along the Z axis.                    |
+| Reconstruct Selected Label | Reconstruct the currently selected non-background label into a 3D surface mesh. The selected label is cropped before mesh extraction to reduce memory usage. |
+| Load Mesh                  | Load a previously saved `.npz` mesh file and display it in a separate 3D napari viewer.                                                                      |
+| Save Mesh                  | Save the latest reconstructed mesh as a compressed `.npz` file, including vertices, faces, voxel count, Z ratio, and label ID.                               |
 
 ### Full 3D View
 
-| Operation | Description |
-|---|---|
-| Z Ratio | Set the Z-axis scaling factor for full-volume 3D visualization. |
-| Switch to 3D View | Switch the current napari viewer between 2D slice view and 3D visualization mode. |
+This module switches the main napari viewer between 2D slice mode and full-volume 3D visualization mode. It applies anisotropic Z scaling to spatial layers before entering 3D view.
 
-### Quantitative Statistics
+| Operation                             | Description                                                                                                                                                           |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Z Ratio                               | Set the Z-axis scaling factor for full-volume 3D visualization. For 3D data ordered as `(Z, Y, X)`, the layer scale is set to `(Z Ratio, 1.0, 1.0)`.                  |
+| Switch to 3D View / Switch to 2D View | Toggle the main viewer between 2D slice view and 3D visualization. When entering 3D mode, the plugin also switches layers to pan/zoom mode to enable camera rotation. |
 
-| Operation | Description |
-|---|---|
-| Calculate Size Distribution | Calculate cell count and cell size distribution from the current label layer. This can be used for basic quantitative analysis of segmentation results. |
+### Quick Quantitative Statistics
+
+This module provides a lightweight size-distribution summary from the current label layer. It is intended for a quick overview of segmentation results.
+
+| Operation                   | Description                                                                                                                                                                          |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Calculate Size Distribution | Count all non-background labels and compute their voxel sizes. The result dialog reports the number of cells, minimum size, maximum size, and a histogram of cell size distribution. |
+
+### Morphometry Analysis
+
+The `Morphometry Analysis` panel provides task-based quantitative analysis for 3D label layers. Each task runs independently in the background and saves its results to a task-specific output folder.
+
+> Morphometry analysis currently supports 3D label layers. Raw image layers are only required when intensity-based features are selected.
+
+#### Common Settings
+
+| Operation              | Description                                                                                                                                              |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Voxel size (Z / Y / X) | Set the physical voxel size used for volume, surface area, centroid, distance, and shape measurements.                                                   |
+| Output folder          | Set the root folder for morphometry outputs. Each task writes results into a subfolder such as `basic_info`, `neighborhood`, `contact`, or `clustering`. |
+| Browse                 | Select an output folder from the file system.                                                                                                            |
+| Open Output Folder     | Open the current morphometry output folder.                                                                                                              |
+
+#### 1. Basic Information
+
+Compute selected per-cell measurements and save them into one CSV table.
+
+| Operation             | Description                                                                                                                                                                                         |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Raw layer             | Select the raw image layer used for intensity measurements. This is required only when intensity features are selected.                                                                             |
+| Refresh Raw Layers    | Refresh the raw-layer dropdown from the current napari viewer.                                                                                                                                      |
+| Features to compute   | Select cell-level features to calculate, including volume, equivalent diameter, surface area, centroid, sphericity, compactness, major axis length, elongation, flatness, and intensity statistics. |
+| Run Basic Information | Compute the selected features and save `basic_info_cell_features.csv` and `basic_info_summary.csv`.                                                                                                 |
+| Show feature          | Display a selected computed feature as a mapped 3D image layer in napari. Non-map features such as centroid and some scalar-only fields are saved in CSV but are not shown as feature maps.         |
+
+Supported basic features include:
+
+| Feature                          | Description                                                                         |
+| -------------------------------- | ----------------------------------------------------------------------------------- |
+| Volume                           | Physical cell volume computed from voxel count and voxel size.                      |
+| Equivalent diameter              | Diameter of a sphere with the same volume.                                          |
+| Surface area                     | Surface area estimated from exposed voxel faces.                                    |
+| Centroid                         | Cell centroid in physical coordinates.                                              |
+| Sphericity                       | Shape compactness relative to a sphere.                                             |
+| Compactness                      | Surface-area-to-volume based compactness measurement.                               |
+| Axis major                       | Major axis length estimated from PCA on physical voxel coordinates.                 |
+| Elongation                       | Ratio describing long-axis elongation.                                              |
+| Flatness                         | Ratio describing flattening along the minor axis.                                   |
+| Min / Max / Mean / Std intensity | Intensity statistics computed inside each labeled cell. Requires a raw image layer. |
+
+#### 2. Neighborhood Analysis
+
+Compute centroid-based neighborhood features using either k-nearest neighbors or a radius-based neighborhood.
+
+| Operation            | Description                                                                                                                          |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Mode                 | Choose between `kNN distance` and `Radius count / density`.                                                                          |
+| k                    | Number of neighbors used in kNN mode.                                                                                                |
+| Radius pixels        | Radius used in radius mode, measured in voxel/pixel coordinates.                                                                     |
+| Run Neighborhood     | Compute neighborhood features and save `neighborhood_cell_features.csv` and `neighborhood_summary.csv`.                              |
+| Show feature         | Display a selected neighborhood feature as a mapped 3D image layer.                                                                  |
+| Run Local Comparison | After neighborhood analysis is finished, compute a local z-score for one selected feature by comparing each cell with its neighbors. |
+
+In `kNN distance` mode, the plugin computes nearest-neighbor distance, mean/median kNN distance, and local density. In `Radius count / density` mode, it computes the number of neighboring cells within the selected radius and the corresponding local density.
+
+Local comparison supports features such as mean intensity, sphericity, volume, surface area, compactness, elongation, and flatness. The output includes the original feature value, local neighbor mean, local neighbor standard deviation, and local z-score.
+
+#### 3. Contact Graph Analysis
+
+Compute face-touching contact relationships between neighboring labeled cells.
+
+| Operation           | Description                                                                                                                                        |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Features to compute | Select contact features to calculate, including neighbor count, total contact area, mean contact area, maximum contact area, and contact fraction. |
+| Run Contact Graph   | Compute the contact graph and save `contact_cell_features.csv`, `contact_edges.csv`, and `contact_summary.csv`.                                    |
+| Show feature        | Display a selected contact feature as a mapped 3D image layer.                                                                                     |
+
+Contact area is estimated from shared voxel faces using the physical voxel size. `contact_edges.csv` stores pairwise cell-cell contact edges, while `contact_cell_features.csv` stores per-cell contact summaries.
+
+#### 4. Clustering
+
+Cluster cells using one selected feature.
+
+| Operation      | Description                                                                                                                                                                     |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Feature        | Select the feature used for clustering. Available features include morphology, intensity, and contact-related measurements.                                                     |
+| Clusters       | Set the number of clusters for K-means clustering.                                                                                                                              |
+| Run Clustering | Cluster cells based on the selected feature and save `clustering_cell_features.csv` and `clustering_summary.csv`. The `cluster_id` result is displayed automatically in napari. |
+
+If an intensity feature is selected for clustering, a raw image layer is required. Clustering uses the selected feature values and assigns each valid cell a `cluster_id`.
 
 ## Recommended Workflow
 
