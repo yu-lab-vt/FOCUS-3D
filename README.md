@@ -190,7 +190,8 @@ The `Segmentation` menu provides automatic 3D segmentation with **FOCUS-3D**, on
 
 The `Analysis` menu provides tools for selected-label 3D reconstruction, full-volume 3D visualization, and task-based morphometry analysis.
 
-![Uploading image.png…]()
+<img width="3830" height="2072" alt="image" src="https://github.com/user-attachments/assets/bee8aa3e-7f57-439d-93bc-cf28ebbb0f9c" />
+
 
 ### 3D Label Reconstruction
 
