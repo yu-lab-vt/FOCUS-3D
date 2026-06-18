@@ -2684,9 +2684,38 @@ def _apply_new_label(self):
         return
 
     data = labels_layer.data
-    z_max = data.shape[0] - 1
-    slice_shape = data.shape[1:3]
-    current_z = int(self.viewer.dims.current_step[0])
+    data_shape = tuple(int(v) for v in data.shape)
+
+    # ------------------------------------------------------------
+    # Labels layer must be 3D for multi-slice new-label drawing.
+    # Expected order: Z, Y, X
+    # ------------------------------------------------------------
+    if len(data_shape) == 3:
+        z_size, y_size, x_size = data_shape
+        z_max = z_size - 1
+        slice_shape = (y_size, x_size)
+
+        current_z = int(round(self.viewer.dims.current_step[0]))
+        current_z = int(np.clip(current_z, 0, z_max))
+
+    elif len(data_shape) == 2:
+        # Do not continue silently here.
+        # Your traceback is exactly this case: data.shape == (2046, 2046).
+        notifications.show_error(
+            'Current labels layer is 2D, but Add New Label polygon mode is drawing 3D shapes. '
+            f'labels_layer.data.shape = {data_shape}. '
+            'Please load/create the label layer as a 3D Z/Y/X volume before adding a new 3D label.'
+        )
+        self._cancel_roi(labels_layer_to_activate=labels_layer)
+        return
+
+    else:
+        notifications.show_error(
+            f'Unsupported labels layer shape: {data_shape}. '
+            'Expected 3D labels in Z/Y/X order.'
+        )
+        self._cancel_roi(labels_layer_to_activate=labels_layer)
+        return
 
     modified_slices = set()
 
@@ -3165,6 +3194,16 @@ def _add_new_label(self):
     if labels_layer is None:
         return
 
+    data_shape = tuple(int(v) for v in labels_layer.data.shape)
+
+    if len(data_shape) != 3:
+        notifications.show_error(
+            f'Add New Label expects a 3D labels layer in Z/Y/X order, '
+            f'but got labels_layer.data.shape = {data_shape}. '
+            'Please load/create a 3D label volume before adding a new label.'
+        )
+        return
+
     try:
         new_label = self._consume_next_label_id(labels_layer)
     except Exception as e:
@@ -3315,34 +3354,102 @@ def _rasterize_shapes_to_slice_masks(
     default_z=None,
     z_max=None,
 ):
-    """Convert napari polygon shapes into {z: mask2d}."""
+    """
+    Convert napari polygon/path shapes into {z: mask2d}.
+
+    Expected coordinates:
+        3D shapes: (z, y, x)
+        2D shapes: (y, x)
+
+    Output:
+        dict[int, np.ndarray], where each mask has shape (Y, X).
+    """
+
+    # ------------------------------------------------------------
+    # 1. Validate slice_shape.
+    #    It must be exactly (Y, X).
+    # ------------------------------------------------------------
+    slice_shape = tuple(int(v) for v in slice_shape)
+
+    if len(slice_shape) > 2:
+        # If someone accidentally passes (Z, Y, X), recover by using (Y, X).
+        slice_shape = slice_shape[-2:]
+
+    if len(slice_shape) != 2:
+        raise ValueError(
+            f'slice_shape must be 2D as (Y, X), got {slice_shape}. '
+            'This means the labels layer is probably 2D or the Z/Y/X axes were mixed.'
+        )
+
+    y_size, x_size = slice_shape
 
     if z_max is None:
         z_max = 0
+    z_max = int(z_max)
+
+    if default_z is not None:
+        default_z = int(np.clip(int(round(default_z)), 0, z_max))
 
     slice_masks = {}
 
+    # ------------------------------------------------------------
+    # 2. Rasterize each shape.
+    # ------------------------------------------------------------
     for shape in shapes_data:
-        shape = np.asarray(shape)
-        if shape.ndim != 2 or shape.shape[0] < 3:
+        shape = np.asarray(shape, dtype=np.float64)
+
+        if shape.ndim != 2:
+            continue
+
+        # Need at least 3 vertices for polygon.
+        # Your traceback里最后一个 shape 只有 2 个点，这种必须跳过。
+        if shape.shape[0] < 3:
+            continue
+
+        # Remove invalid points.
+        shape = shape[np.isfinite(shape).all(axis=1)]
+        if shape.shape[0] < 3:
             continue
 
         if shape.shape[1] >= 3:
-            # napari 3D shapes: assume (z, y, x)
-            z = int(np.clip(np.round(np.median(shape[:, 0])), 0, z_max))
-            poly = shape[:, 1:3]
-        else:
+            # napari 3D shape: z, y, x
+            z_values = shape[:, 0]
+            z = int(np.clip(np.round(np.median(z_values)), 0, z_max))
+            poly_yx = shape[:, 1:3]
+
+        elif shape.shape[1] == 2:
+            # 2D shape: y, x
             if default_z is None:
                 continue
-            z = int(np.clip(default_z, 0, z_max))
-            poly = shape[:, :2]
 
-        poly = _smooth_closed_polygon_yx(
-            poly,
+            z = default_z
+            poly_yx = shape[:, :2]
+
+        else:
+            continue
+
+        # Smooth polygon/path into dense closed curve.
+        poly_yx = _smooth_closed_polygon_yx(
+            poly_yx,
             samples_per_segment=16,
         )
 
-        rr, cc = draw_polygon(poly[:, 0], poly[:, 1], slice_shape)
+        if poly_yx.ndim != 2 or poly_yx.shape[0] < 3:
+            continue
+
+        # Clip coordinates softly to avoid invalid extreme values.
+        poly_yx[:, 0] = np.clip(poly_yx[:, 0], 0, y_size - 1)
+        poly_yx[:, 1] = np.clip(poly_yx[:, 1], 0, x_size - 1)
+
+        rr, cc = draw_polygon(
+            poly_yx[:, 0],
+            poly_yx[:, 1],
+            shape=slice_shape,
+        )
+
+        if rr.size == 0 or cc.size == 0:
+            continue
+
         mask = np.zeros(slice_shape, dtype=bool)
         mask[rr, cc] = True
 

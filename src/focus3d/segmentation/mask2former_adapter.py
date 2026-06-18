@@ -6,9 +6,9 @@ import os
 import platform
 import sys
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any, Dict, Union
+from typing import Any
 
 import numpy as np
 import tifffile
@@ -25,7 +25,7 @@ INFERENCE_PY_WINDOWS = MASK2FORMER_DIR / 'inference_win.py'
 _INFERENCE_MODULE_CACHE = {}
 
 
-def _resolve_relative_to_mask2former(path: Union[str, Path]) -> str:
+def _resolve_relative_to_mask2former(path: str | Path) -> str:
     """
     Resolve config / checkpoint path.
 
@@ -81,7 +81,7 @@ def _select_inference_file():
     return INFERENCE_PY_DETECTRON2, 'detectron2'
 
 
-def _resolve_output_dir(path: Union[str, Path]) -> str:
+def _resolve_output_dir(path: str | Path) -> str:
     """
     Resolve output dir before changing cwd.
     """
@@ -92,7 +92,7 @@ def _resolve_output_dir(path: Union[str, Path]) -> str:
     return str(p.resolve())
 
 
-def _resolve_image_path(path: Union[str, Path]) -> str | None:
+def _resolve_image_path(path: str | Path) -> str | None:
     if path is None:
         return None
 
@@ -181,7 +181,7 @@ def _temporarily_chdir(path: Path):
 
 def _image_data_to_temp_tif(
     image_data,
-    output_dir: Union[str, Path],
+    output_dir: str | Path,
     input_name: str = 'napari_layer',
 ) -> str:
     """
@@ -220,14 +220,14 @@ def _image_data_to_temp_tif(
 def run_mask2former_inference(
     *,
     image_data=None,
-    image_path: Union[str, Path] | None = None,
+    image_path: str | Path | None = None,
     input_name: str = 'napari_layer',
-    config_file: Union[str, Path],
-    weights_path: Union[str, Path],
-    output_dir: Union[str, Path],
+    config_file: str | Path,
+    weights_path: str | Path,
+    output_dir: str | Path,
     cuda_visible_devices: str | None = None,
     **kwargs: Any,
-) -> Dict:
+) -> dict:
     """
     Stable UI-side wrapper for Mask2Former infer_volume().
 
@@ -280,7 +280,5 @@ def run_mask2former_inference(
 
     finally:
         if tmp_image_path is not None:
-            try:
+            with suppress(Exception):
                 Path(tmp_image_path).unlink(missing_ok=True)
-            except Exception:
-                pass

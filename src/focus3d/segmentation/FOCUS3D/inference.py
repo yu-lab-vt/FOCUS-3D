@@ -4,7 +4,7 @@ import math
 import time
 import csv
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 from mask2former import add_maskformer2_config
 from detectron2.config import get_cfg
 from detectron2.modeling import build_model
@@ -15,16 +15,13 @@ import tifffile
 import zarr
 from scipy import ndimage as ndi
 from tqdm.auto import tqdm
-from scipy.ndimage import gaussian_filter
 from skimage.measure import label as sk_label
 from scipy.ndimage import find_objects
-from scipy.sparse import coo_matrix
-
 
 # ============================================================
 # Main inference function
 # ============================================================
-def setup_cfg(config_file, weights_path):
+def setup_cfg(config_file, weights_path, device: Optional[str] = None):
     cfg = get_cfg()
     add_maskformer2_config(cfg)
     cfg.set_new_allowed(True)
@@ -32,31 +29,29 @@ def setup_cfg(config_file, weights_path):
     cfg.merge_from_file(config_file)
 
     cfg.MODEL.WEIGHTS = weights_path
-    cfg.MODEL.DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    cfg.MODEL.DEVICE = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     cfg.freeze()
     return cfg
-
 
 def build_predictor(cfg):
     model = build_model(cfg)
     if model.sem_seg_postprocess_before_inference:
         model.sem_seg_postprocess_before_inference = False
-    print(f'Loading weights from: {cfg.MODEL.WEIGHTS}')
+    print(f"Loading weights from: {cfg.MODEL.WEIGHTS}")
     checkpointer = DetectionCheckpointer(model)
     checkpointer.load(cfg.MODEL.WEIGHTS)
     model.eval()
     model.to(cfg.MODEL.DEVICE)
     return model
 
-
 def infer_volume(
     image_path: Union[str, Path],
     config_file: Union[str, Path],
     weights_path: Union[str, Path],
     device: Optional[str] = None,
-    z_ratio: float = 1.0,
     output_dir: Union[str, Path] = None,
+    z_ratio: float = 1.0,
     lower_percentile: float = 1.0,
     upper_percentile: float = 99.0,
     background_threshold: float = 5.0,
@@ -72,10 +67,21 @@ def infer_volume(
     size_filter_min_size: int = 0,
     size_filter_max_size: Optional[int] = None,
     use_amp: bool = True,
-    amp_dtype: str = 'float16',
-    patch_size: Tuple[int, int, int] = (32, 96, 96),  # (Z, Y, X)
+    amp_dtype: str = "float16",
+    patch_size: Tuple[int, int, int] = (32, 96, 96),   # (Z, Y, X)
     stride: Optional[Tuple[int, int, int]] = None,
-) -> Dict:
+    # Inference-time downsampling
+    downsample_factor: Optional[Union[float, Tuple[float, float, float]]] = None,
+    restore_downsampled_mask: bool = True,
+    save_downsampled_image: bool = False,
+
+    # Stitch parameters
+    stitch_face_iom_thresh: float = 0.2,
+    stitch_min_core_voxels: int = 64,
+    stitch_min_contact_cc_pixels: int = 10,
+    stitch_min_contact_cc_ratio: float = 0.5,
+    stitch_contact_connectivity: int = 2,
+ ) -> Dict:
     """
     Inference on an arbitrarily-sized 3D volume:
         1) Read image
@@ -95,38 +101,37 @@ def infer_volume(
     # Build model
     # --------------------------------------------------------
     print(f'\n[Step 1] "Building config and loading model..."')
-    cfg = setup_cfg(config_file, weights_path)
+    cfg = setup_cfg(config_file, weights_path, device=device)
     model = build_predictor(cfg)
     device = cfg.MODEL.DEVICE if device is None else device
 
-    amp_enabled = bool(use_amp and str(device).startswith('cuda'))
-    if amp_dtype == 'bfloat16':
+    amp_enabled = bool(use_amp and str(device).startswith("cuda"))
+    if amp_dtype == "float16":
+        autocast_dtype = torch.float16
+    elif amp_dtype == "bfloat16":
         autocast_dtype = torch.bfloat16
     else:
-        autocast_dtype = torch.float16
+        raise ValueError("amp_dtype must be 'float16' or 'bfloat16'")
 
     if batch_size < 1:
-        raise ValueError('batch_size must be >= 1')
+        raise ValueError("batch_size must be >= 1")
 
     log_info = {
-        'image_path': str(image_path),
-        'z_ratio': float(z_ratio),
-        'lower_percentile': float(lower_percentile),
-        'upper_percentile': float(upper_percentile),
-        'background_threshold': float(background_threshold),
-        'batch_size': int(batch_size),
-        'save_intermediate': bool(save_intermediate),
-        'amp_enabled_from_cfg': bool(amp_enabled),
-        'patch_postprocess_params': {
-            'score_thresh': float(score_thresh),
-            'mask_thresh': float(mask_thresh),
-            'min_edge_area': int(min_edge_area),
+        "image_path": str(image_path),
+        "lower_percentile": float(lower_percentile),
+        "upper_percentile": float(upper_percentile),
+        "background_threshold": float(background_threshold),
+        "batch_size": int(batch_size),
+        "save_intermediate": bool(save_intermediate),
+        "amp_enabled_from_cfg": bool(amp_enabled),
+        "patch_postprocess_params": {
+            "score_thresh": float(score_thresh),
+            "mask_thresh": float(mask_thresh),
+            "min_edge_area": int(min_edge_area),
         },
-        'final_size_filter_params': {
-            'size_filter_min_size': int(size_filter_min_size),
-            'size_filter_max_size': None
-            if size_filter_max_size is None
-            else int(size_filter_max_size),
+        "final_size_filter_params": {
+            "size_filter_min_size": int(size_filter_min_size),
+            "size_filter_max_size": None if size_filter_max_size is None else int(size_filter_max_size),
         },
     }
 
@@ -135,22 +140,36 @@ def infer_volume(
     # --------------------------------------------------------
     print(f'\n[Step 2] "Reading image..."')
     raw_volume = read_volume(image_path)
-    norm_volume, norm_stats = normalize_img(
+    raw_shape_original = tuple(raw_volume.shape)
+
+    infer_raw_volume, downsample_info = downsample_volume_for_inference(
         raw_volume,
+        downsample_factor=downsample_factor,
+        order=1,
+    )
+    infer_shape = tuple(infer_raw_volume.shape)
+    log_info["downsample"] = downsample_info
+
+    if save_downsampled_image and downsample_info["enabled"]:
+        save_volume(
+            output_dir / f"{Path(image_path).stem}_downsampled_image.tif",
+            infer_raw_volume.astype(np.float32),
+        )
+
+    norm_volume, norm_stats = normalize_img(
+        infer_raw_volume,
         lower_percentile=lower_percentile,
         upper_percentile=upper_percentile,
     )
     bg_raw = float(background_threshold)
-    p_low = norm_stats['p_low']
-    p_high = norm_stats['p_high']
+    p_low = norm_stats["p_low"]
+    p_high = norm_stats["p_high"]
     if p_high <= p_low:
         background_threshold_norm = 0.0
     else:
         background_threshold_norm = (bg_raw - p_low) / (p_high - p_low)
-        background_threshold_norm = float(
-            np.clip(background_threshold_norm, 0.0, 1.0)
-        )
-    log_info['normalization'] = norm_stats
+        background_threshold_norm = float(np.clip(background_threshold_norm, 0.0, 1.0))
+    log_info["normalization"] = norm_stats
 
     # --------------------------------------------------------
     # Patch / stride planning and padding
@@ -160,15 +179,10 @@ def infer_volume(
         stride = tuple(s // 2 for s in patch_size)
     else:
         stride = tuple(stride)
-    padded_volume, pad_info = pad_volume_for_sliding_window(
-        norm_volume, patch_size, stride
-    )
+    padded_volume, pad_info = pad_volume_for_sliding_window(norm_volume, patch_size, stride)
 
     if save_intermediate:
-        save_volume(
-            output_dir / 'padded_normalized_image.tif',
-            padded_volume.astype(np.float32),
-        )
+        save_volume(output_dir / "padded_normalized_image.tif", padded_volume.astype(np.float32))
 
     all_coords = generate_patch_coords(padded_volume.shape, patch_size, stride)
     max_z = max(c[0] for c in all_coords)
@@ -180,21 +194,20 @@ def infer_volume(
     skipped_coords = []
 
     pz, py, px = patch_size
-    for z0, y0, x0 in all_coords:
-        patch = padded_volume[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px]
+    for (z0, y0, x0) in all_coords:
+        patch = padded_volume[z0:z0+pz, y0:y0+py, x0:x0+px]
         if np.percentile(patch, 99.9) < background_threshold_norm:
             skipped_coords.append((z0, y0, x0))
         else:
             infer_coords.append((z0, y0, x0))
 
-    log_info['num_infer_patches'] = int(len(infer_coords))
-    log_info['num_skipped_background_patches'] = int(len(skipped_coords))
+    log_info["num_infer_patches"] = int(len(infer_coords))
+    log_info["num_skipped_background_patches"] = int(len(skipped_coords))
 
     # --------------------------------------------------------
     # Batch inference
     # --------------------------------------------------------
     print(f'\n[Step 4] "Batch inference..."')
-    uf_tracker = UnionFind()
     patch_dataset = PatchDataset(
         padded_volume=padded_volume,
         infer_coords=infer_coords,
@@ -209,14 +222,14 @@ def infer_volume(
     next_instance_id = 1
 
     if save_intermediate:
-        patch_output_dir = output_dir / 'patch_outputs'
+        patch_output_dir = output_dir / "patch_outputs"
         patch_output_dir.mkdir(parents=True, exist_ok=True)
 
     t_stitch_start = time.time()
     if data_loader_num_workers < 0:
-        raise ValueError('data_loader_num_workers must be >= 0')
+        raise ValueError("data_loader_num_workers must be >= 0")
     if topk_postprocess < 1:
-        raise ValueError('topk_postprocess must be >= 1')
+        raise ValueError("topk_postprocess must be >= 1")
 
     patch_loader = torch.utils.data.DataLoader(
         patch_dataset,
@@ -232,24 +245,24 @@ def infer_volume(
     patch_pbar = tqdm(
         patch_loader,
         total=len(patch_loader),
-        desc='Inferencing patches',
-        unit='batch',
+        desc="Inferencing patches",
+        unit="batch",
     )
 
     for inputs in patch_pbar:
         for sample in inputs:
-            sample['image'] = sample['image'].to(device, non_blocking=True)
+            sample["image"] = sample["image"].to(device, non_blocking=True)
 
         with torch.inference_mode():
             with torch.autocast(
-                device_type='cuda',
+                device_type="cuda",
                 dtype=autocast_dtype,
                 enabled=amp_enabled,
             ):
                 batch_outputs = model(inputs)
 
         for sample, model_output in zip(inputs, batch_outputs):
-            z0, y0, x0 = sample['coord']
+            z0, y0, x0 = sample["coord"]
 
             post = patch_postprocess_argmax(
                 model_output=model_output,
@@ -260,10 +273,10 @@ def infer_volume(
                 topk_postprocess=topk_postprocess,
             )
 
-            patch_instance_map = post['patch_instance_map']
-            patch_confidence = post['patch_confidence']
+            patch_instance_map = post["patch_instance_map"]
+            patch_confidence = post["patch_confidence"]
 
-            next_instance_id = stitch_patch_instance_results_v8(
+            next_instance_id = stitch_patch_instance_results(
                 global_instance_map=global_instance_map,
                 confidence_sum=confidence_sum,
                 confidence_count=confidence_count,
@@ -276,65 +289,57 @@ def infer_volume(
                 max_coords=max_coords,
                 patch_size=patch_size,
                 stride=stride,
-                uf_tracker=uf_tracker,
+                face_iom_thresh=stitch_face_iom_thresh,
+                stitch_min_core_voxels=stitch_min_core_voxels,
+                min_contact_cc_pixels=stitch_min_contact_cc_pixels,
+                min_contact_cc_ratio=stitch_min_contact_cc_ratio,
+                contact_connectivity=stitch_contact_connectivity,
             )
 
             if save_intermediate:
-                patch_tag = f'z{z0:04d}_y{y0:04d}_x{x0:04d}'
+                patch_tag = f"z{z0:04d}_y{y0:04d}_x{x0:04d}"
 
                 save_volume(
-                    patch_output_dir / f'{patch_tag}_instance.tif',
-                    patch_instance_map.astype(np.uint16),
+                    patch_output_dir / f"{patch_tag}_patch_postprocess_instance.tif",
+                    patch_instance_map.astype(np.uint16)
                 )
 
+    # ========================================================
+    # Post-processing and saving (note: following code is outside the for loop)
+    # ========================================================
     print(f'\n[Step 5] "Post-processing and save results..."')
     infer_time_sec = time.time() - t_infer_start
-    log_info['inference_time_sec'] = infer_time_sec
+    log_info["inference_time_sec"] = infer_time_sec
 
     if save_intermediate:
-        save_volume(
-            output_dir / 'merged_instance_padded.tif',
-            global_instance_map.astype(np.uint32),
-        )
-        save_volume(
-            output_dir / 'confidence_sum_padded.tif',
-            confidence_sum.astype(np.float32),
-        )
-        save_volume(
-            output_dir / 'confidence_count_padded.tif',
-            confidence_count.astype(np.uint16),
-        )
-    log_info['online_postprocess_stitch_time_sec'] = (
-        time.time() - t_stitch_start
-    )
+        save_volume(output_dir / "merged_instance_padded.tif", global_instance_map.astype(np.uint32))
+        save_volume(output_dir / "confidence_sum_padded.tif", confidence_sum.astype(np.float32))
+        save_volume(output_dir / "confidence_count_padded.tif", confidence_count.astype(np.uint16))
 
-    instance_map_padded, confidence_map_padded = (
-        finalize_instance_and_confidence(
-            global_instance_map=global_instance_map,
-            confidence_sum=confidence_sum,
-            confidence_count=confidence_count,
-        )
+    log_info["online_postprocess_stitch_time_sec"] = time.time() - t_stitch_start
+
+    instance_map_padded, confidence_map_padded = finalize_instance_and_confidence(
+        global_instance_map=global_instance_map,
+        confidence_sum=confidence_sum,
+        confidence_count=confidence_count,
     )
 
     # Save result before final post-processing
     pre_post_instance_padded = instance_map_padded.copy()
     pre_post_confidence_padded = confidence_map_padded.copy()
 
-    z_raw, y_raw, x_raw = raw_volume.shape
-    pre_post_instance = pre_post_instance_padded[:z_raw, :y_raw, :x_raw]
-    pre_post_confidence = pre_post_confidence_padded[:z_raw, :y_raw, :x_raw]
+    z_inf, y_inf, x_inf = infer_shape
+    pre_post_instance = pre_post_instance_padded[:z_inf, :y_inf, :x_inf]
+    pre_post_confidence = pre_post_confidence_padded[:z_inf, :y_inf, :x_inf]
     if save_intermediate:
         save_volume(
-            output_dir
-            / f'{Path(image_path).stem}_instance_map_before_postprocess.tif',
+            output_dir / f"{Path(image_path).stem}_instance_map_before_postprocess.tif",
             pre_post_instance.astype(np.uint32),
         )
         save_volume(
-            output_dir
-            / f'{Path(image_path).stem}_confidence_map_before_postprocess.tif',
+            output_dir / f"{Path(image_path).stem}_confidence_map_before_postprocess.tif",
             pre_post_confidence.astype(np.float32),
         )
-    finalize_global_bridge_resolution(global_instance_map, uf_tracker)
     instance_map_padded, confidence_map_padded = filter_instances_by_size(
         instance_map=instance_map_padded,
         confidence_map=confidence_map_padded,
@@ -346,44 +351,57 @@ def infer_volume(
         verbose=True,
     )
 
-    # Crop back to original shape
-    z_raw, y_raw, x_raw = raw_volume.shape
-    instance_map = instance_map_padded[:z_raw, :y_raw, :x_raw]
-    confidence_map = confidence_map_padded[:z_raw, :y_raw, :x_raw]
+    # Crop back to inference image shape first.
+    z_inf, y_inf, x_inf = infer_shape
+    instance_map_infer = instance_map_padded[:z_inf, :y_inf, :x_inf]
+    confidence_map_infer = confidence_map_padded[:z_inf, :y_inf, :x_inf]
+
+    # Restore to original raw image shape if inference was done on a downsampled volume.
+    if downsample_info["enabled"] and restore_downsampled_mask:
+        instance_map = resize_volume_to_shape(
+            instance_map_infer.astype(np.uint32, copy=False),
+            target_shape=raw_shape_original,
+            order=0,   # nearest neighbor for labels
+        ).astype(np.uint32, copy=False)
+
+        confidence_map = resize_volume_to_shape(
+            confidence_map_infer.astype(np.float32, copy=False),
+            target_shape=raw_shape_original,
+            order=1,   # linear interpolation for confidence
+        ).astype(np.float32, copy=False)
+    else:
+        instance_map = instance_map_infer.astype(np.uint32, copy=False)
+        confidence_map = confidence_map_infer.astype(np.float32, copy=False)
 
     # --------------------------------------------------------
     # Save outputs
     # --------------------------------------------------------
     stem = Path(image_path).stem
 
-    instance_path = output_dir / f'{stem}_instance_map.tif'
-    confidence_path = output_dir / f'{stem}_confidence_map.tif'
-    log_path = output_dir / f'{stem}_log.json'
+    instance_path = output_dir / f"{stem}_instance_map.tif"
+    confidence_path = output_dir / f"{stem}_confidence_map.tif"
+    log_path = output_dir / f"{stem}_log.json"
 
     save_volume(instance_path, instance_map.astype(np.uint32))
     save_volume(confidence_path, confidence_map.astype(np.float32))
 
-    log_info['total_time_sec'] = time.time() - t_total_start
+    log_info["total_time_sec"] = time.time() - t_total_start
 
-    with open(log_path, 'w', encoding='utf-8') as f:
+    with open(log_path, "w", encoding="utf-8") as f:
         json.dump(log_info, f, indent=2)
 
     result = {
-        'instance_map_path': str(instance_path),
-        'confidence_map_path': str(confidence_path),
-        'log_json_path': str(log_path),
-        'num_infer_patches': len(infer_coords),
-        'num_skipped_background_patches': len(skipped_coords),
-        'instance_map': instance_map,
-        'confidence_map': confidence_map,
-        'log_info': log_info,
+        "instance_map_path": str(instance_path),
+        "confidence_map_path": str(confidence_path),
+        "log_json_path": str(log_path),
+        "num_infer_patches": len(infer_coords),
+        "num_skipped_background_patches": len(skipped_coords),
+        "instance_map": instance_map,
+        "confidence_map": confidence_map,
+        "log_info": log_info,
     }
     return result
 
-
-# ============================================================
-# Basic I/O
-# ============================================================
 class PatchDataset(torch.utils.data.Dataset):
     def __init__(self, padded_volume, infer_coords, patch_size):
         self.padded_volume = padded_volume
@@ -397,15 +415,12 @@ class PatchDataset(torch.utils.data.Dataset):
         z0, y0, x0 = self.infer_coords[idx]
         pz, py, px = self.patch_size
 
-        patch = self.padded_volume[
-            z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px
-        ].astype(np.float32, copy=False)
+        patch = self.padded_volume[z0:z0+pz, y0:y0+py, x0:x0+px].astype(np.float32, copy=False)
 
         return {
-            'image': torch.from_numpy(patch).unsqueeze(0),  # (1, Z, Y, X)
-            'coord': (z0, y0, x0),
+            "image": torch.from_numpy(patch).unsqueeze(0),   # (1, Z, Y, X)
+            "coord": (z0, y0, x0),
         }
-
 
 def read_volume(image_path: Union[str, Path]) -> np.ndarray:
     """
@@ -418,24 +433,21 @@ def read_volume(image_path: Union[str, Path]) -> np.ndarray:
     image_path = str(image_path)
     suffix = Path(image_path).suffix.lower()
 
-    if suffix in ['.tif', '.tiff']:
+    if suffix in [".tif", ".tiff"]:
         vol = tifffile.imread(image_path)
-    elif suffix == '.zarr':
-        z = zarr.open(image_path, mode='r')
+    elif suffix == ".zarr":
+        z = zarr.open(image_path, mode="r")
         vol = np.asarray(z)
     else:
-        raise ValueError(f'Unsupported file format: {image_path}')
+        raise ValueError(f"Unsupported file format: {image_path}")
 
     vol = np.asarray(vol)
     vol = np.squeeze(vol)
 
     if vol.ndim != 3:
-        raise ValueError(
-            f'Expected a 3D volume after squeeze, got shape {vol.shape}'
-        )
+        raise ValueError(f"Expected a 3D volume after squeeze, got shape {vol.shape}")
 
     return vol.astype(np.float32, copy=False)
-
 
 def save_volume(output_path: Union[str, Path], volume: np.ndarray) -> None:
     """
@@ -444,31 +456,28 @@ def save_volume(output_path: Union[str, Path], volume: np.ndarray) -> None:
     output_path = str(output_path)
     suffix = Path(output_path).suffix.lower()
 
-    if suffix in ['.tif', '.tiff']:
+    if suffix in [".tif", ".tiff"]:
         tifffile.imwrite(output_path, volume)
-    elif suffix == '.zarr':
-        z = zarr.open(
-            output_path, mode='w', shape=volume.shape, dtype=volume.dtype
-        )
+    elif suffix == ".zarr":
+        z = zarr.open(output_path, mode="w", shape=volume.shape, dtype=volume.dtype)
         z[:] = volume
     else:
-        raise ValueError(f'Unsupported output format: {output_path}')
-
+        raise ValueError(f"Unsupported output format: {output_path}")
 
 def normalize_img(
     volume: np.ndarray,
     lower_percentile: float = 1.0,
     upper_percentile: float = 99.0,
-) -> Tuple[np.ndarray, Dict]:
+ ) -> Tuple[np.ndarray, Dict]:
     """
-    Normalize the whole volume to [0, 255] using user-provided percentiles.
+    Normalize the whole volume to [0, 1] using user-provided percentiles.
 
     Returns:
-        normalized_volume: float32 array in [0, 255]
+        normalized_volume: float32 array in [0, 1]
         stats: dictionary with normalization metadata
     """
     if not (0.0 <= lower_percentile < upper_percentile <= 100.0):
-        raise ValueError('Percentiles must satisfy 0 <= lower < upper <= 100')
+        raise ValueError("Percentiles must satisfy 0 <= lower < upper <= 100")
 
     p_low = float(np.percentile(volume, lower_percentile))
     p_high = float(np.percentile(volume, upper_percentile))
@@ -479,11 +488,11 @@ def normalize_img(
         p_high = float(volume.max())
         normalized = np.zeros_like(volume, dtype=np.float32)
         stats = {
-            'raw_min': float(volume.min()),
-            'raw_max': float(volume.max()),
-            'p_low': p_low,
-            'p_high': p_high,
-            'note': 'Degenerate image; output is all zeros.',
+            "raw_min": float(volume.min()),
+            "raw_max": float(volume.max()),
+            "p_low": p_low,
+            "p_high": p_high,
+            "note": "Degenerate image; output is all zeros."
         }
         return normalized, stats
 
@@ -492,18 +501,128 @@ def normalize_img(
     normalized = normalized.astype(np.float32, copy=False)
 
     stats = {
-        'raw_min': float(volume.min()),
-        'raw_max': float(volume.max()),
-        'p_low': p_low,
-        'p_high': p_high,
+        "raw_min": float(volume.min()),
+        "raw_max": float(volume.max()),
+        "p_low": p_low,
+        "p_high": p_high,
     }
     return normalized, stats
 
+def _normalize_downsample_factor(
+    downsample_factor: Optional[Union[float, Tuple[float, float, float]]]
+) -> Optional[Tuple[float, float, float]]:
+    """
+    Convert downsample_factor to a 3-tuple in (Z, Y, X).
+
+    Meaning:
+        factor = 2       -> output size is original / 2 on each axis
+        factor = (1,2,2) -> keep Z, downsample Y/X by 2
+    """
+    if downsample_factor is None:
+        return None
+
+    if isinstance(downsample_factor, (int, float)):
+        f = float(downsample_factor)
+        factors = (f, f, f)
+    else:
+        if len(downsample_factor) != 3:
+            raise ValueError(
+                "downsample_factor must be None, a scalar, or a 3-tuple/list in (Z, Y, X)."
+            )
+        factors = tuple(float(x) for x in downsample_factor)
+
+    if any(f <= 0 for f in factors):
+        raise ValueError(f"downsample_factor must be positive, got {factors}")
+
+    if all(abs(f - 1.0) < 1e-6 for f in factors):
+        return None
+
+    return factors
+
+def resize_volume_to_shape(
+    volume: np.ndarray,
+    target_shape: Tuple[int, int, int],
+    order: int,
+) -> np.ndarray:
+    """
+    Resize 3D volume to exact target_shape.
+
+    order:
+        0: nearest neighbor, for instance labels
+        1: linear interpolation, for raw/confidence
+    """
+    target_shape = tuple(int(s) for s in target_shape)
+    if tuple(volume.shape) == target_shape:
+        return volume
+
+    zoom_factors = tuple(
+        target_shape[i] / float(volume.shape[i])
+        for i in range(3)
+    )
+
+    resized = ndi.zoom(
+        volume,
+        zoom=zoom_factors,
+        order=order,
+        mode="nearest",
+        prefilter=(order > 1),
+    )
+
+    # Safety correction: ndi.zoom usually gives exact shape, but protect against rounding.
+    out = np.zeros(target_shape, dtype=resized.dtype)
+    z = min(target_shape[0], resized.shape[0])
+    y = min(target_shape[1], resized.shape[1])
+    x = min(target_shape[2], resized.shape[2])
+    out[:z, :y, :x] = resized[:z, :y, :x]
+
+    return out
+
+def downsample_volume_for_inference(
+    volume: np.ndarray,
+    downsample_factor: Optional[Union[float, Tuple[float, float, float]]],
+    order: int = 1,
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Downsample raw volume before inference.
+
+    downsample_factor means shrink factor, not zoom factor:
+        factor=(1,2,2) means new_shape=(Z, Y/2, X/2).
+    """
+    factors = _normalize_downsample_factor(downsample_factor)
+
+    info = {
+        "enabled": factors is not None,
+        "factor_zyx": None,
+        "original_shape": [int(s) for s in volume.shape],
+        "inference_shape": [int(s) for s in volume.shape],
+    }
+
+    if factors is None:
+        return volume.astype(np.float32, copy=False), info
+
+    original_shape = tuple(int(s) for s in volume.shape)
+    target_shape = tuple(
+        max(1, int(round(original_shape[i] / factors[i])))
+        for i in range(3)
+    )
+
+    downsampled = resize_volume_to_shape(
+        volume.astype(np.float32, copy=False),
+        target_shape=target_shape,
+        order=order,
+    )
+
+    info.update({
+        "factor_zyx": [float(f) for f in factors],
+        "original_shape": [int(s) for s in original_shape],
+        "inference_shape": [int(s) for s in downsampled.shape],
+    })
+
+    return downsampled.astype(np.float32, copy=False), info
 
 # ============================================================
 # Sliding-window planning and padding
 # ============================================================
-
 
 def compute_padded_length(length: int, patch: int, stride: int) -> int:
     """
@@ -519,12 +638,11 @@ def compute_padded_length(length: int, patch: int, stride: int) -> int:
     n_steps = math.ceil((length - patch) / stride)
     return patch + n_steps * stride
 
-
 def pad_volume_for_sliding_window(
     volume: np.ndarray,
     patch_size: Tuple[int, int, int],
     stride: Tuple[int, int, int],
-) -> Tuple[np.ndarray, Dict]:
+ ) -> Tuple[np.ndarray, Dict]:
     """
     Pad the input volume so that all sliding windows fit exactly.
 
@@ -548,25 +666,20 @@ def pad_volume_for_sliding_window(
         (0, pad_x),
     )
 
-    padded = np.pad(volume, pad_width=pad_width, mode='reflect')
+    padded = np.pad(volume, pad_width=pad_width, mode="reflect")
 
     pad_info = {
-        'original_shape': [int(z), int(y), int(x)],
-        'padded_shape': [
-            int(padded.shape[0]),
-            int(padded.shape[1]),
-            int(padded.shape[2]),
-        ],
-        'pad_width': [[0, int(pad_z)], [0, int(pad_y)], [0, int(pad_x)]],
+        "original_shape": [int(z), int(y), int(x)],
+        "padded_shape": [int(padded.shape[0]), int(padded.shape[1]), int(padded.shape[2])],
+        "pad_width": [[0, int(pad_z)], [0, int(pad_y)], [0, int(pad_x)]],
     }
     return padded, pad_info
-
 
 def generate_patch_coords(
     volume_shape: Tuple[int, int, int],
     patch_size: Tuple[int, int, int],
     stride: Tuple[int, int, int],
-) -> List[Tuple[int, int, int]]:
+ ) -> List[Tuple[int, int, int]]:
     """
     Generate all patch start coordinates for a padded volume.
     """
@@ -581,7 +694,6 @@ def generate_patch_coords(
                 coords.append((z0, y0, x0))
     return coords
 
-
 def patch_postprocess_argmax(
     model_output,
     patch_shape,
@@ -589,40 +701,26 @@ def patch_postprocess_argmax(
     mask_thresh=0.5,
     min_voxels=20,
     topk_postprocess=300,
-):
+ ):
     D, H, W = patch_shape
 
     patch_instance_map = np.zeros((D, H, W), dtype=np.uint16)
     patch_confidence = np.zeros((D, H, W), dtype=np.float32)
 
-    kept_scores = []
-    kept_labels = []
-    kept_original_indices = []
+    if "pred_scores" not in model_output or "pred_masks" not in model_output:
 
-    if 'pred_scores' not in model_output or 'pred_masks' not in model_output:
         return {
-            'patch_instance_map': patch_instance_map,
-            'patch_confidence': patch_confidence,
-            'kept_scores': kept_scores,
-            'kept_labels': kept_labels,
-            'kept_original_indices': kept_original_indices,
+            "patch_instance_map": patch_instance_map,
+            "patch_confidence": patch_confidence,
         }
 
-    scores = model_output['pred_scores'].detach().float()
-    masks = model_output['pred_masks'].detach().float()
-
-    if 'pred_classes' in model_output:
-        labels = model_output['pred_classes'].detach()
-    else:
-        labels = torch.zeros_like(scores, dtype=torch.long)
+    scores = model_output["pred_scores"].detach().float()
+    masks = model_output["pred_masks"].detach().float()
 
     if masks.numel() == 0 or scores.numel() == 0:
         return {
-            'patch_instance_map': patch_instance_map,
-            'patch_confidence': patch_confidence,
-            'kept_scores': kept_scores,
-            'kept_labels': kept_labels,
-            'kept_original_indices': kept_original_indices,
+            "patch_instance_map": patch_instance_map,
+            "patch_confidence": patch_confidence,
         }
 
     if masks.min() < 0 or masks.max() > 1:
@@ -635,9 +733,11 @@ def patch_postprocess_argmax(
     # ------------------------------------------------------------
     mask_bin_tmp = mask_prob > mask_thresh
 
-    mask_scores = (mask_prob.flatten(1) * mask_bin_tmp.flatten(1)).sum(
-        dim=1
-    ) / (mask_bin_tmp.flatten(1).sum(dim=1) + 1e-6)
+    mask_scores = (
+        mask_prob.flatten(1) * mask_bin_tmp.flatten(1)
+    ).sum(dim=1) / (
+        mask_bin_tmp.flatten(1).sum(dim=1) + 1e-6
+    )
 
     # Final query score = classification score * mask quality score
     final_scores = scores * mask_scores
@@ -647,20 +747,14 @@ def patch_postprocess_argmax(
 
     if keep.sum().item() == 0:
         return {
-            'patch_instance_map': patch_instance_map,
-            'patch_confidence': patch_confidence,
-            'kept_scores': kept_scores,
-            'kept_labels': kept_labels,
-            'kept_original_indices': kept_original_indices,
+            "patch_instance_map": patch_instance_map,
+            "patch_confidence": patch_confidence,
         }
 
-    original_indices = torch.arange(scores.shape[0], device=scores.device)
 
     final_scores = final_scores[keep]
     mask_scores = mask_scores[keep]
-    labels = labels[keep]
     mask_prob = mask_prob[keep]
-    original_indices = original_indices[keep]
 
     # ------------------------------------------------------------
     # 2. Sort queries by final score
@@ -668,16 +762,12 @@ def patch_postprocess_argmax(
     order = torch.argsort(final_scores, descending=True)
     final_scores = final_scores[order]
     mask_scores = mask_scores[order]
-    labels = labels[order]
     mask_prob = mask_prob[order]
-    original_indices = original_indices[order]
 
     if topk_postprocess is not None and mask_prob.shape[0] > topk_postprocess:
         final_scores = final_scores[:topk_postprocess]
         mask_scores = mask_scores[:topk_postprocess]
-        labels = labels[:topk_postprocess]
         mask_prob = mask_prob[:topk_postprocess]
-        original_indices = original_indices[:topk_postprocess]
 
     num_queries = mask_prob.shape[0]
 
@@ -721,7 +811,7 @@ def patch_postprocess_argmax(
                 continue
 
             for cc_id in range(1, num_cc + 1):
-                cc_mask_np = cc_map == cc_id
+                cc_mask_np = (cc_map == cc_id)
                 if int(cc_mask_np.sum()) < conflict_min_pixels:
                     continue
 
@@ -731,10 +821,8 @@ def patch_postprocess_argmax(
                 )
 
                 participate = (
-                    (mask_bin[:, z] & cc_mask[None, :, :])
-                    .flatten(1)
-                    .any(dim=1)
-                )
+                    mask_bin[:, z] & cc_mask[None, :, :]
+                ).flatten(1).any(dim=1)
 
                 if participate.sum().item() <= 1:
                     continue
@@ -779,9 +867,7 @@ def patch_postprocess_argmax(
                         iom = float(inter) / float(min(area_i, area_j) + 1e-6)
                         iou = float(inter) / float(union_area + 1e-6)
 
-                        should_merge = (iom > merge_iom_thresh) or (
-                            iou > merge_iou_thresh
-                        )
+                        should_merge = (iom > merge_iom_thresh) or (iou > merge_iou_thresh)
                         if should_merge:
                             union(i, j)
 
@@ -819,24 +905,23 @@ def patch_postprocess_argmax(
                         if z > 0:
                             adj_iou = max(
                                 adj_iou,
-                                _safe_iou_bool(
-                                    merged_mask, mask_bin[q, z - 1]
-                                ),
+                                _safe_iou_bool(merged_mask, mask_bin[q, z - 1]),
                             )
 
                         if z < D - 1:
                             adj_iou = max(
                                 adj_iou,
-                                _safe_iou_bool(
-                                    merged_mask, mask_bin[q, z + 1]
-                                ),
+                                _safe_iou_bool(merged_mask, mask_bin[q, z + 1]),
                             )
 
                         score_tie = float(final_scores[q].item())
 
-                        if adj_iou > best_adj_iou or (
-                            abs(adj_iou - best_adj_iou) < 1e-6
-                            and score_tie > best_score_tie
+                        if (
+                            adj_iou > best_adj_iou
+                            or (
+                                abs(adj_iou - best_adj_iou) < 1e-6
+                                and score_tie > best_score_tie
+                            )
                         ):
                             best_adj_iou = adj_iou
                             best_score_tie = score_tie
@@ -851,9 +936,7 @@ def patch_postprocess_argmax(
                     group_probs = mask_prob_resolved[group_qs, z]
                     merged_prob = group_probs.max(dim=0).values
 
-                    mask_prob_resolved[best_q, z][merged_mask] = merged_prob[
-                        merged_mask
-                    ]
+                    mask_prob_resolved[best_q, z][merged_mask] = merged_prob[merged_mask]
                     mask_bin[best_q, z][merged_mask] = True
 
                     # Suppress other queries only on this merged structure.
@@ -873,7 +956,9 @@ def patch_postprocess_argmax(
 
     # Foreground is determined by the selected query's resolved mask probability
     selected_mask_prob = torch.gather(
-        mask_prob_resolved, dim=0, index=best_idx.unsqueeze(0)
+        mask_prob_resolved,
+        dim=0,
+        index=best_idx.unsqueeze(0)
     ).squeeze(0)
 
     fg = selected_mask_prob > mask_thresh
@@ -896,65 +981,64 @@ def patch_postprocess_argmax(
         patch_instance_map[inst_mask] = new_label_id
         patch_confidence[inst_mask] = best_score_np[inst_mask]
 
-        kept_scores.append(float(final_scores[local_q].item()))
-        kept_labels.append(int(labels[local_q].item()))
-        kept_original_indices.append(int(original_indices[local_q].item()))
-
         new_label_id += 1
 
+    # ------------------------------------------------------------
+    # 6. Remove abnormal full-foreground patch
+    # ------------------------------------------------------------
+    foreground_ratio = float(np.count_nonzero(patch_instance_map)) / float(patch_instance_map.size)
+
+    nonzero_ids = np.unique(patch_instance_map)
+    nonzero_ids = nonzero_ids[nonzero_ids > 0]
+
+    if nonzero_ids.size == 1 and foreground_ratio > 0.98:
+        patch_instance_map[...] = 0
+        patch_confidence[...] = 0.0
+
     return {
-        'patch_instance_map': patch_instance_map,
-        'patch_confidence': patch_confidence,
-        'kept_scores': kept_scores,
-        'kept_labels': kept_labels,
-        'kept_original_indices': kept_original_indices,
+        "patch_instance_map": patch_instance_map,
+        "patch_confidence": patch_confidence,
     }
 
-
-class UnionFind:
-    def __init__(self):
-        self.parent: Dict[int, int] = {}
-
-    def find(self, i: int) -> int:
-        if i not in self.parent:
-            self.parent[i] = i
-            return i
-        path = []
-        while self.parent[i] != i:
-            path.append(i)
-            i = self.parent[i]
-        for node in path:
-            self.parent[node] = i
-        return i
-
-    def union(self, i: int, j: int):
-        root_i = self.find(i)
-        root_j = self.find(j)
-        if root_i != root_j:
-            self.parent[root_i] = root_j
-
-
-def stitch_patch_instance_results_v8(
+def stitch_patch_instance_results(
     global_instance_map: np.ndarray,
     confidence_sum: np.ndarray,
     confidence_count: np.ndarray,
     patch_instance_map: np.ndarray,
     patch_confidence: np.ndarray,
-    z0: int,
-    y0: int,
-    x0: int,
+    z0: int, y0: int, x0: int,
     next_instance_id: int,
     max_coords: Tuple[int, int, int],
     patch_size: Tuple[int, int, int] = (32, 256, 256),
     stride: Tuple[int, int, int] = (16, 224, 224),
-    face_iom_thresh: float = 0.6,
-    uf_tracker=None,
+    face_iom_thresh: float = 0.2,
+    stitch_min_core_voxels: int = 64,
+    min_contact_cc_pixels: int = 10,
+    min_contact_cc_ratio: float = 0.5,
+    contact_connectivity: int = 2,
 ) -> int:
-    # Copy to avoid modifying the input patch array in-place
+    """
+    Stitch: contiguous-contact based stitching.
+
+    Main idea:
+    For each local/global candidate pair on a stitch face, build a 2D contact mask:
+
+        contact_mask = (local_face == local_id) & (global_face == global_id)
+
+    Merge only when:
+        1. IoM >= face_iom_thresh
+        2. largest connected contact component >= min_contact_cc_pixels
+        3. largest connected contact component / total contact pixels >= min_contact_cc_ratio
+
+    This distinguishes:
+        - true straight/continuous stitch seams -> merge
+        - sparse dotted contact between densely packed cells -> do not merge
+    """
+
     patch_instance_map = patch_instance_map.copy()
 
     # =========================================================================
-    # 1. [Multi-connected Component Splitting] Method A - Strict Logic Unchanged
+    # 1. Split disconnected components inside each local instance
     # =========================================================================
     max_lid = int(patch_instance_map.max())
     if max_lid > 0:
@@ -967,20 +1051,24 @@ def stitch_patch_instance_results_v8(
 
             lid = lid_minus_1 + 1
             sub_map = patch_instance_map[sub_slice]
-            mask = sub_map == lid
+            mask = (sub_map == lid)
 
-            # Use C++ level optimized 3D labeling stream
-            labeled_mask, num_features = sk_label(mask, return_num=True)
+            labeled_mask, num_features = sk_label(
+                mask,
+                return_num=True,
+                connectivity=1,
+            )
 
             if num_features > 1:
                 for feat_id in range(2, num_features + 1):
                     current_max_local_id += 1
                     sub_map[labeled_mask == feat_id] = current_max_local_id
 
-    # Update the maximum local ID after splitting
     max_local_id = int(patch_instance_map.max())
-    # =========================================================================
 
+    # =========================================================================
+    # 2. Dynamic core region
+    # =========================================================================
     dz, dy, dx = patch_size
     sz, sy, sx = stride
     mz, my, mx = (dz - sz) // 2, (dy - sy) // 2, (dx - sx) // 2
@@ -990,134 +1078,199 @@ def stitch_patch_instance_results_v8(
 
     z_start = 0 if z0 == 0 else mz
     z_end = dz if z0 == max_z else mz + sz
+
     y_start = 0 if y0 == 0 else my
     y_end = dy if y0 == max_y else my + sy
+
     x_start = 0 if x0 == 0 else mx
     x_end = dx if x0 == max_x else mx + sx
 
     core_instance = patch_instance_map[
-        z_start:z_end, y_start:y_end, x_start:x_end
+        z_start:z_end,
+        y_start:y_end,
+        x_start:x_end,
     ]
+
     gz0, gy0, gx0 = z0 + z_start, y0 + y_start, x0 + x_start
     gz1, gy1, gx1 = z0 + z_end, y0 + y_end, x0 + x_end
 
     # =========================================================================
-    # 2. [Core Region ID Extraction] Use np.bincount (O(N)) instead of np.unique (O(N log N))
+    # 3. Local IDs in core
     # =========================================================================
     core_counts_all = np.bincount(core_instance.ravel())
+
     if core_counts_all.size > 1:
         core_ids = np.nonzero(core_counts_all)[0]
-        core_ids = core_ids[core_ids > 0]  # Exclude background 0
-        local_ids_in_core = core_ids[core_counts_all[core_ids] >= 64]
+        core_ids = core_ids[core_ids > 0]
+        local_ids_in_core = core_ids[
+            core_counts_all[core_ids] >= int(stitch_min_core_voxels)
+        ]
     else:
-        local_ids_in_core = np.array([], dtype=np.int32)
+        core_ids = np.array([], dtype=np.int64)
+        local_ids_in_core = np.array([], dtype=np.int64)
 
-    b_local, b_global = [], []
+    # =========================================================================
+    # 4. Helper: measure contact continuity
+    # =========================================================================
+    def _contact_continuity_stats(contact_mask_2d: np.ndarray):
+        """
+        Return:
+            total_contact: total contact pixels
+            largest_cc: largest connected contact component size
+            cc_ratio: largest_cc / total_contact
+        """
+        total_contact = int(contact_mask_2d.sum())
+        if total_contact <= 0:
+            return 0, 0, 0.0
+
+        cc_map = sk_label(
+            contact_mask_2d.astype(np.uint8),
+            background=0,
+            connectivity=int(contact_connectivity),
+        )
+
+        if cc_map.max() <= 0:
+            return total_contact, 0, 0.0
+
+        cc_sizes = np.bincount(cc_map.ravel())
+        if cc_sizes.size <= 1:
+            return total_contact, 0, 0.0
+
+        largest_cc = int(cc_sizes[1:].max())
+        cc_ratio = float(largest_cc) / float(total_contact + 1e-6)
+
+        return total_contact, largest_cc, cc_ratio
+
+    # =========================================================================
+    # 5. Build seam faces separately
+    # =========================================================================
+    # Each face stores 2D arrays, not flattened arrays.
+    # This is necessary because we need connected components of contact pixels.
+    faces = []
+
     if gz0 > 0:
-        b_local.append(core_instance[0, :, :].reshape(-1))
-        b_global.append(
-            global_instance_map[gz0 - 1, gy0:gy1, gx0:gx1].reshape(-1)
-        )
+        faces.append((
+            "Z",
+            core_instance[0, :, :],
+            global_instance_map[gz0 - 1, gy0:gy1, gx0:gx1],
+        ))
+
     if gy0 > 0:
-        b_local.append(core_instance[:, 0, :].reshape(-1))
-        b_global.append(
-            global_instance_map[gz0:gz1, gy0 - 1, gx0:gx1].reshape(-1)
-        )
+        faces.append((
+            "Y",
+            core_instance[:, 0, :],
+            global_instance_map[gz0:gz1, gy0 - 1, gx0:gx1],
+        ))
+
     if gx0 > 0:
-        b_local.append(core_instance[:, :, 0].reshape(-1))
-        b_global.append(
-            global_instance_map[gz0:gz1, gy0:gy1, gx0 - 1].reshape(-1)
-        )
-
-    b_local_arr = (
-        np.concatenate(b_local)
-        if b_local
-        else np.array([], dtype=core_instance.dtype)
-    )
-    b_global_arr = (
-        np.concatenate(b_global)
-        if b_global
-        else np.array([], dtype=global_instance_map.dtype)
-    )
+        faces.append((
+            "X",
+            core_instance[:, :, 0],
+            global_instance_map[gz0:gz1, gy0:gy1, gx0 - 1],
+        ))
 
     # =========================================================================
-    # 3. [Boundary Intersection Optimization] Compute all overlaps via Sparse Matrix
+    # 6. Candidate matching with contiguous-contact filtering
     # =========================================================================
-    b_local_counts = (
-        np.bincount(b_local_arr) if b_local_arr.size > 0 else np.array([])
-    )
-    g_counts_all = (
-        np.bincount(b_global_arr) if b_global_arr.size > 0 else np.array([])
-    )
-
-    overlap_matrix = None
-    if b_local_arr.size > 0 and b_global_arr.size > 0:
-        valid_b = (b_local_arr > 0) & (b_global_arr > 0)
-        if valid_b.any():
-            bl_valid = b_local_arr[valid_b]
-            bg_valid = b_global_arr[valid_b]
-            max_l = int(bl_valid.max())
-            max_g = int(bg_valid.max())
-
-            # Construct a sparse co-occurrence matrix:
-            # rows = local_id, cols = global_id, values = intersection area
-            ones = np.ones_like(bl_valid, dtype=np.int32)
-            overlap_matrix = coo_matrix(
-                (ones, (bl_valid, bg_valid)),
-                shape=(max(max_l, max_local_id) + 1, max_g + 1),
-            ).tocsr()
-
     id_remap = {}
-    for lid in local_ids_in_core:
-        matched_gids = []
-        area_l = int(b_local_counts[lid]) if lid < b_local_counts.size else 0
 
-        # O(1) slice via CSR row pointer to fetch all intersecting global_ids and voxel counts
-        if (
-            area_l > 0
-            and overlap_matrix is not None
-            and lid < overlap_matrix.shape[0]
-        ):
-            row = overlap_matrix[lid]
-            for gid, inter in zip(row.indices, row.data):
-                if gid == 0:
-                    continue
-                area_g = (
-                    int(g_counts_all[gid]) if gid < g_counts_all.size else 0
-                )
+    for lid in local_ids_in_core:
+        candidates = []
+
+        for face_name, local_face, global_face in faces:
+            local_mask = (local_face == lid)
+            area_l = int(local_mask.sum())
+
+            if area_l <= 0:
+                continue
+
+            touched_global_ids = np.unique(global_face[local_mask])
+            touched_global_ids = touched_global_ids[touched_global_ids > 0]
+
+            if touched_global_ids.size == 0:
+                continue
+
+            for gid in touched_global_ids:
+                gid = int(gid)
+
+                global_mask = (global_face == gid)
+                area_g = int(global_mask.sum())
+
                 if area_g <= 0:
                     continue
 
-                iom = float(inter) / float(min(area_l, area_g))
-                if iom >= face_iom_thresh:
-                    matched_gids.append(int(gid))
+                contact_mask = local_mask & global_mask
 
-        if len(matched_gids) > 0:
-            base_gid = matched_gids[0]
-            id_remap[int(lid)] = base_gid
-            if len(matched_gids) > 1 and uf_tracker is not None:
-                for other_gid in matched_gids[1:]:
-                    uf_tracker.union(base_gid, other_gid)
+                total_contact, largest_cc, cc_ratio = _contact_continuity_stats(
+                    contact_mask
+                )
+
+                if total_contact <= 0:
+                    continue
+
+                iom = float(total_contact) / float(min(area_l, area_g) + 1e-6)
+
+                # Core rule:
+                # IoM says how much they match.
+                # largest_cc says whether the contact is a real continuous seam.
+                # cc_ratio rejects dotted/sparse contact patterns.
+                if (
+                    iom >= float(face_iom_thresh)
+                    and largest_cc >= int(min_contact_cc_pixels)
+                    and cc_ratio >= float(min_contact_cc_ratio)
+                ):
+                    candidates.append({
+                        "gid": gid,
+                        "face": face_name,
+                        "iom": iom,
+                        "total_contact": total_contact,
+                        "largest_cc": largest_cc,
+                        "cc_ratio": cc_ratio,
+                    })
+
+        if len(candidates) > 0:
+            # Prefer the candidate with the strongest continuous contact.
+            # This is better than simply picking the largest total contact.
+            candidates.sort(
+                key=lambda c: (
+                    c["largest_cc"],
+                    c["cc_ratio"],
+                    c["iom"],
+                    c["total_contact"],
+                ),
+                reverse=True,
+            )
+
+            best_gid = int(candidates[0]["gid"])
+            id_remap[int(lid)] = best_gid
+
         else:
             id_remap[int(lid)] = int(next_instance_id)
             next_instance_id += 1
-    # =========================================================================
 
+    # =========================================================================
+    # 7. Handle empty remap
+    # =========================================================================
     num_small = (
-        np.sum((core_ids > 0) & (core_counts_all[core_ids] < 64))
+        int(np.sum((core_ids > 0) & (core_counts_all[core_ids] < int(stitch_min_core_voxels))))
         if core_counts_all.size > 1
         else 0
     )
+
     if len(id_remap) == 0 and num_small > 0:
-        remapped_patch = np.zeros_like(patch_instance_map)
+        remapped_patch = np.zeros_like(patch_instance_map, dtype=np.uint32)
     elif len(id_remap) == 0:
         return next_instance_id
     else:
         lut = np.zeros(max_local_id + 1, dtype=np.uint32)
         for lid, gid in id_remap.items():
-            lut[lid] = gid
+            lut[int(lid)] = int(gid)
+
         remapped_patch = lut[patch_instance_map]
 
+    # =========================================================================
+    # 8. Write back
+    # =========================================================================
     gz1_full = min(z0 + patch_instance_map.shape[0], limit_z)
     gy1_full = min(y0 + patch_instance_map.shape[1], limit_y)
     gx1_full = min(x0 + patch_instance_map.shape[2], limit_x)
@@ -1130,38 +1283,29 @@ def stitch_patch_instance_results_v8(
     conf_crop = patch_confidence[:local_z1, :local_y1, :local_x1]
 
     valid_mask = remapped_crop > 0
+
     if valid_mask.any():
         global_crop = global_instance_map[
-            z0:gz1_full, y0:gy1_full, x0:gx1_full
+            z0:gz1_full,
+            y0:gy1_full,
+            x0:gx1_full,
         ]
-        conf_sum_crop = confidence_sum[z0:gz1_full, y0:gy1_full, x0:gx1_full]
-        conf_cnt_crop = confidence_count[z0:gz1_full, y0:gy1_full, x0:gx1_full]
+        conf_sum_crop = confidence_sum[
+            z0:gz1_full,
+            y0:gy1_full,
+            x0:gx1_full,
+        ]
+        conf_cnt_crop = confidence_count[
+            z0:gz1_full,
+            y0:gy1_full,
+            x0:gx1_full,
+        ]
 
         global_crop[valid_mask] = remapped_crop[valid_mask]
         conf_sum_crop[valid_mask] += conf_crop[valid_mask]
         conf_cnt_crop[valid_mask] += 1
 
     return next_instance_id
-
-
-def finalize_global_bridge_resolution(
-    global_instance_map: np.ndarray, uf_tracker: UnionFind
-):
-    if not uf_tracker.parent:
-        return
-
-    max_global_id = int(global_instance_map.max())
-    if max_global_id == 0:
-        return
-
-    global_lut = np.arange(max_global_id + 1, dtype=np.uint32)
-
-    for gid in list(uf_tracker.parent.keys()):
-        if gid <= max_global_id:
-            global_lut[gid] = uf_tracker.find(gid)
-
-    global_instance_map[:] = global_lut[global_instance_map]
-
 
 def filter_instances_by_size(
     instance_map: np.ndarray,
@@ -1195,27 +1339,24 @@ def filter_instances_by_size(
 
     if instance_map.shape != confidence_map.shape:
         raise ValueError(
-            f'instance_map and confidence_map must have the same shape, '
-            f'got {instance_map.shape} and {confidence_map.shape}'
+            f"instance_map and confidence_map must have the same shape, "
+            f"got {instance_map.shape} and {confidence_map.shape}"
         )
 
-    if (
-        intensity_volume is not None
-        and intensity_volume.shape != instance_map.shape
-    ):
+    if intensity_volume is not None and intensity_volume.shape != instance_map.shape:
         raise ValueError(
-            f'intensity_volume must have the same shape as instance_map, '
-            f'got {intensity_volume.shape} and {instance_map.shape}'
+            f"intensity_volume must have the same shape as instance_map, "
+            f"got {intensity_volume.shape} and {instance_map.shape}"
         )
 
     if min_area < 0:
-        raise ValueError('min_area must be >= 0')
+        raise ValueError("min_area must be >= 0")
 
     if min_size < 0:
-        raise ValueError('min_size must be >= 0')
+        raise ValueError("min_size must be >= 0")
 
     if max_size is not None and max_size < min_size:
-        raise ValueError('max_size must be None or >= min_size')
+        raise ValueError("max_size must be None or >= min_size")
 
     out_instance = instance_map.copy().astype(np.uint32, copy=False)
     out_confidence = confidence_map.copy().astype(np.float32, copy=False)
@@ -1263,7 +1404,9 @@ def filter_instances_by_size(
                 conf_sl[remove_mask] = 0.0
 
     if verbose:
-        print(f'[2D filtering] Removed {removed_2d_cc} small components, ')
+        print(
+            f"[2D filtering] Removed {removed_2d_cc} small components, "
+        )
 
     # ============================================================
     # Step 2: vectorized ID-wise 3D size / intensity filtering
@@ -1281,10 +1424,11 @@ def filter_instances_by_size(
     ids_arr = np.arange(max_old_id + 1)
 
     valid = np.zeros(max_old_id + 1, dtype=bool)
-    valid[1:] = True
+    valid[1:] = counts[1:] > 0
 
     # Size filtering
-    valid &= counts >= int(min_size)
+    if min_size > 0:
+        valid &= counts >= int(min_size)
 
     if max_size is not None:
         valid &= counts <= int(max_size)
@@ -1297,9 +1441,7 @@ def filter_instances_by_size(
     removed_by_intensity = 0
 
     if intensity_volume is not None and background_threshold is not None:
-        flat_intensity = intensity_volume.astype(
-            np.float32, copy=False
-        ).ravel()
+        flat_intensity = intensity_volume.astype(np.float32, copy=False).ravel()
 
         intensity_sum = np.bincount(
             flat_ids,
@@ -1328,8 +1470,8 @@ def filter_instances_by_size(
 
         if verbose:
             print(
-                '[ID filtering] No valid instances remain after '
-                'size/intensity filtering.'
+                "[ID filtering] No valid instances remain after "
+                "size/intensity filtering."
             )
 
         return new_instance, new_confidence
@@ -1345,13 +1487,12 @@ def filter_instances_by_size(
 
     if verbose:
         print(
-            f'[ID filtering] Kept {valid_ids.size} instances. '
-            f'Removed by size: {removed_by_size}. '
-            f'Removed by intensity: {removed_by_intensity}. '
+            f"[ID filtering] Kept {valid_ids.size} instances. "
+            f"Removed by size: {removed_by_size}. "
+            f"Removed by intensity: {removed_by_intensity}. "
         )
 
     return new_instance.astype(np.uint32), new_confidence.astype(np.float32)
-
 
 def finalize_instance_and_confidence(
     global_instance_map: np.ndarray,
@@ -1359,11 +1500,14 @@ def finalize_instance_and_confidence(
     confidence_count: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Finalize:
-        - instance_map: connected components of the union foreground
-        - confidence_map: average confidence in overlap regions
+    Finalize stitching result.
+
+    Notes:
+        - instance_map is returned from global_instance_map as-is.
+        - No connected-component relabeling is performed here.
+        - No union-find / global-bridge remapping is performed here.
+        - confidence_map is the average confidence over written voxels.
     """
-    confidence_map = np.zeros_like(confidence_sum, dtype=np.float32)
     instance_map = global_instance_map.astype(np.uint32, copy=False)
 
     valid = confidence_count > 0
@@ -1372,3 +1516,138 @@ def finalize_instance_and_confidence(
     confidence_map[instance_map == 0] = 0.0
 
     return instance_map, confidence_map
+
+def infer_folder(
+    input_dir: Union[str, Path],
+    output_dir: Union[str, Path],
+    config_file: Union[str, Path],
+    weights_path: Union[str, Path],
+    recursive: bool = False,
+    skip_existing: bool = True,
+    keep_failed_tmp: bool = False,
+    **infer_kwargs,
+) -> Dict:
+    """
+    Batch inference for all tif/tiff files in a folder.
+    Only keep final mask result: <stem>_instance_map.tif
+
+    Parameters
+    ----------
+    input_dir:
+        Folder containing tif/tiff files.
+    output_dir:
+        Folder to save mask results.
+    config_file:
+        Config yaml path.
+    weights_path:
+        Model checkpoint path.
+    recursive:
+        If True, search tif/tiff recursively.
+    skip_existing:
+        If True, skip files whose output mask already exists.
+    keep_failed_tmp:
+        If True, keep temporary output folder when an image fails.
+    infer_kwargs:
+        Other parameters passed to infer_volume, e.g. batch_size, patch_size.
+    """
+    import shutil
+    import traceback
+
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not input_dir.exists():
+        raise FileNotFoundError(f"input_dir does not exist: {input_dir}")
+
+    if recursive:
+        tif_files = []
+        for pat in ["*.tif", "*.tiff", "*.TIF", "*.TIFF", "*.zarr", "*.ZARR"]:
+            tif_files.extend(input_dir.rglob(pat))
+    else:
+        tif_files = []
+        for pat in ["*.tif", "*.tiff", "*.TIF", "*.TIFF", "*.zarr", "*.ZARR"]:
+            tif_files.extend(input_dir.glob(pat))
+
+    tif_files = sorted(set(tif_files))
+
+    if len(tif_files) == 0:
+        raise FileNotFoundError(f"No tif/tiff files found in: {input_dir}")
+
+    summary = {
+        "total": len(tif_files),
+        "done": [],
+        "skipped": [],
+        "failed": [],
+    }
+
+    print(f"[Batch inference] Found {len(tif_files)} tif/tiff files.")
+    print(f"[Batch inference] Input : {input_dir}")
+    print(f"[Batch inference] Output: {output_dir}")
+
+    for image_path in tqdm(tif_files, desc="Batch infer", unit="vol"):
+        image_path = Path(image_path)
+
+        if recursive:
+            rel_parent = image_path.relative_to(input_dir).parent
+            final_out_dir = output_dir / rel_parent
+        else:
+            final_out_dir = output_dir
+
+        final_out_dir.mkdir(parents=True, exist_ok=True)
+
+        final_mask_path = final_out_dir / f"{image_path.stem}_instance_map.tif"
+
+        if skip_existing and final_mask_path.exists():
+            print(f"[Skip] {final_mask_path}")
+            summary["skipped"].append(str(final_mask_path))
+            continue
+
+        tmp_dir = final_out_dir / f".tmp_{image_path.stem}"
+
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            result = infer_volume(
+                image_path=image_path,
+                config_file=config_file,
+                weights_path=weights_path,
+                output_dir=tmp_dir,
+                save_intermediate=False,
+                **infer_kwargs,
+            )
+
+            src_mask_path = Path(result["instance_map_path"])
+
+            if final_mask_path.exists():
+                final_mask_path.unlink()
+
+            shutil.move(str(src_mask_path), str(final_mask_path))
+
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+            print(f"[Done] {image_path.name} -> {final_mask_path}")
+            summary["done"].append(str(final_mask_path))
+
+        except Exception as e:
+            err_msg = traceback.format_exc()
+            print(f"[Failed] {image_path}")
+            print(err_msg)
+
+            summary["failed"].append({
+                "image_path": str(image_path),
+                "error": repr(e),
+            })
+
+            if not keep_failed_tmp:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    print("\n[Batch inference finished]")
+    print(f"  Total  : {summary['total']}")
+    print(f"  Done   : {len(summary['done'])}")
+    print(f"  Skipped: {len(summary['skipped'])}")
+    print(f"  Failed : {len(summary['failed'])}")
+
+    return summary

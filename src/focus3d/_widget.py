@@ -563,7 +563,10 @@ class SegmentationWidget(QWidget):
         )
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
         self._install_delete_shortcut()
-        self.setMaximumWidth(350)
+        # self.setMaximumWidth(350)
+        PLUGIN_DOCK_WIDTH = 350
+        self.setMinimumWidth(PLUGIN_DOCK_WIDTH)
+        self.setMaximumWidth(PLUGIN_DOCK_WIDTH)
         self._apply_contour_to_existing_labels()
         self.viewer.layers.events.inserted.connect(
             self._on_layers_changed_for_channel_display
@@ -864,8 +867,15 @@ class SegmentationWidget(QWidget):
 
         # Initialize control states
         self._update_curation_controls()
-        self.viewer.bind_key('q', self._go_to_previous_slice)
-        self.viewer.bind_key('w', self._go_to_next_slice)
+        try:
+            self.viewer.bind_key(
+                'q', self._go_to_previous_slice, overwrite=True
+            )
+            self.viewer.bind_key('w', self._go_to_next_slice, overwrite=True)
+        except Exception as e:
+            notifications.show_warning(
+                f'Failed to bind q/w navigation shortcuts: {e}'
+            )
 
         layout.addStretch()
 
@@ -1481,7 +1491,22 @@ class SegmentationWidget(QWidget):
         layout.addStretch()
 
     def _init_analysis_tab(self):
-        layout = QVBoxLayout(self.analysis_tab)
+        outer_layout = QVBoxLayout(self.analysis_tab)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+
+        scroll_content = QWidget()
+        layout = QVBoxLayout(scroll_content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        scroll.setWidget(scroll_content)
+        outer_layout.addWidget(scroll)
 
         # ---------- 3D label reconstruction group ----------
         recon_group = QGroupBox('3D Label Reconstruction')
@@ -1545,17 +1570,12 @@ class SegmentationWidget(QWidget):
         layout.addWidget(full_3d_group)
 
         layout.addSpacing(12)
-        # ---------- Quantitative statistics group ----------
-        stats_group = QGroupBox('Quantitative Statistics')
-        stats_group.setStyleSheet(self._section_group_style())
-        stats_layout = QVBoxLayout()
+        # ---------- Morphometry analysis group ----------
+        from focus3d.analysis.analysis import _init_morphometry_analysis_group
 
-        self.btn_stats = QPushButton('Calculate Size Distribution')
-        self.btn_stats.clicked.connect(self._show_quantitative_stats)
-        stats_layout.addWidget(self.btn_stats)
-
-        stats_group.setLayout(stats_layout)
-        layout.addWidget(stats_group)
+        _init_morphometry_analysis_group(
+            self, layout, self._section_group_style()
+        )
 
         layout.addStretch()
 
@@ -4304,6 +4324,28 @@ def _lazy_show_3d_reconstruction(self, *args, **kwargs):
     return _show_3d_reconstruction(self)
 
 
+def _lazy_run_morphometry_analysis(self, *args, **kwargs):
+    try:
+        from focus3d.analysis.analysis import _run_morphometry_analysis
+    except Exception as e:
+        notifications.show_error(
+            f'Failed to import morphometry analysis:\n{e}'
+        )
+        return
+    return _run_morphometry_analysis(self, *args, **kwargs)
+
+
+def _lazy_on_morphometry_finished(self, *args, **kwargs):
+    try:
+        from focus3d.analysis.analysis import _on_morphometry_finished
+    except Exception as e:
+        notifications.show_error(
+            f'Failed to import morphometry analysis:\n{e}'
+        )
+        return
+    return _on_morphometry_finished(self, *args, **kwargs)
+
+
 def _lazy_toggle_full_3d_view(self, *args, **kwargs):
     try:
         from focus3d.analysis.analysis import _toggle_full_3d_view
@@ -4481,3 +4523,5 @@ SegmentationWidget._on_one_click_model_load_error = (
 SegmentationWidget._cancel_one_click_model_loading = (
     _cancel_one_click_model_loading
 )
+SegmentationWidget._run_morphometry_analysis = _lazy_run_morphometry_analysis
+SegmentationWidget._on_morphometry_finished = _lazy_on_morphometry_finished
