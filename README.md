@@ -10,7 +10,7 @@
 
 FOCUS-3D provides a user-friendly napari plugin for interactive 3D cell segmentation, manual curation, model fine-tuning, and analysis. Users can run automatic 3D segmentation with pretrained FOCUS-3D models, manually correct segmentation errors, perform one-click segmentation, prepare curated patches for human-in-the-loop fine-tuning, reconstruct selected 3D cell instances, and compute quantitative statistics within the same napari workflow. Our website is [https://www.quiclab.org.cn/focus-3d](https://www.quiclab.org.cn/focus-3d).
 
-<img width="1000" height="542" alt="image" src="https://github.com/user-attachments/assets/2a9ccc08-3109-4b73-bcae-0514bcec2a86" />
+<img width="800" height="434" alt="image" src="https://github.com/user-attachments/assets/2a9ccc08-3109-4b73-bcae-0514bcec2a86" />
 
 ## Installation
 
@@ -139,7 +139,7 @@ The `Basic` menu provides functions for loading segmentation labels, adjusting i
 ## Segmentation Menu
 
 The `Segmentation` menu provides automatic 3D segmentation with **FOCUS-3D**, one-click local segmentation refinement, and human-in-the-loop fine-tuning based on curated labels.
-<img width="1000" height="542" alt="image" src="https://github.com/user-attachments/assets/74b6b9ae-0a00-4b40-bb31-fb743709c725" />
+<img width="800" height="434" alt="image" src="https://github.com/user-attachments/assets/74b6b9ae-0a00-4b40-bb31-fb743709c725" />
 
 ### Run Segmentation
 
@@ -190,7 +190,7 @@ The `Segmentation` menu provides automatic 3D segmentation with **FOCUS-3D**, on
 
 The `Analysis` menu provides tools for selected-label 3D reconstruction, full-volume 3D visualization, and task-based morphometry analysis.
 
-<img width="3830" height="2072" alt="image" src="https://github.com/user-attachments/assets/bee8aa3e-7f57-439d-93bc-cf28ebbb0f9c" />
+<img width="800" height="434" alt="image" src="https://github.com/user-attachments/assets/bee8aa3e-7f57-439d-93bc-cf28ebbb0f9c" />
 
 
 ### 3D Label Reconstruction
