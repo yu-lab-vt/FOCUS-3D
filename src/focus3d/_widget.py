@@ -564,9 +564,9 @@ class SegmentationWidget(QWidget):
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
         self._install_delete_shortcut()
         # self.setMaximumWidth(350)
-        PLUGIN_DOCK_WIDTH = 350
+        PLUGIN_DOCK_WIDTH = 400
         self.setMinimumWidth(PLUGIN_DOCK_WIDTH)
-        self.setMaximumWidth(PLUGIN_DOCK_WIDTH)
+        # self.setMaximumWidth(PLUGIN_DOCK_WIDTH)
         self._apply_contour_to_existing_labels()
         self.viewer.layers.events.inserted.connect(
             self._on_layers_changed_for_channel_display
@@ -624,7 +624,7 @@ class SegmentationWidget(QWidget):
         if labels_layer is None:
             if show_warning:
                 notifications.show_warning(
-                    'Please load a label layer first. Use "Load from Zarr" or "Load from TIFF" before entering curation mode.'
+                    'Please load a label layer first. Use "Load from Zarr", "Load from TIFF", or "Create Empty Label" before entering curation mode.'
                 )
             return None
 
@@ -634,7 +634,7 @@ class SegmentationWidget(QWidget):
         if labels_layer is None:
             if show_warning:
                 notifications.show_warning(
-                    'Please load a label layer first. Use "Load from TIFF" or "Load from TIFF" before entering curation mode.'
+                    'Please load a label layer first. Use "Load from Zarr", "Load from TIFF", or "Create Empty Label" before entering curation mode.'
                 )
             return None
 
@@ -674,6 +674,10 @@ class SegmentationWidget(QWidget):
         load_buttons_layout.addWidget(self.btn_show_seg)
 
         load_group_layout.addWidget(load_buttons_widget)
+
+        self.btn_create_empty_label = QPushButton('Create Empty Label')
+        self.btn_create_empty_label.clicked.connect(self._create_empty_label)
+        load_group_layout.addWidget(self.btn_create_empty_label)
 
         self.chk_contour = QCheckBox('Only Show Contour')
         self.chk_contour.setChecked(False)
@@ -2580,41 +2584,6 @@ class SegmentationWidget(QWidget):
 
         return ''.join(safe)
 
-    def _default_seg_output_path(self, image_layer=None) -> str:
-        """
-        Default segmentation output folder.
-
-        If the input image is:
-            /data/00503.tif
-
-        return:
-            /data/00503_seg
-
-        If the image has no source path, use:
-            ./<layer_name>_seg
-        """
-        if image_layer is None:
-            image_layer = self._get_first_image_layer()
-
-        source_path = self._get_image_source_path(image_layer)
-
-        if source_path is not None:
-            if not source_path.is_absolute():
-                source_path = Path.cwd() / source_path
-
-            base_dir = source_path.parent
-            stem = source_path.stem
-        else:
-            base_dir = Path.cwd()
-            stem = (
-                getattr(image_layer, 'name', 'image')
-                if image_layer is not None
-                else 'image'
-            )
-
-        stem = self._sanitize_name_for_path(stem)
-        return str(base_dir / f'{stem}_seg')
-
     def _set_default_seg_output_path_from_layer(
         self, image_layer=None, force=False
     ):
@@ -2683,32 +2652,28 @@ class SegmentationWidget(QWidget):
     def _default_seg_output_path(self, image_layer=None) -> str:
         """
         Default output folder:
-        - If image has source path, create output_xxx beside the original image.
-        - If no source path, create output_xxx under current working directory.
+        - If image has source path, create output_xxx_timestamp beside the original image.
+        - If no image has been loaded yet, return a harmless default path
+          without showing any warning.
         """
         if image_layer is None:
-            image_layer = self._get_active_image()
+            image_layer = self._get_first_image_layer()
 
-        source_path = self._get_image_source_path(image_layer)
-
-        if source_path is not None:
-            # If source is relative, make it absolute relative to current cwd.
-            if not source_path.is_absolute():
-                source_path = Path.cwd() / source_path
-
-            # For tif:
-            #   /data/00503.tif -> /data/output_00503_timestamp
-            # For zarr:
-            #   /data/00503.zarr -> /data/output_00503_timestamp
-            base_dir = source_path.parent
-            stem = source_path.stem
-        else:
+        if image_layer is None:
             base_dir = Path.cwd()
-            stem = (
-                getattr(image_layer, 'name', 'image')
-                if image_layer is not None
-                else 'image'
-            )
+            stem = 'image'
+        else:
+            source_path = self._get_image_source_path(image_layer)
+
+            if source_path is not None:
+                if not source_path.is_absolute():
+                    source_path = Path.cwd() / source_path
+
+                base_dir = source_path.parent
+                stem = source_path.stem
+            else:
+                base_dir = Path.cwd()
+                stem = getattr(image_layer, 'name', 'image')
 
         stem = self._sanitize_name_for_path(stem)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -3164,6 +3129,145 @@ class SegmentationWidget(QWidget):
 
         return labels_layers[0]
 
+    def _create_empty_label(self):
+        """
+        Create an all-zero editable label layer with the same shape as
+        the current image layer.
+
+        The empty label is stored as zarr to avoid allocating a large
+        dense numpy array in memory.
+        """
+        image_layer = self._get_active_image(show_error=False)
+
+        if image_layer is None:
+            image_layer = self._get_first_image_layer()
+
+        if image_layer is None:
+            notifications.show_error(
+                'Please load an image layer before creating an empty label.'
+            )
+            return
+
+        try:
+            shape = tuple(int(v) for v in image_layer.data.shape)
+        except Exception as e:
+            notifications.show_error(f'Failed to read image shape:\n{e}')
+            return
+
+        if len(shape) != 3:
+            notifications.show_error(
+                f'Only 3D images (Z, Y, X) are supported for empty labels. '
+                f'Current image shape: {shape}'
+            )
+            return
+
+        # Decide where to save the editable empty label.
+        output_root = ''
+        if hasattr(self, 'save_seg_path_edit'):
+            output_root = self.save_seg_path_edit.text().strip()
+
+        if not output_root:
+            output_root = self._default_seg_output_path(image_layer)
+            with contextlib.suppress(Exception):
+                self.save_seg_path_edit.setText(output_root)
+
+        curation_dir = Path(output_root).expanduser()
+        if not curation_dir.is_absolute():
+            curation_dir = Path.cwd() / curation_dir
+
+        try:
+            curation_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            notifications.show_error(
+                f'Failed to create output folder:\n{curation_dir}\n\n{e}'
+            )
+            return
+
+        editable_zarr_path = curation_dir / 'curation_labels.zarr'
+
+        # If a previous empty label layer with the same name exists, remove it first.
+        layer_name = f'{image_layer.name}_empty_label'
+        with contextlib.suppress(Exception):
+            if layer_name in self.viewer.layers:
+                self.viewer.layers.remove(layer_name)
+
+        try:
+            import shutil
+
+            import zarr
+
+            if editable_zarr_path.exists():
+                shutil.rmtree(editable_zarr_path)
+
+            chunks = (
+                1,
+                min(512, shape[1]),
+                min(512, shape[2]),
+            )
+
+            labels_to_show = zarr.open(
+                str(editable_zarr_path),
+                mode='w',
+                shape=shape,
+                chunks=chunks,
+                dtype=np.uint16,
+                fill_value=0,
+            )
+
+        except Exception as e:
+            notifications.show_error(
+                f'Failed to create empty label zarr:\n{e}'
+            )
+            return
+
+        try:
+            layer = self.viewer.add_labels(
+                labels_to_show,
+                name=layer_name,
+            )
+
+            layer.contour = bool(self.chk_contour.isChecked())
+            layer.edge_color = 'white'
+            layer.edge_width = 1
+            layer.opacity = 0.8
+
+            layer.metadata['editable_backend'] = 'zarr'
+            layer.metadata['zarr_path'] = str(editable_zarr_path)
+            layer.metadata['next_label_id'] = 1
+
+            self.current_label_path = str(editable_zarr_path)
+
+            self.viewer.layers.selection.active = layer
+            layer.refresh()
+
+            self._update_curation_controls()
+
+        except Exception as e:
+            notifications.show_error(f'Failed to add empty label layer:\n{e}')
+            return
+
+        try:
+            self._init_session_log_file(str(editable_zarr_path))
+            self._append_log_entry(
+                operation='create empty label',
+                label_id_or_count='0',
+                z_index='',
+                layer_name=layer.name,
+                note=(
+                    f'Created all-zero editable label with shape={shape}; '
+                    f'stored at {editable_zarr_path}'
+                ),
+            )
+        except Exception as e:
+            notifications.show_warning(
+                f'Empty label created, but failed to initialize curation log: {e}'
+            )
+
+        notifications.show_info(
+            f'Empty label created with shape {shape}.\n'
+            f'Editable label saved to:\n{editable_zarr_path}'
+        )
+
     # ---------- Segmentation actions ----------
     def _segment_3d(self):
         """
@@ -3304,6 +3408,28 @@ class SegmentationWidget(QWidget):
             'device': 'cuda' if cuda_visible_devices else None,
         }
 
+        try:
+            import importlib.util
+
+            import torch
+
+            if importlib.util.find_spec('torchvision') is None:
+                raise ImportError('torchvision is not installed')
+        except ImportError as e:
+            notifications.show_error(
+                'FOCUS-3D deep-learning backend is not installed.\n\n'
+                'Automatic segmentation requires PyTorch and torchvision.\n'
+                'Please install the appropriate backend for your CUDA version '
+                f'Missing dependency: {e.name}'
+            )
+            return
+
+        if not torch.cuda.is_available():
+            notifications.show_warning(
+                'PyTorch is installed, but CUDA is not available.\n'
+                'Segmentation may be unavailable or very slow. Please check '
+                'your PyTorch/CUDA installation.'
+            )
         try:
             from focus3d.segmentation.segmentation import SegmentationWorker
         except Exception as e:

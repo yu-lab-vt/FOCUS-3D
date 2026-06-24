@@ -1,6 +1,6 @@
 [project]
 name = "focus-3d"
-version = "0.1.2"
+version = "0.1.4"
 description = "FOCUS-3D: a user-friendly napari plugin for interactive 3D cell segmentation, curation, and analysis"
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -46,13 +46,13 @@ dependencies = [
     "numcodecs",
     "pillow",
     "matplotlib",
+    "scikit-learn",
+    "umap-learn",
 ]
 
 [project.optional-dependencies]
-all = [
+gui = [
     "napari[all]",
-    "torch",
-    "torchvision",
 ]
 
 [dependency-groups]
@@ -66,8 +66,6 @@ dev = [
 
 [project.entry-points."napari.manifest"]
 focus-3d = "focus3d:napari.yaml"
-
-
 
 [build-system]
 requires = ["setuptools>=77.0.3", "wheel"]

@@ -33,6 +33,8 @@ else:
         build_maskformer_model_from_cfg,
     )
 
+def identity_collate(batch):
+    return batch
 
 def _format_eta(seconds: float | None) -> str:
     if seconds is None or seconds < 0 or not math.isfinite(seconds):
@@ -436,7 +438,7 @@ def infer_volume(
         pin_memory=True,
         persistent_workers=(data_loader_num_workers > 0),
         prefetch_factor=2 if data_loader_num_workers > 0 else None,
-        collate_fn=lambda x: x,
+        collate_fn=identity_collate,
     )
 
     patch_pbar = tqdm(
