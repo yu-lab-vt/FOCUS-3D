@@ -61,6 +61,7 @@ The `Basic` menu provides functions for loading segmentation labels, adjusting i
 |---|---|
 | Load from Zarr | Load an existing 3D label map from a `.zarr` folder. This is recommended for large 3D volumes because it supports efficient data access and editing. |
 | Load from TIFF | Load an existing 3D label map from a `.tif` or `.tiff` file. |
+| Create Empty Label | Create an all-zero label layer with the same shape as the current image. This is useful when no existing label map is available and the user wants to start manual annotation from scratch. |
 | Only Show Contour | Display label contours instead of filled label masks, making it easier to inspect boundaries and compare labels with the raw image. |
 
 ### Display Settings
