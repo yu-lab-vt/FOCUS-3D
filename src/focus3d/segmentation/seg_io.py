@@ -355,6 +355,7 @@ def _save_current_labels(self):
     # Progress dialog
     self.save_progress = QProgressDialog('Saving...', 'Cancel', 0, 100, self)
     self.save_progress.setWindowTitle('Save Progress')
+    self.save_progress.setCancelButton(None)
     self.save_progress.setAutoClose(True)
     self.save_progress.show()
 
@@ -371,8 +372,6 @@ def _save_current_labels(self):
     )
     self.save_worker.finished.connect(self._on_save_finished)
     self.save_worker.error.connect(self._on_save_error)
-    self.save_progress.canceled.connect(self.save_worker.cancel)
-    self.save_progress.canceled.connect(self.save_thread.quit)
     self.save_thread.started.connect(self.save_worker.run)
     self.save_worker.finished.connect(self.save_thread.quit)
     self.save_worker.finished.connect(self.save_worker.deleteLater)

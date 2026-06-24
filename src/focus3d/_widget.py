@@ -91,6 +91,7 @@ from focus3d.basic.curation import (
     _exit_local_refinement_mode,
     _exit_new_label_mode,
     _get_first_image_layer_for_refine,
+    _get_label_bbox_near_click_for_local_refine,
     _get_selected_cell_bbox_3d,
     _install_local_refinement_callbacks,
     _on_brush_z_changed,
@@ -4598,7 +4599,9 @@ SegmentationWidget._get_selected_cell_bbox_3d = _get_selected_cell_bbox_3d
 SegmentationWidget._get_first_image_layer_for_refine = (
     _get_first_image_layer_for_refine
 )
-
+SegmentationWidget._get_label_bbox_near_click_for_local_refine = (
+    _get_label_bbox_near_click_for_local_refine
+)
 SegmentationWidget._enter_local_refinement_mode = _enter_local_refinement_mode
 SegmentationWidget._exit_local_refinement_mode = _exit_local_refinement_mode
 SegmentationWidget._install_local_refinement_callbacks = (
