@@ -14,8 +14,6 @@ FOCUS-3D provides a user-friendly napari plugin for interactive 3D cell segmenta
 
 ## Installation
 
-### Windows
-
 #### 1. Create a new environment
 
 ```bash
@@ -26,44 +24,17 @@ conda activate focus3d
 #### 2. Install FOCUS-3D
 
 ```bash
-pip install -U "focus-3d[all]"
+pip install -U "focus-3d[gui]"
 ```
 
-#### 3. Launch napari
-
-```bash
-python -m napari
-```
-
----
-
-### Linux
-
-#### 1. Create a new environment
-
-```bash
-conda create -n focus3d python=3.10 -y
-conda activate focus3d
-```
-
-#### 2. Install PyTorch
-
-For CUDA 12.6:
+#### 3. Install torch
+For CUDA 12.x, replace cu12x with your specific CUDA-compatible PyTorch build. For example, for CUDA 12.6:
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 ```
-
-If your CUDA version is different, please install the corresponding PyTorch version from the official PyTorch installation guide.
-
-#### 3. Install FOCUS-3D
-
-```bash
-pip install -U "focus-3d[all]"
-```
-
-#### 4. Install detectron2
-
+Please check the official PyTorch installation guide if you need another CUDA version.
+#### 4. Install detectron2 (only for Linux, required for model fine-tuning)
 ```bash
 pip install "git+https://github.com/facebookresearch/detectron2.git"
 ```
