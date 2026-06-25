@@ -148,6 +148,66 @@ def build_predictor(cfg):
     model.to(cfg.MODEL.DEVICE)
     return model
 
+def resolve_inference_device(device: str | None = None) -> str:
+    """
+    Resolve inference device to an explicit torch device string.
+
+    Returns:
+        cuda:0 / cuda:1 / ... / cpu
+    """
+    if not torch.cuda.is_available():
+        return 'cpu'
+
+    if device is None or str(device).strip() == '':
+        return 'cuda:0'
+
+    device = str(device).strip()
+
+    if device == 'cuda':
+        return 'cuda:0'
+
+    torch_device = torch.device(device)
+
+    if torch_device.type != 'cuda':
+        return str(torch_device)
+
+    dev_index = torch_device.index
+    if dev_index is None:
+        dev_index = 0
+
+    n_cuda = torch.cuda.device_count()
+    if dev_index < 0 or dev_index >= n_cuda:
+        raise RuntimeError(
+            f'Requested device cuda:{dev_index}, but PyTorch only sees '
+            f'{n_cuda} CUDA device(s). Please check the GPU selector.'
+        )
+
+    return f'cuda:{dev_index}'
+
+
+def activate_inference_device(device: str | None = None) -> str:
+    """
+    Set selected CUDA device before model construction.
+    """
+    device = resolve_inference_device(device)
+
+    if str(device).startswith('cuda') and torch.cuda.is_available():
+        torch_device = torch.device(device)
+        torch.cuda.set_device(torch_device)
+
+        print(f'[FOCUS3D inference_win] requested device: {device}')
+        print(
+            f'[FOCUS3D inference_win] current cuda device: '
+            f'cuda:{torch.cuda.current_device()}'
+        )
+        print(
+            f'[FOCUS3D inference_win] GPU name: '
+            f'{torch.cuda.get_device_name(torch_device.index)}'
+        )
+    else:
+        print('[FOCUS3D inference_win] using CPU')
+
+    return device
 
 def setup_cfg(config_file, weights_path, device: str | None = None):
     """
@@ -170,8 +230,7 @@ def setup_cfg(config_file, weights_path, device: str | None = None):
     cfg.INPUT.IMAGE_SIZE = [32, 96, 96]
     cfg.merge_from_file(config_file)
 
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = resolve_inference_device(device)
 
     cfg.MODEL.WEIGHTS = str(weights_path)
     cfg.MODEL.DEVICE = device
@@ -266,9 +325,22 @@ def infer_volume(
     # Build model
     # --------------------------------------------------------
     print('\n[Step 1] "Building config and loading model..."')
+    _emit_progress(progress_callback, 0, 'Building config and loading model...')
+    _check_cancelled(cancel_callback)
+
+    device = activate_inference_device(device)
+
+    _check_cancelled(cancel_callback)
+
     cfg = setup_cfg(config_file, weights_path, device=device)
+
+    _check_cancelled(cancel_callback)
+
     model = build_predictor(cfg)
-    device = cfg.MODEL.DEVICE if device is None else device
+
+    _check_cancelled(cancel_callback)
+
+    device = cfg.MODEL.DEVICE
 
     amp_enabled = bool(use_amp and str(device).startswith('cuda'))
     if amp_dtype == 'float16':
@@ -393,12 +465,21 @@ def infer_volume(
     skipped_coords = []
 
     pz, py, px = patch_size
-    for z0, y0, x0 in all_coords:
+    _emit_status(progress_callback, 'Generating valid inference patches...')
+    _check_cancelled(cancel_callback)
+
+    for idx, (z0, y0, x0) in enumerate(all_coords):
+        if idx % 16 == 0:
+            _check_cancelled(cancel_callback)
+
         patch = padded_volume[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px]
+
         if np.percentile(patch, 99.9) < background_threshold_norm:
             skipped_coords.append((z0, y0, x0))
         else:
             infer_coords.append((z0, y0, x0))
+
+    _check_cancelled(cancel_callback)
 
     log_info['num_infer_patches'] = int(len(infer_coords))
     log_info['num_skipped_background_patches'] = int(len(skipped_coords))
@@ -472,7 +553,10 @@ def infer_volume(
         _check_cancelled(cancel_callback)
 
         for sample in inputs:
+            _check_cancelled(cancel_callback)
             sample['image'] = sample['image'].to(device, non_blocking=True)
+
+        _check_cancelled(cancel_callback)
 
         with (
             torch.inference_mode(),
@@ -484,7 +568,11 @@ def infer_volume(
         ):
             batch_outputs = model(inputs)
 
+        _check_cancelled(cancel_callback)
+
         for sample, model_output in zip(inputs, batch_outputs, strict=False):
+            _check_cancelled(cancel_callback)
+
             z0, y0, x0 = sample['coord']
 
             post = patch_postprocess_argmax(
@@ -654,6 +742,7 @@ def infer_volume(
     confidence_path = output_dir / f'{stem}_confidence_map.tif'
     log_path = output_dir / f'{stem}_log.json'
 
+    _check_cancelled(cancel_callback)
     save_volume(instance_path, instance_map.astype(np.uint32))
     save_volume(confidence_path, confidence_map.astype(np.float32))
 
@@ -745,20 +834,39 @@ def read_volume(image_path: str | Path) -> np.ndarray:
 def save_volume(output_path: str | Path, volume: np.ndarray) -> None:
     """
     Save a volume either as .tif/.tiff or .zarr based on file extension.
+    TIFF is saved with Z/Y/X axes metadata.
     """
     output_path = str(output_path)
     suffix = Path(output_path).suffix.lower()
 
+    volume = np.asarray(volume)
+    volume = np.squeeze(volume)
+
+    if volume.ndim != 3:
+        raise ValueError(
+            f'Expected 3D volume in Z/Y/X order, got shape={volume.shape}.'
+        )
+
     if suffix in ['.tif', '.tiff']:
-        tifffile.imwrite(output_path, volume)
+        tifffile.imwrite(
+            output_path,
+            volume,
+            bigtiff=True,
+            ome=True,
+            metadata={'axes': 'ZYX'},
+            photometric='minisblack',
+            compression='zlib',
+        )
     elif suffix == '.zarr':
         z = zarr.open(
-            output_path, mode='w', shape=volume.shape, dtype=volume.dtype
+            output_path,
+            mode='w',
+            shape=volume.shape,
+            dtype=volume.dtype,
         )
         z[:] = volume
     else:
         raise ValueError(f'Unsupported output format: {output_path}')
-
 
 def normalize_img(
     volume: np.ndarray,
