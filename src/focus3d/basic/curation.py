@@ -330,22 +330,36 @@ def _get_one_click_backend_name():
     Select backend for one-click segmentation.
 
     Default:
-        Windows -> inference_win.py
-        Linux   -> inference.py
+        Use the portable PyTorch backend on all platforms.
 
     Override:
-        CELLSEG_FOCUS3D_BACKEND=windows
+        CELLSEG_FOCUS3D_BACKEND=pytorch
         CELLSEG_FOCUS3D_BACKEND=detectron2
+
+    Notes:
+        - 'windows' and 'win' are kept as backward-compatible aliases
+          for the portable PyTorch backend.
+        - 'detectron2' is optional and may depend on the user's local
+          torch/CUDA/detectron2 build compatibility.
     """
     backend = os.environ.get('CELLSEG_FOCUS3D_BACKEND', 'auto').strip().lower()
 
-    if backend in {'windows', 'win', 'nod2', 'no_detectron2', 'pytorch'}:
-        return 'windows'
+    if backend in {
+        'auto',
+        'pytorch',
+        'torch',
+        'portable',
+        'windows',
+        'win',
+        'nod2',
+        'no_detectron2',
+    }:
+        return 'pytorch'
 
     if backend in {'detectron2', 'd2', 'linux'}:
         return 'detectron2'
 
-    return 'windows' if os.name == 'nt' else 'detectron2'
+    return 'pytorch'
 
 
 def _normalize_one_click_cuda_visible_devices(cuda_visible_devices=None):
@@ -532,7 +546,7 @@ class OneClickModelLoadWorker(QObject):
                 f'Importing {backend_name} one-click backend...',
             )
 
-            if backend_name == 'windows':
+            if backend_name in {'pytorch', 'windows'}:
                 from focus3d.segmentation.FOCUS3D.inference_win import (
                     build_predictor,
                     setup_cfg,
@@ -542,7 +556,6 @@ class OneClickModelLoadWorker(QObject):
                     build_predictor,
                     setup_cfg,
                 )
-
             self.progress.emit(45, 'Building model configuration...')
 
             # Prefer setup_cfg(..., device=device).

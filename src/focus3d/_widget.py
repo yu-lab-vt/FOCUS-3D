@@ -2894,6 +2894,41 @@ class SegmentationWidget(QWidget):
         if folder:
             self.finetune_checkpoint_save_edit.setText(folder)
 
+    @staticmethod
+    def _check_finetune_backend_available():
+        """
+        Check dependencies required by fine-tuning.
+
+        Fine-tuning requires the Detectron2/Mask2Former training backend.
+        One-click segmentation does not require this backend by default.
+        """
+        missing = []
+
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            missing.append('torch')
+
+        try:
+            import torchvision  # noqa: F401
+        except Exception:
+            missing.append('torchvision')
+
+        try:
+            import detectron2  # noqa: F401
+        except Exception:
+            missing.append('detectron2')
+
+        try:
+            from focus3d.segmentation.FOCUS3D import fine_tune  # noqa: F401
+        except Exception as e:
+            missing.append(f'FOCUS3D fine_tune backend ({e})')
+
+        if missing:
+            return False, missing
+
+        return True, []
+
     def _run_finetune_from_curated_patches(self):
         curated_dir = self.curated_patch_save_dir_edit.text().strip()
         output_dir = self.finetune_checkpoint_save_edit.text().strip()
@@ -2945,6 +2980,16 @@ class SegmentationWidget(QWidget):
             self.checkpoint_edit.setText(init_checkpoint)
 
         cuda_visible_devices = self._selected_cuda_visible_devices()
+
+        ok, missing = self._check_finetune_backend_available()
+        if not ok:
+            notifications.show_error(
+                'Fine-tuning requires the Detectron2 training backend.\n\n'
+                'Missing or failed dependency:\n'
+                + '\n'.join(f'- {m}' for m in missing)
+                + '\n\nPlease install Detectron2 following the official guide before running fine-tuning.'
+            )
+            return
 
         self.finetune_progress_dialog = QProgressDialog(
             'Preparing fine-tuning...', 'Cancel', 0, 100, self

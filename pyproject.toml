@@ -1,6 +1,6 @@
 [project]
 name = "focus-3d"
-version = "0.1.5"
+version = "0.1.6"
 description = "FOCUS-3D: a user-friendly napari plugin for interactive 3D cell segmentation, curation, and analysis"
 readme = "README.md"
 license = "BSD-3-Clause"
