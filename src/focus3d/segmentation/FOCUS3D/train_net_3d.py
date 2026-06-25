@@ -26,6 +26,12 @@ from detectron2.projects.deeplab import add_deeplab_config, build_lr_scheduler
 from detectron2.solver.build import maybe_add_gradient_clipping
 from detectron2.utils.logger import setup_logger
 
+from pathlib import Path
+import sys
+
+FOCUS3D_ROOT = Path(__file__).resolve().parent
+if str(FOCUS3D_ROOT) not in sys.path:
+    sys.path.insert(0, str(FOCUS3D_ROOT))
 # Import the modified components (ensure they are registered)
 from mask2former import add_maskformer2_config
 from mask2former.data.data_mapper import (

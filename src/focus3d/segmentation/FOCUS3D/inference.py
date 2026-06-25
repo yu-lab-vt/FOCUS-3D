@@ -4,7 +4,11 @@ import math
 import time
 import csv
 from pathlib import Path
+import sys
 from typing import Dict, List, Optional, Tuple, Union
+FOCUS3D_ROOT = Path(__file__).resolve().parent
+if str(FOCUS3D_ROOT) not in sys.path:
+    sys.path.insert(0, str(FOCUS3D_ROOT))
 from mask2former import add_maskformer2_config
 from detectron2.config import get_cfg
 from detectron2.modeling import build_model
