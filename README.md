@@ -21,13 +21,7 @@ conda create -n focus3d python=3.10 -y
 conda activate focus3d
 ```
 
-#### 2. Install FOCUS-3D
-
-```bash
-pip install -U "focus-3d[gui]"
-```
-
-#### 3. Install torch
+#### 2. Install torch
 For CUDA 12.x, replace cu12x with your specific CUDA-compatible PyTorch build. For example, for CUDA 12.6:
 
 ```bash
@@ -35,12 +29,18 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 ```
 Please check the official PyTorch installation guide if you need another CUDA version.
 
+#### 3. Install FOCUS-3D
+
+```bash
+pip install -U "focus-3d[gui]"
+```
+
 #### 4. Install detectron2 (only for Linux)
 For Linux, FOCUS-3D requires Detectron2 for segmentation model training and inference. Please install Detectron2 according to the official guide:
 
 https://detectron2.readthedocs.io/en/latest/tutorials/install.html
 
-For most Linux/macOS environments, the official source installation command is:
+For most Linux environments, the official source installation command is:
 
 ```bash
 python -m pip install 'git+https://github.com/facebookresearch/detectron2.git'
