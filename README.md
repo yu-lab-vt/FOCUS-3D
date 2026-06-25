@@ -34,7 +34,7 @@ For CUDA 12.x, replace cu12x with your specific CUDA-compatible PyTorch build. F
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 ```
 Please check the official PyTorch installation guide if you need another CUDA version.
-#### 4. Install detectron2 (only for Linux, required for model fine-tuning)
+#### 4. Install detectron2 (only for Linux)
 ```bash
 pip install "git+https://github.com/facebookresearch/detectron2.git"
 ```
