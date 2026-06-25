@@ -20,6 +20,40 @@ from skimage import io
 from zarr.convenience import copy_store
 
 
+def _prepare_zyx_label_array_for_tiff(data):
+    """
+    Convert label data to a numpy array and validate it as a 3D Z/Y/X volume.
+
+    The saved TIFF should be interpreted as:
+        Z, Y, X
+
+    not:
+        T, Y, X
+    """
+    if isinstance(data, da.Array):
+        data = data.compute()
+
+    elif isinstance(data, zarr.Array):
+        data = np.asarray(data)
+
+    else:
+        data = np.asarray(data)
+
+    data = np.squeeze(data)
+
+    if data.ndim != 3:
+        raise ValueError(
+            f'Expected 3D labels in Z/Y/X order before saving TIFF, '
+            f'got shape={data.shape}.'
+        )
+
+    # Labels should stay integer. Keep existing dtype if possible.
+    if not np.issubdtype(data.dtype, np.integer):
+        data = data.astype(np.uint32, copy=False)
+
+    return data
+
+
 class SaveWorker(QObject):
     """Worker for saving labels in the background."""
 
@@ -56,16 +90,23 @@ class SaveWorker(QObject):
             base = os.path.join(self.save_dir, f'labels_{timestamp}')
 
             if self.save_format.startswith('TIFF'):
-                self.progress.emit(30, 'Saving as TIFF...')
-                filename = base + '.tif'
-                if isinstance(data, da.Array):
-                    data = data.compute()
-                with tifffile.TiffWriter(filename, bigtiff=True) as tif:
-                    tif.write(
-                        data, photometric='minisblack', compression='zlib'
-                    )
-                self.progress.emit(100, 'TIFF saved.')
-                self.finished.emit(f'Saved TIFF to {filename}')
+                self.progress.emit(30, 'Saving as 3D TIFF Z/Y/X...')
+                filename = base + '.ome.tif'
+
+                data = _prepare_zyx_label_array_for_tiff(data)
+
+                tifffile.imwrite(
+                    filename,
+                    data,
+                    bigtiff=True,
+                    ome=True,
+                    metadata={'axes': 'ZYX'},
+                    photometric='minisblack',
+                    compression='zlib',
+                )
+
+                self.progress.emit(100, '3D TIFF saved.')
+                self.finished.emit(f'Saved 3D TIFF Z/Y/X to {filename}')
             else:  # Zarr
                 self.progress.emit(30, 'Saving as Zarr...')
                 store_path = base + '.zarr'
@@ -277,7 +318,14 @@ def _show_segmentation_tif(self):
             layer.edge_width = 1
             layer.opacity = 0.8
         else:
-            data = io.imread(filepath)
+            data = tifffile.imread(filepath)
+            data = np.squeeze(data)
+
+            if data.ndim != 3:
+                notifications.show_error(
+                    f'Loaded TIFF is not a 3D Z/Y/X volume. Got shape={data.shape}.'
+                )
+                return
             layer = self.viewer.add_labels(
                 data, name=os.path.basename(filepath)
             )
@@ -397,18 +445,6 @@ def _save_labels(self, labels: np.ndarray, base_filename: str):
     filepath = os.path.join(save_dir, base_filename)
     io.imsave(filepath, labels.astype(np.uint16))
     notifications.show_info(f'Saved to {filepath}')
-
-
-def _save_labels_tiff(self, data):
-    save_dir = self.path_edit.text()
-    os.makedirs(save_dir, exist_ok=True)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = os.path.join(save_dir, f'labels_{timestamp}.tif')
-    if isinstance(data, da.Array):
-        data = data.compute()
-    with tifffile.TiffWriter(filename, bigtiff=True) as tif:
-        tif.write(data, photometric='minisblack', compression='zlib')
-    notifications.show_info(f'Saved TIFF to {filename}')
 
 
 def _save_labels_zarr(self, data):

@@ -348,18 +348,139 @@ def _get_one_click_backend_name():
     return 'windows' if os.name == 'nt' else 'detectron2'
 
 
+def _normalize_one_click_cuda_visible_devices(cuda_visible_devices=None):
+    """
+    Normalize CUDA_VISIBLE_DEVICES text from UI.
+
+    Examples:
+        None -> None
+        '' -> None
+        '0' -> '0'
+        '1' -> '1'
+        '0,1' -> '0,1'
+    """
+    if cuda_visible_devices is None:
+        return None
+
+    text = str(cuda_visible_devices).strip()
+    if text == '':
+        return None
+
+    text = text.replace(' ', '')
+    text = text.replace(';', ',')
+
+    ids = [x for x in text.split(',') if x != '']
+    if len(ids) == 0:
+        return None
+
+    return ','.join(ids)
+
+
+def _normalize_one_click_device(device=None, cuda_visible_devices=None):
+    """
+    Resolve one-click inference device to an explicit and valid torch device.
+    """
+    try:
+        import torch
+    except Exception:
+        return 'cpu'
+
+    if not torch.cuda.is_available():
+        return 'cpu'
+
+    if device is not None and str(device).strip() != '':
+        device = str(device).strip()
+    else:
+        cuda_visible_devices = _normalize_one_click_cuda_visible_devices(
+            cuda_visible_devices
+        )
+
+        if cuda_visible_devices:
+            first_gpu = cuda_visible_devices.split(',')[0].strip()
+            if first_gpu.isdigit():
+                device = f'cuda:{int(first_gpu)}'
+            else:
+                device = 'cuda:0'
+        else:
+            device = 'cuda:0'
+
+    if device == 'cuda':
+        device = 'cuda:0'
+
+    torch_device = torch.device(device)
+
+    if torch_device.type != 'cuda':
+        return str(torch_device)
+
+    dev_index = torch_device.index
+    if dev_index is None:
+        dev_index = 0
+
+    n_cuda = torch.cuda.device_count()
+    if dev_index < 0 or dev_index >= n_cuda:
+        raise RuntimeError(
+            f'Requested one-click device cuda:{dev_index}, but PyTorch only sees '
+            f'{n_cuda} CUDA device(s). Please check the GPU selector.'
+        )
+
+    return f'cuda:{dev_index}'
+
+
+def _activate_one_click_torch_device(device):
+    """
+    Set selected CUDA device before building model or running clicked inference.
+    """
+    try:
+        import torch
+    except Exception:
+        return 'cpu'
+
+    device = _normalize_one_click_device(device)
+
+    if str(device).startswith('cuda') and torch.cuda.is_available():
+        torch_device = torch.device(device)
+
+        if torch_device.index is None:
+            torch_device = torch.device('cuda:0')
+            device = 'cuda:0'
+
+        torch.cuda.set_device(torch_device)
+
+        print(
+            f'[FOCUS3D one-click] active device={device}, '
+            f'current_device=cuda:{torch.cuda.current_device()}, '
+            f'gpu={torch.cuda.get_device_name(torch_device.index)}',
+            flush=True,
+        )
+
+    else:
+        print('[FOCUS3D one-click] active device=cpu', flush=True)
+
+    return device
+
+
 def _make_one_click_model_cache_key(
     config_file,
     weights_path,
     cuda_visible_devices=None,
+    device=None,
 ):
     backend_name = _get_one_click_backend_name()
+
+    cuda_visible_devices = _normalize_one_click_cuda_visible_devices(
+        cuda_visible_devices
+    )
+    device = _normalize_one_click_device(
+        device=device,
+        cuda_visible_devices=cuda_visible_devices,
+    )
 
     return (
         backend_name,
         str(Path(config_file).expanduser().resolve()),
         str(Path(weights_path).expanduser().resolve()),
         str(cuda_visible_devices),
+        str(device),
     )
 
 
@@ -371,7 +492,7 @@ class OneClickModelLoadWorker(QObject):
     """
 
     progress = Signal(int, str)
-    finished = Signal(object, object)  # model, cache_key
+    finished = Signal(object, object, object)  # model, cache_key, runtime_info
     error = Signal(str)
 
     def __init__(
@@ -380,21 +501,28 @@ class OneClickModelLoadWorker(QObject):
         weights_path,
         cache_key,
         cuda_visible_devices=None,
+        device=None,
     ):
         super().__init__()
         self.config_file = str(config_file)
         self.weights_path = str(weights_path)
         self.cache_key = cache_key
-        self.cuda_visible_devices = cuda_visible_devices
+        self.cuda_visible_devices = _normalize_one_click_cuda_visible_devices(
+            cuda_visible_devices
+        )
+        self.device = _normalize_one_click_device(
+            device=device,
+            cuda_visible_devices=self.cuda_visible_devices,
+        )
 
     def run(self):
         try:
             self.progress.emit(5, 'Preparing one-click segmentation model...')
 
-            if self.cuda_visible_devices:
-                os.environ['CUDA_VISIBLE_DEVICES'] = str(
-                    self.cuda_visible_devices
-                )
+            # Keep this only as metadata / compatibility.
+            # The real in-process control is torch.cuda.set_device + model.to(device).
+
+            device = _activate_one_click_torch_device(self.device)
 
             backend_name = _get_one_click_backend_name()
 
@@ -415,13 +543,52 @@ class OneClickModelLoadWorker(QObject):
                 )
 
             self.progress.emit(45, 'Building model configuration...')
-            cfg = setup_cfg(self.config_file, self.weights_path)
+
+            # Prefer setup_cfg(..., device=device).
+            # Keep fallback for older inference_win.py that may not accept device.
+            try:
+                cfg = setup_cfg(
+                    self.config_file,
+                    self.weights_path,
+                    device=device,
+                )
+            except TypeError:
+                cfg = setup_cfg(self.config_file, self.weights_path)
+
+                # Force cfg.MODEL.DEVICE if possible.
+                try:
+                    cfg.defrost()
+                    cfg.MODEL.DEVICE = device
+                    cfg.freeze()
+                except Exception:
+                    pass
 
             self.progress.emit(65, 'Loading model weights...')
             model = build_predictor(cfg)
 
+            # Extra safety: force model onto selected device even if build_predictor missed it.
+            try:
+                model.to(device)
+                model.eval()
+            except Exception:
+                pass
+
+            runtime_info = {
+                'backend_name': backend_name,
+                'cuda_visible_devices': self.cuda_visible_devices,
+                'device': device,
+            }
+
+            print(
+                f'[FOCUS3D one-click model loaded] '
+                f'backend={backend_name}, '
+                f'CUDA_VISIBLE_DEVICES={self.cuda_visible_devices}, '
+                f'device={device}',
+                flush=True,
+            )
+
             self.progress.emit(100, 'One-click segmentation model loaded.')
-            self.finished.emit(model, self.cache_key)
+            self.finished.emit(model, self.cache_key, runtime_info)
 
         except Exception:
             self.error.emit(traceback.format_exc())
@@ -451,6 +618,8 @@ class ClickedLocalRefineWorker(QObject):
         click_prob_thresh=0.10,
         mask_thresh=0.50,
         min_voxels=20,
+        cuda_visible_devices=None,
+        device=None,
     ):
         super().__init__()
         self.image_input = image_input
@@ -458,25 +627,34 @@ class ClickedLocalRefineWorker(QObject):
         self.config_file = str(config_file)
         self.weights_path = str(weights_path)
         self.model = model
+
         if self.model is None:
             raise ValueError(
                 'ClickedLocalRefineWorker requires a pre-loaded model. '
                 'Please call _load_one_click_segmentation_model_once(self) before starting the worker.'
             )
+
         self.patch_size = tuple(int(v) for v in patch_size)
         self.score_thresh = float(score_thresh)
         self.click_prob_thresh = float(click_prob_thresh)
         self.mask_thresh = float(mask_thresh)
         self.min_voxels = int(min_voxels)
 
+        self.cuda_visible_devices = _normalize_one_click_cuda_visible_devices(
+            cuda_visible_devices
+        )
+        self.device = _normalize_one_click_device(
+            device=device,
+            cuda_visible_devices=self.cuda_visible_devices,
+        )
+
     def run(self):
         try:
             self.progress.emit(
                 5, 'Preparing clicked one-click segmentation...'
             )
+            device = _activate_one_click_torch_device(self.device)
 
-            # curation.py is in src/focus3d/basic/curation.py
-            # Mask2former root is src/focus3d/segmentation/Mask2former
             self.progress.emit(15, 'Importing clicked inference modules...')
 
             from focus3d.segmentation.FOCUS3D.click_inference import (
@@ -490,6 +668,10 @@ class ClickedLocalRefineWorker(QObject):
                 backend_name,
                 '| infer_clicked_instance module=',
                 infer_clicked_instance.__module__,
+                '| device=',
+                device,
+                '| CUDA_VISIBLE_DEVICES=',
+                self.cuda_visible_devices,
                 flush=True,
             )
 
@@ -499,6 +681,13 @@ class ClickedLocalRefineWorker(QObject):
                     'One-click segmentation model is not loaded. '
                     'This should not happen if _enter_local_refinement_mode() loaded the model correctly.'
                 )
+
+            # Extra safety: model must stay on the same device used for one-click.
+            try:
+                model.to(device)
+                model.eval()
+            except Exception:
+                pass
 
             self.progress.emit(
                 45, f'Running clicked inference at zyx={self.coord_zyx}...'
@@ -523,6 +712,8 @@ class ClickedLocalRefineWorker(QObject):
                 )
 
             result['coord_zyx'] = self.coord_zyx
+            result['device'] = device
+            result['cuda_visible_devices'] = self.cuda_visible_devices
 
             if not result.get('success', False):
                 reason = result.get('reason', 'unknown reason')
@@ -536,8 +727,8 @@ class ClickedLocalRefineWorker(QObject):
             self.progress.emit(100, 'Clicked one-click segmentation finished.')
             self.finished.emit(result)
 
-        except Exception as e:
-            self.error.emit(str(e))
+        except Exception:
+            self.error.emit(traceback.format_exc())
 
 
 def _smooth_closed_polygon_yx(poly_yx, samples_per_segment=16, eps=1e-6):
@@ -1159,6 +1350,7 @@ def _start_one_click_model_loading(
     weights_path,
     cache_key,
     cuda_visible_devices=None,
+    device=None,
 ):
     """
     Start loading the one-click segmentation model in a QThread.
@@ -1172,10 +1364,26 @@ def _start_one_click_model_loading(
         )
         return
 
+    cuda_visible_devices = _normalize_one_click_cuda_visible_devices(
+        cuda_visible_devices
+    )
+    device = _normalize_one_click_device(
+        device=device,
+        cuda_visible_devices=cuda_visible_devices,
+    )
+
     self._local_refine_loading = True
     self._local_refine_pending_cache_key = cache_key
     self._local_refine_pending_config_file = str(config_file)
     self._local_refine_pending_weights_path = str(weights_path)
+    self._local_refine_pending_cuda_visible_devices = cuda_visible_devices
+    self._local_refine_pending_device = device
+
+    print(
+        f'[FOCUS3D one-click loading request] '
+        f'CUDA_VISIBLE_DEVICES={cuda_visible_devices}, device={device}',
+        flush=True,
+    )
 
     if hasattr(self, 'btn_enter_local_refinement'):
         self.btn_enter_local_refinement.setEnabled(False)
@@ -1196,6 +1404,7 @@ def _start_one_click_model_loading(
         100,
         self,
     )
+    self.local_refine_model_progress.setCancelButton(None)
     self.local_refine_model_progress.setWindowTitle(
         'One-click Segmentation Model Loading'
     )
@@ -1209,6 +1418,7 @@ def _start_one_click_model_loading(
         weights_path=weights_path,
         cache_key=cache_key,
         cuda_visible_devices=cuda_visible_devices,
+        device=device,
     )
 
     self.local_refine_model_worker.moveToThread(self.local_refine_model_thread)
@@ -1255,7 +1465,7 @@ def _start_one_click_model_loading(
     self.local_refine_model_thread.start()
 
 
-def _on_one_click_model_loaded(self, model, cache_key):
+def _on_one_click_model_loaded(self, model, cache_key, runtime_info):
     """
     Called in the main thread after the one-click model is loaded.
     """
@@ -1299,6 +1509,24 @@ def _on_one_click_model_loaded(self, model, cache_key):
         None,
     )
 
+    runtime_info = runtime_info or {}
+
+    self._local_refine_cuda_visible_devices = runtime_info.get(
+        'cuda_visible_devices',
+        getattr(self, '_local_refine_pending_cuda_visible_devices', None),
+    )
+    self._local_refine_device = runtime_info.get(
+        'device',
+        getattr(self, '_local_refine_pending_device', None),
+    )
+
+    print(
+        f'[FOCUS3D one-click active model] '
+        f'CUDA_VISIBLE_DEVICES={self._local_refine_cuda_visible_devices}, '
+        f'device={self._local_refine_device}',
+        flush=True,
+    )
+
     self._local_refine_mode_active = True
     self._local_refine_busy = False
 
@@ -1317,7 +1545,8 @@ def _on_one_click_model_loaded(self, model, cache_key):
         self.local_refine_status_label.setStyleSheet('color: #66cc66;')
 
     notifications.show_info(
-        'One-click segmentation model loaded. Click a cell to segment it.'
+        f'One-click segmentation model loaded on {self._local_refine_device}. '
+        f'Click a cell to segment it.'
     )
 
 
@@ -1349,39 +1578,6 @@ def _on_one_click_model_load_error(self, error_msg):
 
     notifications.show_error(
         f'Failed to load one-click segmentation model:\n{error_msg}'
-    )
-
-
-def _cancel_one_click_model_loading(self):
-    """
-    Mark current model loading result as ignored.
-
-    Torch model loading cannot always be force-stopped safely, so we do not kill
-    the thread. We just ignore its result when it finishes.
-    """
-    self._local_refine_load_cancelled = True
-    self._local_refine_loading = False
-
-    if (
-        hasattr(self, 'local_refine_model_progress')
-        and self.local_refine_model_progress is not None
-    ):
-        self.local_refine_model_progress.close()
-
-    if hasattr(self, 'btn_enter_local_refinement'):
-        self.btn_enter_local_refinement.setEnabled(True)
-
-    if hasattr(self, 'btn_exit_local_refinement'):
-        self.btn_exit_local_refinement.setEnabled(False)
-
-    if hasattr(self, 'local_refine_status_label'):
-        self.local_refine_status_label.setText(
-            'One-click segmentation inactive'
-        )
-        self.local_refine_status_label.setStyleSheet('color: #aaaaaa;')
-
-    notifications.show_info(
-        'One-click segmentation model loading cancellation requested.'
     )
 
 
@@ -1450,10 +1646,28 @@ def _enter_local_refinement_mode(self):
     if hasattr(self, '_selected_cuda_visible_devices'):
         cuda_visible_devices = self._selected_cuda_visible_devices()
 
+    cuda_visible_devices = _normalize_one_click_cuda_visible_devices(
+        cuda_visible_devices
+    )
+
+    if hasattr(self, '_selected_torch_device'):
+        device = self._selected_torch_device()
+    else:
+        device = _normalize_one_click_device(
+            device=None,
+            cuda_visible_devices=cuda_visible_devices,
+        )
+
+    device = _normalize_one_click_device(
+        device=device,
+        cuda_visible_devices=cuda_visible_devices,
+    )
+
     cache_key = _make_one_click_model_cache_key(
         config_file=config_real_path,
         weights_path=checkpoint_real_path,
         cuda_visible_devices=cuda_visible_devices,
+        device=device,
     )
 
     # Case 1: the correct model is already cached.
@@ -1463,6 +1677,21 @@ def _enter_local_refinement_mode(self):
     if cached_model is not None and cached_key == cache_key:
         self._local_refine_config_file = str(config_real_path)
         self._local_refine_weights_path = str(checkpoint_real_path)
+
+        self._local_refine_cuda_visible_devices = cuda_visible_devices
+        self._local_refine_device = device
+
+        try:
+            cached_model.to(device)
+            cached_model.eval()
+        except Exception:
+            pass
+
+        print(
+            f'[FOCUS3D one-click reuse model] '
+            f'CUDA_VISIBLE_DEVICES={cuda_visible_devices}, device={device}',
+            flush=True,
+        )
 
         self._local_refine_mode_active = True
         self._local_refine_busy = False
@@ -1494,6 +1723,7 @@ def _enter_local_refinement_mode(self):
         weights_path=str(checkpoint_real_path),
         cache_key=cache_key,
         cuda_visible_devices=cuda_visible_devices,
+        device=device,
     )
 
 
@@ -1566,6 +1796,7 @@ def _start_clicked_local_refinement(self, coord_zyx):
         100,
         self,
     )
+    self.local_refine_progress.setCancelButton(None)
     self.local_refine_progress.setWindowTitle('one-click segmentation')
     self.local_refine_progress.setAutoClose(True)
     self.local_refine_progress.setAutoReset(True)
@@ -1586,6 +1817,39 @@ def _start_clicked_local_refinement(self, coord_zyx):
         )
         return
 
+    cuda_visible_devices = getattr(
+        self,
+        '_local_refine_cuda_visible_devices',
+        None,
+    )
+
+    device = getattr(
+        self,
+        '_local_refine_device',
+        None,
+    )
+
+    if device is None:
+        if hasattr(self, '_selected_torch_device'):
+            device = self._selected_torch_device()
+        else:
+            device = _normalize_one_click_device(
+                device=None,
+                cuda_visible_devices=cuda_visible_devices,
+            )
+
+    device = _normalize_one_click_device(
+        device=device,
+        cuda_visible_devices=cuda_visible_devices,
+    )
+
+    print(
+        f'[FOCUS3D clicked one-click request] '
+        f'CUDA_VISIBLE_DEVICES={cuda_visible_devices}, device={device}, '
+        f'coord_zyx={coord_zyx}',
+        flush=True,
+    )
+
     self.local_refine_thread = QThread()
     self.local_refine_worker = ClickedLocalRefineWorker(
         image_input=image_input,
@@ -1598,6 +1862,8 @@ def _start_clicked_local_refinement(self, coord_zyx):
         click_prob_thresh=0.05,
         mask_thresh=0.50,
         min_voxels=10,
+        cuda_visible_devices=cuda_visible_devices,
+        device=device,
     )
 
     self.local_refine_worker.moveToThread(self.local_refine_thread)
@@ -1614,10 +1880,6 @@ def _start_clicked_local_refinement(self, coord_zyx):
     )
     self.local_refine_worker.error.connect(
         self._on_clicked_local_refinement_error
-    )
-
-    self.local_refine_progress.canceled.connect(
-        self.local_refine_thread.requestInterruption
     )
 
     self.local_refine_thread.started.connect(self.local_refine_worker.run)

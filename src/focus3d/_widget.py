@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import contextlib
 from datetime import datetime
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock
 
 import dask.array as da
 import napari
@@ -77,7 +77,6 @@ from focus3d.basic.curation import (
     _apply_delete_inside,
     _apply_new_label,
     _apply_roi,
-    _cancel_one_click_model_loading,
     _cancel_roi,
     _change_selected_label_id,
     _choose_roi_brush_color,
@@ -129,7 +128,6 @@ from focus3d.segmentation.seg_io import (
     _on_save_finished,
     _save_current_labels,
     _save_labels,
-    _save_labels_tiff,
     _save_labels_zarr,
     _show_log_file_location,
     _show_segmentation_tif,
@@ -170,13 +168,23 @@ class PatchCalculationWorker(QObject):
         super().__init__()
         self.image_data = image_data
         self.label_data = label_data
-        self.patch_size = patch_size
-        self.stride = stride
-        self.min_intensity = min_intensity
+        self.patch_size = tuple(int(v) for v in patch_size)
+        self.stride = tuple(int(v) for v in stride)
+        self.min_intensity = float(min_intensity)
+
         self._cancelled = False
+        self._cancel_event = Event()
 
     def cancel(self):
         self._cancelled = True
+        self._cancel_event.set()
+
+    def _is_cancelled_now(self):
+        return bool(
+            self._cancelled
+            or self._cancel_event.is_set()
+            or QThread.currentThread().isInterruptionRequested()
+        )
 
     @staticmethod
     def _generate_axis_starts(length, patch_len, stride_len):
@@ -188,6 +196,13 @@ class PatchCalculationWorker(QObject):
         - step by stride
         - always include the last start so the tail is covered
         """
+        length = int(length)
+        patch_len = int(patch_len)
+        stride_len = int(stride_len)
+
+        if stride_len <= 0:
+            raise ValueError('Stride must be > 0 for valid patch calculation.')
+
         if length <= 0:
             return [0]
 
@@ -225,6 +240,10 @@ class PatchCalculationWorker(QObject):
             image_data = self.image_data
             label_data = self.label_data
 
+            if self._is_cancelled_now():
+                self.finished.emit(None, None)
+                return
+
             if image_data.shape != label_data.shape:
                 self.error.emit('Image and label must have the same shape.')
                 return
@@ -241,7 +260,9 @@ class PatchCalculationWorker(QObject):
                 return
 
             all_coords = self.generate_patch_coords(
-                image_data.shape, self.patch_size, self.stride
+                image_data.shape,
+                self.patch_size,
+                self.stride,
             )
 
             valid_patches = []
@@ -251,31 +272,34 @@ class PatchCalculationWorker(QObject):
             patch_id = 1
 
             for i, (z0, y0, x0) in enumerate(all_coords):
-                if self._cancelled:
+                if self._is_cancelled_now():
                     self.finished.emit(None, None)
                     return
 
                 patch = np.asarray(
-                    image_data[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px]
+                    image_data[
+                        z0 : z0 + pz,
+                        y0 : y0 + py,
+                        x0 : x0 + px,
+                    ]
                 )
 
-                if np.max(patch) < self.min_intensity:
-                    progress = int((i + 1) / total * 100)
-                    self.progress.emit(
-                        progress,
-                        f'Checking patch {i + 1}/{total}...',
-                    )
-                    continue
+                if self._is_cancelled_now():
+                    self.finished.emit(None, None)
+                    return
 
-                info = {
-                    'id': patch_id,
-                    'start': (z0, y0, x0),
-                    'patch_size': self.patch_size,
-                    'max_intensity': float(np.max(patch)),
-                }
-                valid_patch_id_to_index[patch_id] = len(valid_patches)
-                valid_patches.append(info)
-                patch_id += 1
+                patch_max = float(np.max(patch))
+
+                if patch_max >= self.min_intensity:
+                    info = {
+                        'id': patch_id,
+                        'start': (z0, y0, x0),
+                        'patch_size': self.patch_size,
+                        'max_intensity': patch_max,
+                    }
+                    valid_patch_id_to_index[patch_id] = len(valid_patches)
+                    valid_patches.append(info)
+                    patch_id += 1
 
                 progress = int((i + 1) / total * 100)
                 self.progress.emit(
@@ -2403,12 +2427,22 @@ class SegmentationWidget(QWidget):
 
     def _detect_cuda_device_ids(self):
         """
-        Detect visible NVIDIA GPU IDs on the current machine.
+        Detect CUDA device IDs visible to the current Python process.
 
-        Returns:
-            list[str], e.g. ['0', '1', '2']
+        Important:
+            These are torch CUDA indices, e.g. cuda:0, cuda:1.
+            If CUDA_VISIBLE_DEVICES was set before launching napari,
+            cuda:0 may correspond to a different physical GPU in nvidia-smi.
         """
-        # Prefer nvidia-smi because it does not import torch.
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return [str(i) for i in range(torch.cuda.device_count())]
+        except Exception:
+            pass
+
+        # Fallback: nvidia-smi, only used when torch is unavailable.
         try:
             import subprocess
 
@@ -2421,24 +2455,93 @@ class SegmentationWidget(QWidget):
                 text=True,
                 stderr=subprocess.DEVNULL,
             )
-            ids = [
-                line.strip() for line in out.splitlines() if line.strip() != ''
-            ]
+            ids = [line.strip() for line in out.splitlines() if line.strip()]
             if ids:
                 return ids
         except Exception:
             pass
 
-        # Fallback to torch if available.
+        return []
+
+    def _selected_gpu_ids(self):
+        """
+        Return normalized GPU IDs selected in the UI.
+
+        Examples:
+            '0'   -> ['0']
+            '1'   -> ['1']
+            '0,1' -> ['0', '1']
+        """
+        text = self._selected_cuda_visible_devices()
+
+        if text is None:
+            return []
+
+        ids = []
+        for part in str(text).replace(';', ',').split(','):
+            part = part.strip()
+            if part:
+                ids.append(part)
+
+        return ids
+
+    def _selected_torch_device(self):
+        """
+        Return the exact torch device selected by the UI.
+
+        For in-process inference, always use an explicit device:
+            cuda:0
+            cuda:1
+            cpu
+
+        If the user selects multiple GPUs, the current inference backend still
+        runs on the first selected GPU unless the backend explicitly supports
+        multi-GPU inference.
+        """
         try:
             import torch
-
-            if torch.cuda.is_available():
-                return [str(i) for i in range(torch.cuda.device_count())]
         except Exception:
-            pass
+            return 'cpu'
 
-        return []
+        if not torch.cuda.is_available():
+            return 'cpu'
+
+        gpu_ids = self._selected_gpu_ids()
+
+        if len(gpu_ids) == 0:
+            return 'cuda:0'
+
+        first_gpu = gpu_ids[0]
+
+        if not first_gpu.isdigit():
+            notifications.show_warning(
+                f'Invalid GPU ID "{first_gpu}". Falling back to cuda:0.'
+            )
+            return 'cuda:0'
+
+        dev_index = int(first_gpu)
+        n_cuda = torch.cuda.device_count()
+
+        if dev_index < 0 or dev_index >= n_cuda:
+            notifications.show_warning(
+                f'Selected GPU cuda:{dev_index} is not visible to PyTorch. '
+                f'Visible CUDA device count: {n_cuda}. Falling back to cuda:0.'
+            )
+            return 'cuda:0'
+
+        return f'cuda:{dev_index}'
+
+    def _selected_gpu_runtime_params(self):
+        """
+        Return both UI-selected CUDA_VISIBLE_DEVICES text and exact torch device.
+
+        cuda_visible_devices is kept for subprocess/fine-tuning compatibility.
+        device is the reliable in-process torch device.
+        """
+        return {
+            'cuda_visible_devices': self._selected_cuda_visible_devices(),
+            'device': self._selected_torch_device(),
+        }
 
     def _populate_gpu_combo(self):
         """
@@ -3385,7 +3488,7 @@ class SegmentationWidget(QWidget):
         # ------------------------------------------------------------
         # 4. GPU selection
         # ------------------------------------------------------------
-        cuda_visible_devices = self._selected_cuda_visible_devices()
+        gpu_runtime = self._selected_gpu_runtime_params()
 
         # ------------------------------------------------------------
         # 5. Pack inference parameters
@@ -3423,9 +3526,8 @@ class SegmentationWidget(QWidget):
             'use_amp': True,
             'amp_dtype': 'float16',
             # GPU selector.
-            # Examples: '0', '1', '0,1'
-            'cuda_visible_devices': cuda_visible_devices,
-            'device': 'cuda' if cuda_visible_devices else None,
+            'cuda_visible_devices': gpu_runtime['cuda_visible_devices'],
+            'device': gpu_runtime['device'],
         }
 
         try:
@@ -3487,12 +3589,16 @@ class SegmentationWidget(QWidget):
         self.seg_worker.finished.connect(self._on_segmentation_finished)
         self.seg_worker.cancelled.connect(self._on_segmentation_cancelled)
 
-        self.progress_dialog.canceled.connect(self.seg_worker.cancel)
-        self.progress_dialog.canceled.connect(self.seg_thread.quit)
+        self.progress_dialog.canceled.connect(self._cancel_segmentation)
 
         self.seg_thread.started.connect(self.seg_worker.run)
+
         self.seg_worker.finished.connect(self.seg_thread.quit)
+        self.seg_worker.cancelled.connect(self.seg_thread.quit)
+
         self.seg_worker.finished.connect(self.seg_worker.deleteLater)
+        self.seg_worker.cancelled.connect(self.seg_worker.deleteLater)
+
         self.seg_thread.finished.connect(self.seg_thread.deleteLater)
 
         self.seg_thread.start()
@@ -3922,6 +4028,32 @@ class SegmentationWidget(QWidget):
             name='selected_patch_box',
         )
 
+    def _cancel_patch_calculation(self):
+        """
+        Cancel Calculate Valid Patches immediately.
+
+        Important:
+            Do not call thread.quit() directly here.
+            The worker must exit by itself after seeing the cancel flag.
+        """
+        worker = getattr(self, 'patch_calc_worker', None)
+        thread = getattr(self, 'patch_calc_thread', None)
+
+        if worker is not None:
+            worker.cancel()
+
+        if thread is not None:
+            thread.requestInterruption()
+
+        if (
+            hasattr(self, 'patch_calc_progress')
+            and self.patch_calc_progress is not None
+        ):
+            self.patch_calc_progress.setLabelText(
+                'Cancelling patch calculation...'
+            )
+            self.patch_calc_progress.setCancelButton(None)
+
     def _start_calculate_valid_patches(self):
         """Start valid patch calculation in a background thread."""
         self._clear_valid_patch_overlay(restore_curation=False, notify=False)
@@ -3977,10 +4109,14 @@ class SegmentationWidget(QWidget):
             self._on_calculate_valid_patches_error
         )
 
-        self.patch_calc_progress.canceled.connect(
-            self.patch_calc_worker.cancel
+        self.patch_calc_worker.error.connect(self.patch_calc_thread.quit)
+        self.patch_calc_worker.error.connect(
+            self.patch_calc_worker.deleteLater
         )
-        self.patch_calc_progress.canceled.connect(self.patch_calc_thread.quit)
+
+        self.patch_calc_progress.canceled.connect(
+            self._cancel_patch_calculation
+        )
 
         self.patch_calc_thread.started.connect(self.patch_calc_worker.run)
         self.patch_calc_worker.finished.connect(self.patch_calc_thread.quit)
@@ -4318,6 +4454,29 @@ class SegmentationWidget(QWidget):
         except Exception as e:
             notifications.show_warning(f'Failed to select patch: {e}')
 
+    def _cancel_segmentation(self):
+        """
+        Request cancellation for Run 3D Segmentation.
+
+        Do not call seg_thread.quit() directly.
+        The inference loop should stop after seeing cancel_callback=True.
+        """
+        worker = getattr(self, 'seg_worker', None)
+        thread = getattr(self, 'seg_thread', None)
+
+        if worker is not None:
+            worker.cancel()
+
+        if thread is not None:
+            thread.requestInterruption()
+
+        if (
+            hasattr(self, 'progress_dialog')
+            and self.progress_dialog is not None
+        ):
+            self.progress_dialog.setLabelText('Cancelling segmentation...')
+            self.progress_dialog.setCancelButton(None)
+
     def _choose_and_curate_patch(self):
         """Open the selected valid patch in a new napari viewer and reuse SegmentationWidget for curation."""
         if len(self.valid_patches) == 0:
@@ -4589,7 +4748,6 @@ SegmentationWidget._save_current_labels = _save_current_labels
 SegmentationWidget._on_save_finished = _on_save_finished
 SegmentationWidget._on_save_error = _on_save_error
 SegmentationWidget._save_labels = _save_labels
-SegmentationWidget._save_labels_tiff = _save_labels_tiff
 SegmentationWidget._save_labels_zarr = _save_labels_zarr
 SegmentationWidget._export_log = _export_log
 
@@ -4667,9 +4825,6 @@ SegmentationWidget._start_one_click_model_loading = (
 SegmentationWidget._on_one_click_model_loaded = _on_one_click_model_loaded
 SegmentationWidget._on_one_click_model_load_error = (
     _on_one_click_model_load_error
-)
-SegmentationWidget._cancel_one_click_model_loading = (
-    _cancel_one_click_model_loading
 )
 SegmentationWidget._run_morphometry_analysis = _lazy_run_morphometry_analysis
 SegmentationWidget._on_morphometry_finished = _lazy_on_morphometry_finished

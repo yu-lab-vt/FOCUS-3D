@@ -1,6 +1,7 @@
 import traceback
+from threading import Event
 
-from qtpy.QtCore import QObject, Signal
+from qtpy.QtCore import QObject, QThread, Signal
 
 
 class SegmentationWorker(QObject):
@@ -21,15 +22,21 @@ class SegmentationWorker(QObject):
         self.checkpoint = checkpoint
         self.seg_params = seg_params or {}
         self._is_cancelled = False
+        self._cancel_event = Event()
 
     def cancel(self):
         self._is_cancelled = True
+        self._cancel_event.set()
 
     def _progress_callback(self, value, message):
         self.progress.emit(int(value), str(message))
 
     def _is_cancelled_callback(self):
-        return self._is_cancelled
+        return bool(
+            self._is_cancelled
+            or self._cancel_event.is_set()
+            or QThread.currentThread().isInterruptionRequested()
+        )
 
     def run(self):
         try:
@@ -46,7 +53,7 @@ class SegmentationWorker(QObject):
             if not output_dir:
                 raise ValueError('save_path is empty.')
 
-            if self._is_cancelled:
+            if self._is_cancelled_callback():
                 self.cancelled.emit()
                 return
 
@@ -115,7 +122,7 @@ class SegmentationWorker(QObject):
                 cancel_callback=self._is_cancelled_callback,
             )
 
-            if self._is_cancelled:
+            if self._is_cancelled_callback():
                 self.cancelled.emit()
                 return
 
@@ -123,7 +130,7 @@ class SegmentationWorker(QObject):
             self.finished.emit(result, '')
 
         except RuntimeError as e:
-            if str(e) == '__SEG_CANCELLED__':
+            if '__SEG_CANCELLED__' in str(e):
                 self.cancelled.emit()
                 return
             self.finished.emit(

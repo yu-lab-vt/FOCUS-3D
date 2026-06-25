@@ -25,6 +25,118 @@ INFERENCE_PY_WINDOWS = MASK2FORMER_DIR / 'inference_win.py'
 _INFERENCE_MODULE_CACHE = {}
 
 
+def _normalize_cuda_visible_devices(cuda_visible_devices=None):
+    """
+    Normalize CUDA_VISIBLE_DEVICES-like text from UI.
+
+    Examples:
+        None -> None
+        '' -> None
+        '0' -> '0'
+        '1' -> '1'
+        '0,1' -> '0,1'
+    """
+    if cuda_visible_devices is None:
+        return None
+
+    text = str(cuda_visible_devices).strip()
+    if text == '':
+        return None
+
+    text = text.replace(' ', '')
+    text = text.replace(';', ',')
+
+    ids = [x for x in text.split(',') if x != '']
+    if len(ids) == 0:
+        return None
+
+    return ','.join(ids)
+
+
+def _normalize_torch_device(device=None, cuda_visible_devices=None):
+    """
+    Resolve device to an explicit torch device string.
+
+    Good:
+        cuda:0
+        cuda:1
+        cpu
+
+    Avoid:
+        cuda
+        None
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return 'cpu'
+
+    cuda_visible_devices = _normalize_cuda_visible_devices(
+        cuda_visible_devices
+    )
+
+    if device is None or str(device).strip() == '':
+        if cuda_visible_devices:
+            first = cuda_visible_devices.split(',')[0].strip()
+            device = f'cuda:{int(first)}' if first.isdigit() else 'cuda:0'
+        else:
+            device = 'cuda:0'
+    else:
+        device = str(device).strip()
+
+    if device == 'cuda':
+        device = 'cuda:0'
+
+    torch_device = torch.device(device)
+
+    if torch_device.type != 'cuda':
+        return str(torch_device)
+
+    dev_index = torch_device.index
+    if dev_index is None:
+        dev_index = 0
+
+    n_cuda = torch.cuda.device_count()
+    if dev_index < 0 or dev_index >= n_cuda:
+        raise RuntimeError(
+            f'Requested device cuda:{dev_index}, but PyTorch only sees '
+            f'{n_cuda} CUDA device(s). '
+            f'Please check the GPU selector and CUDA_VISIBLE_DEVICES.'
+        )
+
+    return f'cuda:{dev_index}'
+
+
+def _activate_torch_device(device):
+    """
+    Make selected CUDA device current before model construction.
+    """
+    import torch
+
+    device = _normalize_torch_device(device)
+
+    if str(device).startswith('cuda') and torch.cuda.is_available():
+        torch_device = torch.device(device)
+        torch.cuda.set_device(torch_device)
+
+        print(
+            f'[FOCUS3D adapter] activated torch device: {device}',
+            flush=True,
+        )
+        print(
+            f'[FOCUS3D adapter] current cuda device: cuda:{torch.cuda.current_device()}',
+            flush=True,
+        )
+        print(
+            f'[FOCUS3D adapter] GPU name: {torch.cuda.get_device_name(torch_device.index)}',
+            flush=True,
+        )
+    else:
+        print('[FOCUS3D adapter] activated torch device: cpu', flush=True)
+
+    return device
+
+
 def _resolve_relative_to_mask2former(path: str | Path) -> str:
     """
     Resolve config / checkpoint path.
@@ -226,21 +338,45 @@ def run_mask2former_inference(
     weights_path: str | Path,
     output_dir: str | Path,
     cuda_visible_devices: str | None = None,
+    device: str | None = None,
     **kwargs: Any,
 ) -> dict:
     """
     Stable UI-side wrapper for Mask2Former infer_volume().
 
     The UI calls this function.
-    This function calls segmentation/Mask2former/inference.py::infer_volume().
-    Mask2former folder itself does not need to be modified.
+    This function calls segmentation/FOCUS3D/inference.py::infer_volume().
     """
-    if (
-        cuda_visible_devices is not None
-        and str(cuda_visible_devices).strip() != ''
-    ):
-        # This is only fully effective if torch has not been imported yet.
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(cuda_visible_devices).strip()
+    # Backward compatibility:
+    # If an older caller passes device through kwargs, consume it here.
+    if device is None:
+        device = kwargs.pop('device', None)
+    else:
+        kwargs.pop('device', None)
+
+    cuda_visible_devices = _normalize_cuda_visible_devices(
+        cuda_visible_devices
+    )
+
+    device = _normalize_torch_device(
+        device=device,
+        cuda_visible_devices=cuda_visible_devices,
+    )
+
+    # Important:
+    # Do NOT rely on changing CUDA_VISIBLE_DEVICES inside a running napari process.
+    # PyTorch may already be imported/initialized. The reliable control path is:
+    # torch.cuda.set_device + infer_volume(device='cuda:N').
+    #
+    # Keep cuda_visible_devices as metadata only. For subprocess training it can
+    # still be useful, but for in-process inference use explicit torch device.
+    device = _activate_torch_device(device)
+
+    print(
+        f'[FOCUS3D adapter] run_mask2former_inference: '
+        f'CUDA_VISIBLE_DEVICES={cuda_visible_devices}, device={device}',
+        flush=True,
+    )
 
     output_dir_abs = _resolve_output_dir(output_dir)
     config_file_abs = _resolve_relative_to_mask2former(config_file)
@@ -265,17 +401,30 @@ def run_mask2former_inference(
         config_file=config_file_abs,
         weights_path=weights_path_abs,
         output_dir=output_dir_abs,
+        device=device,
         **kwargs,
     )
 
-    # Future-proof: only pass arguments supported by the current infer_volume().
+    # Future-proof:
+    # only pass arguments supported by the current infer_volume().
     signature = inspect.signature(infer_volume)
     supported = set(signature.parameters.keys())
     call_kwargs = {k: v for k, v in call_kwargs.items() if k in supported}
 
+    print(
+        f'[FOCUS3D adapter] infer_volume device argument: '
+        f'{call_kwargs.get("device")}',
+        flush=True,
+    )
+
     try:
         with _temporarily_chdir(MASK2FORMER_DIR):
             result = infer_volume(**call_kwargs)
+
+        if isinstance(result, dict):
+            result.setdefault('device', device)
+            result.setdefault('cuda_visible_devices', cuda_visible_devices)
+
         return result
 
     finally:
