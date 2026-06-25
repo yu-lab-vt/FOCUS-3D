@@ -2516,13 +2516,21 @@ class SegmentationWidget(QWidget):
         """
         Default checkpoint path shown in UI.
 
-        Keep it relative to Mask2former root, so it works on both Windows and Linux.
+        Relative path is interpreted from:
+            src/focus3d/segmentation/FOCUS3D
+
         Actual path:
-            segmentation/Mask2former/model_final.pth
-        UI text:
-            model_final.pth
+            example/checkpoint/model_final.pth
         """
-        return 'model_final.pth'
+        return str(
+            Path('..')
+            / '..'
+            / '..'
+            / '..'
+            / 'example'
+            / 'checkpoint'
+            / 'model_final.pth'
+        )
 
     def _default_mask2former_config_text(self) -> str:
         """
@@ -2742,10 +2750,21 @@ class SegmentationWidget(QWidget):
         return str(p)
 
     def _browse_mask2former_checkpoint(self):
+        default_dir = (
+            self._mask2former_root()
+            / '..'
+            / '..'
+            / '..'
+            / '..'
+            / 'example'
+            / 'checkpoint'
+        )
+        default_dir = default_dir.resolve()
+
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             'Select Checkpoint File',
-            str(self._mask2former_root()),
+            str(default_dir),
             'Checkpoint files (*.pth *.pt *.ckpt);;All files (*)',
         )
         if file_path:
