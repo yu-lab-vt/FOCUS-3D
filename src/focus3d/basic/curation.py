@@ -378,7 +378,11 @@ def _normalize_one_click_cuda_visible_devices(cuda_visible_devices=None):
 
 def _normalize_one_click_device(device=None, cuda_visible_devices=None):
     """
-    Resolve one-click inference device to an explicit and valid torch device.
+    Resolve one-click inference device to an explicit torch device.
+
+    Important:
+        In the napari process, GPU IDs are PyTorch-visible CUDA indices.
+        Do not reinterpret them as physical CUDA_VISIBLE_DEVICES IDs.
     """
     try:
         import torch
@@ -388,24 +392,21 @@ def _normalize_one_click_device(device=None, cuda_visible_devices=None):
     if not torch.cuda.is_available():
         return 'cpu'
 
-    if device is not None and str(device).strip() != '':
-        device = str(device).strip()
+    if device is None or str(device).strip() == '':
+        device = 'cuda:0'
     else:
-        cuda_visible_devices = _normalize_one_click_cuda_visible_devices(
-            cuda_visible_devices
-        )
-
-        if cuda_visible_devices:
-            first_gpu = cuda_visible_devices.split(',')[0].strip()
-            if first_gpu.isdigit():
-                device = f'cuda:{int(first_gpu)}'
-            else:
-                device = 'cuda:0'
-        else:
-            device = 'cuda:0'
+        device = str(device).strip()
 
     if device == 'cuda':
         device = 'cuda:0'
+
+    # Accept UI values like "0", "1", "0,1" as torch-visible ids.
+    if device.isdigit():
+        device = f'cuda:{int(device)}'
+
+    if ',' in device:
+        first = device.split(',')[0].strip()
+        device = f'cuda:{int(first)}' if first.isdigit() else 'cuda:0'
 
     torch_device = torch.device(device)
 
@@ -575,7 +576,6 @@ class OneClickModelLoadWorker(QObject):
 
             runtime_info = {
                 'backend_name': backend_name,
-                'cuda_visible_devices': self.cuda_visible_devices,
                 'device': device,
             }
 
@@ -1380,8 +1380,7 @@ def _start_one_click_model_loading(
     self._local_refine_pending_device = device
 
     print(
-        f'[FOCUS3D one-click loading request] '
-        f'CUDA_VISIBLE_DEVICES={cuda_visible_devices}, device={device}',
+        f'[FOCUS3D one-click loading request] torch_device={device}',
         flush=True,
     )
 

@@ -1016,8 +1016,10 @@ class SegmentationWidget(QWidget):
         self.gpu_combo = QComboBox()
         self.gpu_combo.setEditable(True)
         self.gpu_combo.setToolTip(
-            'Select GPU IDs for CUDA_VISIBLE_DEVICES. '
-            'Examples: 0, 1, 0,1. Multiple GPUs are only faster if the backend supports multi-GPU inference.'
+            'Select PyTorch-visible CUDA device index. '
+            'Examples: 0, 1, 0,1. '
+            'If CUDA_VISIBLE_DEVICES was set before launching napari, cuda:0 may correspond '
+            'to a different physical GPU in nvidia-smi.'
         )
         self.gpu_combo.setMaximumWidth(lineedit_w)
 
@@ -2533,14 +2535,18 @@ class SegmentationWidget(QWidget):
 
     def _selected_gpu_runtime_params(self):
         """
-        Return both UI-selected CUDA_VISIBLE_DEVICES text and exact torch device.
+        Return GPU runtime parameters.
 
-        cuda_visible_devices is kept for subprocess/fine-tuning compatibility.
-        device is the reliable in-process torch device.
+        In napari in-process inference, the UI-selected GPU ID is interpreted as
+        the PyTorch-visible CUDA index, not as a physical CUDA_VISIBLE_DEVICES id.
         """
+        device = self._selected_torch_device()
+
         return {
-            'cuda_visible_devices': self._selected_cuda_visible_devices(),
-            'device': self._selected_torch_device(),
+            # Keep this only for subprocess-based code paths.
+            # For one-click and in-process inference, do not use it to remap CUDA devices.
+            'cuda_visible_devices': None,
+            'device': device,
         }
 
     def _populate_gpu_combo(self):
