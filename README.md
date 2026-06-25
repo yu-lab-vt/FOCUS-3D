@@ -35,8 +35,8 @@ Please check the official PyTorch installation guide if you need another CUDA ve
 pip install -U "focus-3d[gui]"
 ```
 
-#### 4. Install detectron2 (only for Linux)
-For Linux, FOCUS-3D requires Detectron2 for segmentation model training and inference. Please install Detectron2 according to the official guide:
+#### 4. Install detectron2 (only for Linux model fine-tuning)
+For Linux, FOCUS-3D requires Detectron2 for segmentation model fine-tuning. Please install Detectron2 according to the official guide:
 
 https://detectron2.readthedocs.io/en/latest/tutorials/install.html
 
