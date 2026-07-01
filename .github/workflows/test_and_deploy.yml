@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup python
         uses: astral-sh/setup-uv@v7
@@ -33,7 +33,7 @@ jobs:
           activate-environment: "true"
 
       - name: Install Linux OpenGL
-        uses: pyvista/setup-headless-display-action@v4.2
+        uses: pyvista/setup-headless-display-action@v4.3
         with:
           qt: true
           wm: herbstluftwm
@@ -52,7 +52,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: hynek/build-and-inspect-python-package@v2
 
   deploy:
@@ -65,7 +65,7 @@ jobs:
 
     steps:
       - name: Download built artifact to dist/
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: Packages
           path: dist
