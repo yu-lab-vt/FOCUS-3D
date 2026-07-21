@@ -280,10 +280,10 @@ def infer_volume(
     amp_dtype: str = 'float16',
     patch_size: tuple[int, int, int] = (32, 96, 96),  # (Z, Y, X)
     stride: tuple[int, int, int] | None = None,
-    # Inference-time downsampling
-    downsample_factor: float | tuple[float, float, float] | None = None,
-    restore_downsampled_mask: bool = True,
-    save_downsampled_image: bool = False,
+    # Inference-time cell-radius normalization
+    cell_radius: float = 15.0,
+    restore_resampled_mask: bool = True,
+    save_resampled_image: bool = False,
     # Stitch parameters, kept aligned with Linux inference.py
     stitch_face_iom_thresh: float = 0.2,
     stitch_min_core_voxels: int = 64,
@@ -297,14 +297,14 @@ def infer_volume(
     """
     Inference on an arbitrarily-sized 3D volume:
         1) Read image
-        2) Optionally downsample for inference
+        2) Resample the image according to cell radius and z_ratio
         3) Normalize to [0, 1]
         4) Pad and generate sliding windows
         5) Skip pure-background patches
         6) Run batch inference
         7) Postprocess patch predictions and stitch them
         8) Build final instance/confidence maps
-        9) Optionally restore masks to the original raw shape
+        9) Optionally restore predictions to the original raw shape
         10) Save outputs
 
     Algorithmic behavior is aligned with the Linux inference.py. Windows-only
@@ -353,8 +353,20 @@ def infer_volume(
     if batch_size < 1:
         raise ValueError('batch_size must be >= 1')
 
+    if cell_radius <= 0:
+        raise ValueError(
+            f'cell_radius must be positive, got {cell_radius}'
+        )
+
+    if z_ratio <= 0:
+        raise ValueError(
+            f'z_ratio must be positive, got {z_ratio}'
+        )
+
     log_info = {
         'image_path': str(image_path),
+        'cell_radius': float(cell_radius),
+        'reference_cell_radius': 15.0,
         'z_ratio': float(z_ratio),
         'lower_percentile': float(lower_percentile),
         'upper_percentile': float(upper_percentile),
@@ -398,20 +410,25 @@ def infer_volume(
     raw_volume = read_volume(image_path)
     raw_shape_original = tuple(raw_volume.shape)
 
-    infer_raw_volume, downsample_info = downsample_volume_for_inference(
-        raw_volume,
-        downsample_factor=downsample_factor,
+    _emit_status(progress_callback, 'Resampling image...')
+    _check_cancelled(cancel_callback)
+
+    infer_raw_volume, resample_info = resample_volume_for_inference(
+        volume=raw_volume,
+        cell_radius=cell_radius,
+        z_ratio=z_ratio,
+        reference_cell_radius=15.0,
         order=1,
     )
-    infer_shape = tuple(infer_raw_volume.shape)
-    log_info['downsample'] = downsample_info
 
-    if save_downsampled_image and downsample_info['enabled']:
+    infer_shape = tuple(infer_raw_volume.shape)
+    log_info['resampling'] = resample_info
+
+    if save_resampled_image and resample_info['enabled']:
         save_volume(
-            output_dir / f'{Path(image_path).stem}_downsampled_image.tif',
+            output_dir / f'{Path(image_path).stem}_resampled_image.tif',
             infer_raw_volume.astype(np.float32),
         )
-
     _emit_status(progress_callback, 'Normalizing image...')
     _check_cancelled(cancel_callback)
 
@@ -715,23 +732,29 @@ def infer_volume(
     instance_map_infer = instance_map_padded[:z_inf, :y_inf, :x_inf]
     confidence_map_infer = confidence_map_padded[:z_inf, :y_inf, :x_inf]
 
-    # Restore to original raw image shape if inference was done on a
-    # downsampled volume.
-    if downsample_info['enabled'] and restore_downsampled_mask:
+    # Restore predictions to the original raw image shape after
+    # inference-time resampling.
+    if resample_info['enabled'] and restore_resampled_mask:
         instance_map = resize_volume_to_shape(
             instance_map_infer.astype(np.uint32, copy=False),
             target_shape=raw_shape_original,
-            order=0,
+            order=0,  # nearest neighbor for instance labels
         ).astype(np.uint32, copy=False)
 
         confidence_map = resize_volume_to_shape(
             confidence_map_infer.astype(np.float32, copy=False),
             target_shape=raw_shape_original,
-            order=1,
+            order=1,  # linear interpolation for confidence
         ).astype(np.float32, copy=False)
     else:
-        instance_map = instance_map_infer.astype(np.uint32, copy=False)
-        confidence_map = confidence_map_infer.astype(np.float32, copy=False)
+        instance_map = instance_map_infer.astype(
+            np.uint32,
+            copy=False,
+        )
+        confidence_map = confidence_map_infer.astype(
+            np.float32,
+            copy=False,
+        )
 
     # --------------------------------------------------------
     # Save outputs
@@ -912,39 +935,6 @@ def normalize_img(
     return normalized, stats
 
 
-def _normalize_downsample_factor(
-    downsample_factor: float | tuple[float, float, float] | None,
-) -> tuple[float, float, float] | None:
-    """
-    Convert downsample_factor to a 3-tuple in (Z, Y, X).
-
-    Meaning:
-        factor = 2       -> output size is original / 2 on each axis
-        factor = (1,2,2) -> keep Z, downsample Y/X by 2
-    """
-    if downsample_factor is None:
-        return None
-
-    if isinstance(downsample_factor, int | float):
-        f = float(downsample_factor)
-        factors = (f, f, f)
-    else:
-        if len(downsample_factor) != 3:
-            raise ValueError(
-                'downsample_factor must be None, a scalar, or a 3-tuple/list '
-                'in (Z, Y, X).'
-            )
-        factors = tuple(float(x) for x in downsample_factor)
-
-    if any(f <= 0 for f in factors):
-        raise ValueError(f'downsample_factor must be positive, got {factors}')
-
-    if all(abs(f - 1.0) < 1e-6 for f in factors):
-        return None
-
-    return factors
-
-
 def resize_volume_to_shape(
     volume: np.ndarray,
     target_shape: tuple[int, int, int],
@@ -983,52 +973,144 @@ def resize_volume_to_shape(
 
     return out
 
-
-def downsample_volume_for_inference(
+def resample_volume_for_inference(
     volume: np.ndarray,
-    downsample_factor: float | tuple[float, float, float] | None,
+    cell_radius: float,
+    z_ratio: float,
+    reference_cell_radius: float = 15.0,
     order: int = 1,
 ) -> tuple[np.ndarray, dict]:
     """
-    Downsample raw volume before inference.
+    Resample a 3D volume so that the cell radius in the inference image
+    is approximately equal to reference_cell_radius pixels.
 
-    downsample_factor means shrink factor, not zoom factor:
-        factor=(1,2,2) means new_shape=(Z, Y/2, X/2).
+    Parameters
+    ----------
+    volume:
+        Input volume in (Z, Y, X).
+
+    cell_radius:
+        Estimated cell radius in pixels in the original XY image.
+
+    z_ratio:
+        Z-to-XY sampling ratio.
+
+        If z_ratio > 1:
+            Keep the Z dimension unchanged and resample only Y/X.
+
+        If z_ratio <= 1:
+            Apply the same resampling factor to Z/Y/X.
+
+    reference_cell_radius:
+        Cell radius expected by the model. Default is 15 pixels.
+
+    order:
+        Interpolation order. Use 1 for raw intensity images.
+
+    Notes
+    -----
+    The factor is defined as:
+
+        factor_xy = cell_radius / reference_cell_radius
+
+    Target size is calculated as:
+
+        target_size = original_size / factor
+
+    Therefore:
+        factor > 1 -> downsampling
+        factor < 1 -> upsampling
+        factor = 1 -> no resampling
     """
-    factors = _normalize_downsample_factor(downsample_factor)
+    if volume.ndim != 3:
+        raise ValueError(
+            f'volume must be a 3D array in (Z, Y, X), got {volume.shape}'
+        )
 
-    info = {
-        'enabled': factors is not None,
-        'factor_zyx': None,
-        'original_shape': [int(s) for s in volume.shape],
-        'inference_shape': [int(s) for s in volume.shape],
-    }
+    cell_radius = float(cell_radius)
+    z_ratio = float(z_ratio)
+    reference_cell_radius = float(reference_cell_radius)
 
-    if factors is None:
-        return volume.astype(np.float32, copy=False), info
+    if cell_radius <= 0:
+        raise ValueError(
+            f'cell_radius must be positive, got {cell_radius}'
+        )
+
+    if z_ratio <= 0:
+        raise ValueError(
+            f'z_ratio must be positive, got {z_ratio}'
+        )
+
+    if reference_cell_radius <= 0:
+        raise ValueError(
+            'reference_cell_radius must be positive, '
+            f'got {reference_cell_radius}'
+        )
+
+    # The original cell radius becomes approximately 15 pixels after:
+    #
+    #     new_radius = cell_radius / factor_xy
+    #
+    # Therefore:
+    #
+    #     factor_xy = cell_radius / 15
+    factor_xy = cell_radius / reference_cell_radius
+
+    # If Z sampling is coarser than XY, keep the Z dimension unchanged.
+    if z_ratio > 1.0:
+        factor_z = 1.0
+        z_resampling_mode = 'keep_z'
+    else:
+        factor_z = factor_xy
+        z_resampling_mode = 'same_as_xy'
+
+    factors = (
+        float(factor_z),
+        float(factor_xy),
+        float(factor_xy),
+    )
 
     original_shape = tuple(int(s) for s in volume.shape)
+
     target_shape = tuple(
-        max(1, int(round(original_shape[i] / factors[i])))
+        max(
+            1,
+            int(round(original_shape[i] / factors[i])),
+        )
         for i in range(3)
     )
 
-    downsampled = resize_volume_to_shape(
+    enabled = target_shape != original_shape
+
+    info = {
+        'enabled': bool(enabled),
+        'cell_radius': float(cell_radius),
+        'reference_cell_radius': float(reference_cell_radius),
+        'z_ratio': float(z_ratio),
+        'z_resampling_mode': z_resampling_mode,
+        'factor_zyx': [float(f) for f in factors],
+        'zoom_zyx': [
+            float(target_shape[i]) / float(original_shape[i])
+            for i in range(3)
+        ],
+        'original_shape': [int(s) for s in original_shape],
+        'inference_shape': [int(s) for s in target_shape],
+    }
+
+    if not enabled:
+        return volume.astype(np.float32, copy=False), info
+
+    resampled = resize_volume_to_shape(
         volume.astype(np.float32, copy=False),
         target_shape=target_shape,
         order=order,
     )
 
-    info.update(
-        {
-            'factor_zyx': [float(f) for f in factors],
-            'original_shape': [int(s) for s in original_shape],
-            'inference_shape': [int(s) for s in downsampled.shape],
-        }
-    )
+    info['inference_shape'] = [
+        int(s) for s in resampled.shape
+    ]
 
-    return downsampled.astype(np.float32, copy=False), info
-
+    return resampled.astype(np.float32, copy=False), info
 
 # ============================================================
 # Sliding-window planning and padding

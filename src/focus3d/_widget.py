@@ -1054,7 +1054,7 @@ class SegmentationWidget(QWidget):
         # ---------------- Advanced body ----------------
         self.seg_advanced_widget = QWidget()
         advanced_layout = QVBoxLayout(self.seg_advanced_widget)
-        advanced_layout.setContentsMargins(0, 0, 0, 0)  # 去掉整体缩进
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
         advanced_layout.setSpacing(6)
 
         # ====================================================
@@ -1141,6 +1141,33 @@ class SegmentationWidget(QWidget):
         percentile_layout.addStretch()
         advanced_layout.addLayout(percentile_layout)
 
+        # Cell radius
+        cell_radius_layout = QHBoxLayout()
+        cell_radius_layout.setContentsMargins(0, 0, 0, 0)
+        cell_radius_layout.setSpacing(4)
+
+        lbl_cell_radius = QLabel('Cell radius (pixel):')
+        lbl_cell_radius.setFixedWidth(140)
+        cell_radius_layout.addWidget(lbl_cell_radius)
+
+        self.seg_cell_radius_spin = NoWheelDoubleSpinBox()
+        self.seg_cell_radius_spin.setRange(0.1, 1000.0)
+        self.seg_cell_radius_spin.setDecimals(1)
+        self.seg_cell_radius_spin.setSingleStep(0.5)
+        self.seg_cell_radius_spin.setValue(15.0)
+        self.seg_cell_radius_spin.setFixedWidth(small_int_w)
+        self.seg_cell_radius_spin.setStyleSheet(compact_spinbox_style)
+        self.seg_cell_radius_spin.setToolTip(
+            'Estimated cell radius in XY pixels. '
+            'The inference image will be resampled so that the cell radius '
+            'is approximately 15 pixels.'
+        )
+
+        cell_radius_layout.addWidget(self.seg_cell_radius_spin)
+        cell_radius_layout.addStretch()
+
+        advanced_layout.addLayout(cell_radius_layout)
+
         # gaussian_title_layout = QHBoxLayout()
         # gaussian_title_layout.setContentsMargins(0, 0, 0, 0)
         # gaussian_title_layout.setSpacing(4)
@@ -1189,40 +1216,40 @@ class SegmentationWidget(QWidget):
         block_title.setStyleSheet(section_title_style)
         advanced_layout.addWidget(block_title)
 
-        patch_size_title_layout = QHBoxLayout()
-        patch_size_title_layout.setContentsMargins(0, 0, 0, 0)
-        patch_size_title_layout.setSpacing(4)
-        patch_size_title_layout.addWidget(QLabel('Patch size (Z/Y/X):'))
-        patch_size_title_layout.addStretch()
-        advanced_layout.addLayout(patch_size_title_layout)
+        # patch_size_title_layout = QHBoxLayout()
+        # patch_size_title_layout.setContentsMargins(0, 0, 0, 0)
+        # patch_size_title_layout.setSpacing(4)
+        # patch_size_title_layout.addWidget(QLabel('Patch size (Z/Y/X):'))
+        # patch_size_title_layout.addStretch()
+        # advanced_layout.addLayout(patch_size_title_layout)
 
-        patch_size_layout = QHBoxLayout()
-        patch_size_layout.setContentsMargins(0, 0, 0, 0)
-        patch_size_layout.setSpacing(3)
+        # patch_size_layout = QHBoxLayout()
+        # patch_size_layout.setContentsMargins(0, 0, 0, 0)
+        # patch_size_layout.setSpacing(3)
 
-        self.seg_patch_size_z_spin = NoWheelSpinBox()
-        self.seg_patch_size_z_spin.setRange(1, 4096)
-        self.seg_patch_size_z_spin.setValue(32)
-        self.seg_patch_size_z_spin.setFixedWidth(triple_w)
-        self.seg_patch_size_z_spin.setStyleSheet(compact_spinbox_style)
-        patch_size_layout.addWidget(self.seg_patch_size_z_spin)
+        # self.seg_patch_size_z_spin = NoWheelSpinBox()
+        # self.seg_patch_size_z_spin.setRange(1, 4096)
+        # self.seg_patch_size_z_spin.setValue(32)
+        # self.seg_patch_size_z_spin.setFixedWidth(triple_w)
+        # self.seg_patch_size_z_spin.setStyleSheet(compact_spinbox_style)
+        # patch_size_layout.addWidget(self.seg_patch_size_z_spin)
 
-        self.seg_patch_size_y_spin = NoWheelSpinBox()
-        self.seg_patch_size_y_spin.setRange(1, 4096)
-        self.seg_patch_size_y_spin.setValue(96)
-        self.seg_patch_size_y_spin.setFixedWidth(triple_w)
-        self.seg_patch_size_y_spin.setStyleSheet(compact_spinbox_style)
-        patch_size_layout.addWidget(self.seg_patch_size_y_spin)
+        # self.seg_patch_size_y_spin = NoWheelSpinBox()
+        # self.seg_patch_size_y_spin.setRange(1, 4096)
+        # self.seg_patch_size_y_spin.setValue(96)
+        # self.seg_patch_size_y_spin.setFixedWidth(triple_w)
+        # self.seg_patch_size_y_spin.setStyleSheet(compact_spinbox_style)
+        # patch_size_layout.addWidget(self.seg_patch_size_y_spin)
 
-        self.seg_patch_size_x_spin = NoWheelSpinBox()
-        self.seg_patch_size_x_spin.setRange(1, 4096)
-        self.seg_patch_size_x_spin.setValue(96)
-        self.seg_patch_size_x_spin.setFixedWidth(triple_w)
-        self.seg_patch_size_x_spin.setStyleSheet(compact_spinbox_style)
-        patch_size_layout.addWidget(self.seg_patch_size_x_spin)
+        # self.seg_patch_size_x_spin = NoWheelSpinBox()
+        # self.seg_patch_size_x_spin.setRange(1, 4096)
+        # self.seg_patch_size_x_spin.setValue(96)
+        # self.seg_patch_size_x_spin.setFixedWidth(triple_w)
+        # self.seg_patch_size_x_spin.setStyleSheet(compact_spinbox_style)
+        # patch_size_layout.addWidget(self.seg_patch_size_x_spin)
 
-        patch_size_layout.addStretch()
-        advanced_layout.addLayout(patch_size_layout)
+        # patch_size_layout.addStretch()
+        # advanced_layout.addLayout(patch_size_layout)
 
         stride_title_layout = QHBoxLayout()
         stride_title_layout.setContentsMargins(0, 0, 0, 0)
@@ -1270,7 +1297,7 @@ class SegmentationWidget(QWidget):
         self.background_threshold_spin.setRange(-1e9, 1e9)
         self.background_threshold_spin.setDecimals(1)
         self.background_threshold_spin.setSingleStep(0.1)
-        self.background_threshold_spin.setValue(0.0)
+        self.background_threshold_spin.setValue(1.0)
         self.background_threshold_spin.setFixedWidth(small_int_w)
         self.background_threshold_spin.setStyleSheet(compact_spinbox_style)
         bg_layout.addWidget(self.background_threshold_spin)
@@ -3550,6 +3577,7 @@ class SegmentationWidget(QWidget):
             'input_name': active.name,
             'lower_percentile': float(self.lower_percentile_spin.value()),
             'upper_percentile': float(self.upper_percentile_spin.value()),
+            'cell_radius': float(self.seg_cell_radius_spin.value()),
             'background_threshold': float(
                 self.background_threshold_spin.value()
             ),
@@ -3559,11 +3587,11 @@ class SegmentationWidget(QWidget):
             'min_edge_area': int(self.min_edge_area_spin.value()),
             'size_filter_min_size': size_filter_min_size,
             'size_filter_max_size': size_filter_max_size,
-            'patch_size': [
-                int(self.seg_patch_size_z_spin.value()),
-                int(self.seg_patch_size_y_spin.value()),
-                int(self.seg_patch_size_x_spin.value()),
-            ],
+            # 'patch_size': [
+            #     int(self.seg_patch_size_z_spin.value()),
+            #     int(self.seg_patch_size_y_spin.value()),
+            #     int(self.seg_patch_size_x_spin.value()),
+            # ],
             'stride': [
                 int(self.seg_stride_z_spin.value()),
                 int(self.seg_stride_y_spin.value()),
@@ -4118,11 +4146,7 @@ class SegmentationWidget(QWidget):
             )
             return
 
-        patch_size = (
-            int(self.seg_patch_size_z_spin.value()),
-            int(self.seg_patch_size_y_spin.value()),
-            int(self.seg_patch_size_x_spin.value()),
-        )
+        patch_size = (32, 96, 96)
         stride = (
             int(self.seg_stride_z_spin.value()),
             int(self.seg_stride_y_spin.value()),

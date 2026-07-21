@@ -1,6 +1,6 @@
 [project]
 name = "focus-3d"
-version = "0.1.7"
+version = "0.1.8"
 description = "FOCUS-3D: a user-friendly napari plugin for interactive 3D cell segmentation, curation, and analysis"
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -48,6 +48,7 @@ dependencies = [
     "matplotlib",
     "scikit-learn",
     "umap-learn",
+    "imagecodecs>=2023.9.18",
 ]
 
 [project.optional-dependencies]

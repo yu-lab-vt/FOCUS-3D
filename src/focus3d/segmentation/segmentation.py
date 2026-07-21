@@ -85,6 +85,7 @@ class SegmentationWorker(QObject):
                 ),
                 device=self.seg_params.get('device', None),
                 z_ratio=float(self.seg_params.get('z_ratio', 1.0)),
+                cell_radius=float(self.seg_params.get('cell_radius', 15.0)),
                 lower_percentile=float(
                     self.seg_params.get('lower_percentile', 1.0)
                 ),
@@ -113,15 +114,10 @@ class SegmentationWorker(QObject):
                 size_filter_max_size=size_filter_max_size,
                 use_amp=bool(self.seg_params.get('use_amp', True)),
                 amp_dtype=str(self.seg_params.get('amp_dtype', 'float16')),
-                patch_size=tuple(
-                    self.seg_params.get('patch_size', [32, 96, 96])
-                ),
                 stride=tuple(self.seg_params.get('stride', [24, 64, 64])),
-                # New: send inference progress back to Qt worker.
                 progress_callback=self._progress_callback,
                 cancel_callback=self._is_cancelled_callback,
             )
-
             if self._is_cancelled_callback():
                 self.cancelled.emit()
                 return

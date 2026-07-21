@@ -1814,11 +1814,7 @@ def _start_clicked_local_refinement(self, coord_zyx):
     self.local_refine_progress.setAutoReset(True)
     self.local_refine_progress.show()
 
-    patch_size = (
-        int(self.seg_patch_size_z_spin.value()),
-        int(self.seg_patch_size_y_spin.value()),
-        int(self.seg_patch_size_x_spin.value()),
-    )
+    patch_size = (32, 96, 96)
 
     model = getattr(self, '_local_refine_model', None)
     if model is None:

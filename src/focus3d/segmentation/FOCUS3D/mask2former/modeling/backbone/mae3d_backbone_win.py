@@ -168,8 +168,7 @@ class D2MAE3DBackbone(nn.Module):
 
     def forward(self, x):
         # x: (B, C, D, H, W)
-        features = self.adapter(x)  # 返回 list of 4 tensors: [f1, f2, f3, f4]
-        # 映射到 Detectron2 输出格式（res2=1/4, res3=1/8, res4=1/16, res5=1/32）
+        features = self.adapter(x)
         return {
             'res2': features[0],
             'res3': features[1],
