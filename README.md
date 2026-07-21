@@ -132,7 +132,7 @@ The `Segmentation` menu provides automatic 3D segmentation with **FOCUS-3D**, on
 | Checkpoint | Select the pretrained model checkpoint. The default path is relative to the backend folder. |
 | Configure | Select the configuration file. The default configuration is `configs/3d_test.yaml`. |
 | Lower / Upper Percentile | Set the intensity percentile range for image normalization before inference. |
-| Patch size (Z/Y/X) | Set the 3D patch size used for sliding-window inference. |
+| Cell radius (pixel) | Resample based on the cell radius. |
 | Stride (Z/Y/X) | Set the stride between neighboring inference patches. Smaller strides increase overlap but require more computation. |
 | Background intensity | Ignore patches whose maximum intensity is below this threshold. |
 | Batch size | Set the inference batch size. Larger values may improve speed but require more GPU memory. |
