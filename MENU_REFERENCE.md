@@ -1,8 +1,6 @@
 # FOCUS-3D Interface Reference
 
-This document describes the controls currently exposed by the FOCUS-3D napari plugin.
-
-For a beginner-oriented walkthrough, return to the [Recommended Workflow](../README.md#recommended-workflow).
+This document describes the controls exposed by the FOCUS-3D napari plugin. For a beginner-oriented walkthrough, return to the [Recommended Workflow](../README.md#recommended-workflow).
 
 ## Interface Overview
 
@@ -389,10 +387,8 @@ A typical output directory contains:
 
 ```text
 output_<image>_<timestamp>/
-├── curation_labels.zarr
+├── segmentation.zarr
 ├── <instance-map output from backend>
-├── <confidence-map output, when enabled>
-├── <inference log, when produced>
 └── curated_patch/
 ```
 
@@ -428,6 +424,3 @@ Each analysis task writes into its own subfolder under the selected output root:
 
 - Prefer Zarr for label loading, empty-label creation, curation, and saving.
 - Keep only the required image and label layers visible when interactive rendering becomes slow.
-- Use a larger inference stride to reduce overlap and runtime, recognizing that this may reduce boundary redundancy.
-- Increase batch size only after checking available GPU memory.
-- Save curated labels before starting a separate analysis or patch-curation session.
