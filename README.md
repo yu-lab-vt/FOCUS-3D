@@ -54,8 +54,8 @@ python -m napari
 
 ## Usage
 
-1. Open FOCUS-3D from `Plugins -> FOCUS-3D`.
-2. Load the raw image from `File -> Open Folder` for a `.zarr` dataset(recommend), or `File -> Open File(s)` for `.tif` images.
+1. Open FOCUS-3D from `Plugins -> 3D Segmentation (FOCUS-3D)`.
+2. Load the raw image from `File -> Open Folder` for a `.zarr` dataset (recommend), or `File -> Open File(s)` for `.tif` images.
 3. Use the `Basic`, `Segmentation`, and `Analysis` tabs to load labels, run segmentation, manually curate results, fine-tune models, reconstruct 3D structures, and calculate quantitative statistics.
 
 ## Basic Menu
