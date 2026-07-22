@@ -187,9 +187,6 @@ The napari panel prepares and exports training data, but it does not launch mode
 
 ## Detailed Interface Reference
 
-<details>
-<summary><strong>Open the menu documentation</strong></summary>
-
 The complete descriptions of all controls are maintained in:
 
 - [Basic tab](docs/MENU_REFERENCE.md#basic-tab)
