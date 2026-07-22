@@ -762,22 +762,22 @@ def infer_volume(
     stem = Path(image_path).stem
 
     instance_path = output_dir / f'{stem}_instance_map.tif'
-    confidence_path = output_dir / f'{stem}_confidence_map.tif'
-    log_path = output_dir / f'{stem}_log.json'
+    if save_intermediate:
+        confidence_path = output_dir / f'{stem}_confidence_map.tif'
+        log_path = output_dir / f'{stem}_log.json'
 
     _check_cancelled(cancel_callback)
     save_volume(instance_path, instance_map.astype(np.uint32))
-    save_volume(confidence_path, confidence_map.astype(np.float32))
+    if save_intermediate:
+        save_volume(confidence_path, confidence_map.astype(np.float32))
 
-    log_info['total_time_sec'] = time.time() - t_total_start
+        log_info['total_time_sec'] = time.time() - t_total_start
 
-    with open(log_path, 'w', encoding='utf-8') as f:
-        json.dump(log_info, f, indent=2)
+        with open(log_path, 'w', encoding='utf-8') as f:
+            json.dump(log_info, f, indent=2)
 
     result = {
         'instance_map_path': str(instance_path),
-        'confidence_map_path': str(confidence_path),
-        'log_json_path': str(log_path),
         'num_infer_patches': len(infer_coords),
         'num_skipped_background_patches': len(skipped_coords),
         'instance_map': instance_map,
@@ -1500,7 +1500,7 @@ def patch_postprocess_argmax(
     nonzero_ids = np.unique(patch_instance_map)
     nonzero_ids = nonzero_ids[nonzero_ids > 0]
 
-    if nonzero_ids.size == 1 and foreground_ratio > 0.98:
+    if nonzero_ids.size == 1 and foreground_ratio > 0.8:
         patch_instance_map[...] = 0
         patch_confidence[...] = 0.0
 

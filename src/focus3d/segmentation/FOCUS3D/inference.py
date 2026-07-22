@@ -90,7 +90,7 @@ def infer_volume(
     z_ratio: float = 1.0,
     lower_percentile: float = 1.0,
     upper_percentile: float = 99.0,
-    background_threshold: float = 5.0,
+    background_threshold: Optional[float] = None,
     batch_size: int = 1,
     data_loader_num_workers: int = 4,
     save_intermediate: bool = False,
@@ -186,7 +186,11 @@ def infer_volume(
         "cell_radius": float(cell_radius),
         "reference_cell_radius": 15.0,
         "z_ratio": float(z_ratio),
-        "background_threshold": float(background_threshold),
+        "background_threshold_user": (
+            None
+            if background_threshold is None
+            else float(background_threshold)
+        ),
         "batch_size": int(batch_size),
         "save_intermediate": bool(save_intermediate),
         "amp_enabled_from_cfg": bool(amp_enabled),
@@ -236,15 +240,49 @@ def infer_volume(
         lower_percentile=lower_percentile,
         upper_percentile=upper_percentile,
     )
-    bg_raw = float(background_threshold)
-    p_low = norm_stats["p_low"]
-    p_high = norm_stats["p_high"]
+
+    # --------------------------------------------------------
+    # Resolve background threshold
+    # --------------------------------------------------------
+    if background_threshold is None:
+        # Automatically estimate background from the global
+        # 2nd percentile of the inference-resolution raw volume.
+        bg_raw = float(np.percentile(infer_raw_volume, 5.0))
+        background_threshold_source = "global_2nd_percentile"
+    else:
+        # Explicit user input always takes priority.
+        bg_raw = float(background_threshold)
+        background_threshold_source = "user"
+
+    p_low = float(norm_stats["p_low"])
+    p_high = float(norm_stats["p_high"])
+
     if p_high <= p_low:
         background_threshold_norm = 0.0
     else:
-        background_threshold_norm = (bg_raw - p_low) / (p_high - p_low)
-        background_threshold_norm = float(np.clip(background_threshold_norm, 0.0, 1.0))
+        background_threshold_norm = (
+            (bg_raw - p_low)
+            / (p_high - p_low)
+        )
+        background_threshold_norm = float(
+            np.clip(background_threshold_norm, 0.0, 1.0)
+        )
+
+    print(
+        "[Background threshold] "
+        f"source={background_threshold_source}, "
+        f"raw_value={bg_raw:.6g}, "
+        f"normalized_value={background_threshold_norm:.6f}"
+    )
+
     log_info["normalization"] = norm_stats
+    log_info["background_threshold"] = float(bg_raw)
+    log_info["background_threshold_norm"] = float(
+        background_threshold_norm
+    )
+    log_info["background_threshold_source"] = (
+        background_threshold_source
+    )
 
     # --------------------------------------------------------
     # Patch / stride planning and padding
@@ -491,21 +529,23 @@ def infer_volume(
     stem = Path(image_path).stem
 
     instance_path = output_dir / f"{stem}_instance_map.tif"
-    confidence_path = output_dir / f"{stem}_confidence_map.tif"
-    log_path = output_dir / f"{stem}_log.json"
+    if save_intermediate:
+        confidence_path = output_dir / f"{stem}_confidence_map.tif"
+        log_path = output_dir / f"{stem}_log.json"
+
     _raise_if_cancelled(cancel_callback)
     save_volume(instance_path, instance_map.astype(np.uint32))
-    save_volume(confidence_path, confidence_map.astype(np.float32))
 
-    log_info["total_time_sec"] = time.time() - t_total_start
+    if save_intermediate:
+        save_volume(confidence_path, confidence_map.astype(np.float32))
 
-    with open(log_path, "w", encoding="utf-8") as f:
-        json.dump(log_info, f, indent=2)
+        log_info["total_time_sec"] = time.time() - t_total_start
+
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(log_info, f, indent=2)
 
     result = {
         "instance_map_path": str(instance_path),
-        "confidence_map_path": str(confidence_path),
-        "log_json_path": str(log_path),
         "num_infer_patches": len(infer_coords),
         "num_skipped_background_patches": len(skipped_coords),
         "instance_map": instance_map,
@@ -1213,7 +1253,7 @@ def patch_postprocess_argmax(
     nonzero_ids = np.unique(patch_instance_map)
     nonzero_ids = nonzero_ids[nonzero_ids > 0]
 
-    if nonzero_ids.size == 1 and foreground_ratio > 0.98:
+    if nonzero_ids.size == 1 and foreground_ratio > 0.8:
         patch_instance_map[...] = 0
         patch_confidence[...] = 0.0
 

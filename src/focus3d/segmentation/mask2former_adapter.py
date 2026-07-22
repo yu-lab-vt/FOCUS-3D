@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import os
-import platform
 import sys
 import uuid
 from contextlib import contextmanager, suppress
@@ -15,11 +14,11 @@ import tifffile
 
 MASK2FORMER_DIR = Path(__file__).resolve().parent / 'FOCUS3D'
 
-# Linux / original Detectron2 version
+# original Detectron2 version
 INFERENCE_PY_DETECTRON2 = MASK2FORMER_DIR / 'inference.py'
 
-# Windows / no-Detectron2 version
-INFERENCE_PY_WINDOWS = MASK2FORMER_DIR / 'inference_win.py'
+# no-Detectron2 version
+INFERENCE_PY_NODETECTRON2 = MASK2FORMER_DIR / 'inference_win.py'
 
 # Cache loaded inference module by backend.
 _INFERENCE_MODULE_CACHE = {}
@@ -164,33 +163,42 @@ def _resolve_relative_to_mask2former(path: str | Path) -> str:
     return str(p_mask2former)
 
 
+# def _select_inference_file():
+#     """
+#     Select inference backend.
+
+#     Default behavior:
+#     - Windows: use inference_win.py
+#     - Linux/macOS: use inference.py
+
+#     Optional override:
+#     set CELLSEG_FOCUS3D_BACKEND to:
+#         - "windows", "nod2", "no_detectron2", "pytorch"
+#         - "detectron2", "d2", "linux"
+#     """
+#     backend = os.environ.get('CELLSEG_FOCUS3D_BACKEND', 'auto').strip().lower()
+
+#     if backend in {'windows', 'win', 'nod2', 'no_detectron2', 'pytorch'}:
+#         return INFERENCE_PY_NODETECTRON2, 'windows'
+
+#     if backend in {'detectron2', 'd2', 'linux'}:
+#         return INFERENCE_PY_DETECTRON2, 'detectron2'
+
+#     # Auto mode
+#     system_name = platform.system().lower()
+#     if system_name.startswith('win') or os.name == 'nt':
+#         return INFERENCE_PY_NODETECTRON2, 'windows'
+
+
+#     return INFERENCE_PY_DETECTRON2, 'detectron2'
 def _select_inference_file():
     """
-    Select inference backend.
+    UI inference always uses the no-Detectron2 implementation.
 
-    Default behavior:
-    - Windows: use inference_win.py
-    - Linux/macOS: use inference.py
-
-    Optional override:
-    set CELLSEG_FOCUS3D_BACKEND to:
-        - "windows", "nod2", "no_detectron2", "pytorch"
-        - "detectron2", "d2", "linux"
+    inference_win.py is a cross-platform PyTorch inference backend,
+    despite its historical filename.
     """
-    backend = os.environ.get('CELLSEG_FOCUS3D_BACKEND', 'auto').strip().lower()
-
-    if backend in {'windows', 'win', 'nod2', 'no_detectron2', 'pytorch'}:
-        return INFERENCE_PY_WINDOWS, 'windows'
-
-    if backend in {'detectron2', 'd2', 'linux'}:
-        return INFERENCE_PY_DETECTRON2, 'detectron2'
-
-    # Auto mode
-    system_name = platform.system().lower()
-    if system_name.startswith('win') or os.name == 'nt':
-        return INFERENCE_PY_WINDOWS, 'windows'
-
-    return INFERENCE_PY_DETECTRON2, 'detectron2'
+    return INFERENCE_PY_NODETECTRON2, 'pytorch'
 
 
 def _resolve_output_dir(path: str | Path) -> str:
@@ -227,8 +235,8 @@ def _load_mask2former_inference_module():
     Dynamically load FOCUS3D inference module.
 
     Backend selection:
-    - Linux / Detectron2: FOCUS3D/inference.py
-    - Windows / no Detectron2: FOCUS3D/inference_win.py
+    - Detectron2: FOCUS3D/inference.py
+    - no Detectron2: FOCUS3D/inference_win.py
     """
     inference_py, backend_name = _select_inference_file()
 
@@ -246,7 +254,7 @@ def _load_mask2former_inference_module():
             f'{inference_py}\n\n'
             f'Expected files:\n'
             f'  Detectron2 backend: {INFERENCE_PY_DETECTRON2}\n'
-            f'  Windows backend:    {INFERENCE_PY_WINDOWS}\n'
+            f'  Windows backend:    {INFERENCE_PY_NODETECTRON2}\n'
         )
 
     # Needed because inference.py / inference_win.py may import local modules

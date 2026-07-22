@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import os
 import sys
-import traceback
 
 sys.path.insert(0, os.path.dirname(__file__))
 import contextlib
@@ -311,81 +310,6 @@ class PatchCalculationWorker(QObject):
 
         except Exception as e:
             self.error.emit(str(e))
-
-
-class FineTuneWorker(QObject):
-    """Worker for running FOCUS3D fine-tuning in a background thread."""
-
-    progress = Signal(int, str)
-    finished = Signal(object, str)
-    cancelled = Signal()
-
-    def __init__(
-        self,
-        config_file,
-        curated_patch_dir,
-        output_dir,
-        init_checkpoint=None,
-        cuda_visible_devices=None,
-        resume=True,
-        opts=None,
-    ):
-        super().__init__()
-        self.config_file = config_file
-        self.curated_patch_dir = curated_patch_dir
-        self.output_dir = output_dir
-        self.init_checkpoint = init_checkpoint
-        self.cuda_visible_devices = cuda_visible_devices
-        self.resume = bool(resume)
-        self.opts = opts or []
-        self._cancelled = False
-
-    def cancel(self):
-        self._cancelled = True
-
-    def _progress_callback(self, value, message):
-        self.progress.emit(int(value), str(message))
-
-    def _cancel_callback(self):
-        return self._cancelled
-
-    def run(self):
-        try:
-            from focus3d.segmentation.FOCUS3D.fine_tune import run_finetune
-
-            result = run_finetune(
-                config_file=self.config_file,
-                curated_patch_dir=self.curated_patch_dir,
-                output_dir=self.output_dir,
-                init_checkpoint=self.init_checkpoint,
-                cuda_visible_devices=self.cuda_visible_devices,
-                resume=self.resume,
-                opts=self.opts,
-                progress_callback=self._progress_callback,
-                cancel_callback=self._cancel_callback,
-            )
-
-            if self._cancelled:
-                self.cancelled.emit()
-                return
-
-            self.finished.emit(result, '')
-
-        except RuntimeError as e:
-            if str(e) == '__FINETUNE_CANCELLED__':
-                self.cancelled.emit()
-                return
-
-            self.finished.emit(
-                None,
-                f'Fine-tuning error: {e}\n{traceback.format_exc()}',
-            )
-
-        except Exception as e:
-            self.finished.emit(
-                None,
-                f'Fine-tuning error: {e}\n{traceback.format_exc()}',
-            )
 
 
 class PatchExportWidget(QWidget):
@@ -1007,32 +931,130 @@ class SegmentationWidget(QWidget):
             self._get_first_image_layer(),
             force=False,
         )
-        # ---------------- GPU selection ----------------
-        gpu_layout = QHBoxLayout()
-        gpu_layout.setContentsMargins(0, 0, 0, 0)
-        gpu_layout.setSpacing(6)
-        gpu_layout.addWidget(QLabel('GPU IDs:'))
 
-        self.gpu_combo = QComboBox()
-        self.gpu_combo.setEditable(True)
-        self.gpu_combo.setToolTip(
-            'Select PyTorch-visible CUDA device index. '
-            'Examples: 0, 1, 0,1. '
-            'If CUDA_VISIBLE_DEVICES was set before launching napari, cuda:0 may correspond '
-            'to a different physical GPU in nvidia-smi.'
+        # ====================================================
+        # Frequently used segmentation parameters
+        # These controls remain outside Advanced.
+        # ====================================================
+
+        # ---------------- Checkpoint ----------------
+        checkpoint_layout = QHBoxLayout()
+        checkpoint_layout.setContentsMargins(0, 0, 0, 0)
+        checkpoint_layout.setSpacing(6)
+        checkpoint_layout.addWidget(QLabel('Checkpoint:'))
+
+        self.checkpoint_edit = QLineEdit()
+        self.checkpoint_edit.setText(
+            self._default_mask2former_checkpoint_text()
         )
-        self.gpu_combo.setMaximumWidth(lineedit_w)
+        self.checkpoint_edit.setPlaceholderText('model_final.pth')
+        self.checkpoint_edit.setMaximumWidth(lineedit_w)
+        checkpoint_layout.addWidget(self.checkpoint_edit)
 
-        gpu_layout.addWidget(self.gpu_combo)
+        self.btn_browse_checkpoint = QPushButton('Browse')
+        self.btn_browse_checkpoint.clicked.connect(
+            self._browse_mask2former_checkpoint
+        )
+        checkpoint_layout.addWidget(self.btn_browse_checkpoint)
+        checkpoint_layout.addStretch()
 
-        self.btn_refresh_gpu = QPushButton('Refresh')
-        self.btn_refresh_gpu.clicked.connect(self._populate_gpu_combo)
-        gpu_layout.addWidget(self.btn_refresh_gpu)
+        auto_main_layout.addLayout(checkpoint_layout)
 
-        gpu_layout.addStretch()
-        auto_main_layout.addLayout(gpu_layout)
+        # ---------------- Cell radius ----------------
+        cell_radius_layout = QHBoxLayout()
+        cell_radius_layout.setContentsMargins(0, 0, 0, 0)
+        cell_radius_layout.setSpacing(4)
 
-        self._populate_gpu_combo()
+        lbl_cell_radius = QLabel('Cell radius (pixel):')
+        lbl_cell_radius.setFixedWidth(140)
+        cell_radius_layout.addWidget(lbl_cell_radius)
+
+        self.seg_cell_radius_spin = NoWheelDoubleSpinBox()
+        self.seg_cell_radius_spin.setRange(0.1, 1000.0)
+        self.seg_cell_radius_spin.setDecimals(1)
+        self.seg_cell_radius_spin.setSingleStep(0.5)
+        self.seg_cell_radius_spin.setValue(15.0)
+        self.seg_cell_radius_spin.setFixedWidth(small_int_w)
+        self.seg_cell_radius_spin.setStyleSheet(compact_spinbox_style)
+        self.seg_cell_radius_spin.setToolTip(
+            'Estimated cell radius in XY pixels. '
+            'The inference image will be resampled so that the cell radius '
+            'is approximately 15 pixels.'
+        )
+
+        cell_radius_layout.addWidget(self.seg_cell_radius_spin)
+        cell_radius_layout.addStretch()
+
+        auto_main_layout.addLayout(cell_radius_layout)
+
+        # ---------------- Background intensity ----------------
+        bg_layout = QHBoxLayout()
+        bg_layout.setContentsMargins(0, 0, 0, 0)
+        bg_layout.setSpacing(4)
+
+        lbl_bg = QLabel('Background intensity:')
+        lbl_bg.setFixedWidth(140)
+        bg_layout.addWidget(lbl_bg)
+
+        self.background_threshold_spin = NoWheelDoubleSpinBox()
+        self.background_threshold_spin.setRange(-1e9, 1e9)
+        self.background_threshold_spin.setDecimals(1)
+        self.background_threshold_spin.setSingleStep(0.1)
+        self.background_threshold_spin.setValue(1.0)
+        self.background_threshold_spin.setFixedWidth(small_int_w)
+        self.background_threshold_spin.setStyleSheet(compact_spinbox_style)
+
+        bg_layout.addWidget(self.background_threshold_spin)
+        bg_layout.addStretch()
+
+        auto_main_layout.addLayout(bg_layout)
+
+        # ---------------- Size filter (3D) ----------------
+
+        size_min_layout = QHBoxLayout()
+        size_min_layout.setContentsMargins(0, 0, 0, 0)
+        size_min_layout.setSpacing(4)
+
+        lbl_size_min = QLabel('Min size (3D):')
+        lbl_size_min.setFixedWidth(140)
+        size_min_layout.addWidget(lbl_size_min)
+
+        self.size_filter_min_size_spin = NoWheelSpinBox()
+        self.size_filter_min_size_spin.setRange(0, 1000000000)
+        self.size_filter_min_size_spin.setValue(0)
+        self.size_filter_min_size_spin.setFixedWidth(small_int_w)
+        self.size_filter_min_size_spin.setStyleSheet(compact_spinbox_style)
+        self.size_filter_min_size_spin.setToolTip(
+            'Minimum 3D object size in voxels. '
+            '0 disables minimum-size filtering.'
+        )
+
+        size_min_layout.addWidget(self.size_filter_min_size_spin)
+        size_min_layout.addStretch()
+
+        auto_main_layout.addLayout(size_min_layout)
+
+        size_max_layout = QHBoxLayout()
+        size_max_layout.setContentsMargins(0, 0, 0, 0)
+        size_max_layout.setSpacing(4)
+
+        lbl_size_max = QLabel('Max size (3D):')
+        lbl_size_max.setFixedWidth(140)
+        size_max_layout.addWidget(lbl_size_max)
+
+        self.size_filter_max_size_spin = NoWheelSpinBox()
+        self.size_filter_max_size_spin.setRange(1, 1000000000)
+        self.size_filter_max_size_spin.setValue(100000)
+        self.size_filter_max_size_spin.setFixedWidth(small_int_w)
+        self.size_filter_max_size_spin.setStyleSheet(compact_spinbox_style)
+        self.size_filter_max_size_spin.setToolTip(
+            'Maximum 3D object size in voxels. Default: 100000.'
+        )
+
+        size_max_layout.addWidget(self.size_filter_max_size_spin)
+        size_max_layout.addStretch()
+
+        auto_main_layout.addLayout(size_max_layout)
 
         # ---------------- Advanced header ----------------
         advanced_header_layout = QHBoxLayout()
@@ -1064,27 +1086,6 @@ class SegmentationWidget(QWidget):
         config_title.setStyleSheet(section_title_style)
         advanced_layout.addWidget(config_title)
 
-        # checkpoint
-        checkpoint_layout = QHBoxLayout()
-        checkpoint_layout.setContentsMargins(0, 0, 0, 0)
-        checkpoint_layout.setSpacing(6)
-        checkpoint_layout.addWidget(QLabel('Checkpoint:'))
-
-        self.checkpoint_edit = QLineEdit()
-        self.checkpoint_edit.setText(
-            self._default_mask2former_checkpoint_text()
-        )
-        self.checkpoint_edit.setPlaceholderText('model_final.pth')
-        self.checkpoint_edit.setMaximumWidth(lineedit_w)
-        checkpoint_layout.addWidget(self.checkpoint_edit)
-
-        self.btn_browse_checkpoint = QPushButton('Browse')
-        self.btn_browse_checkpoint.clicked.connect(
-            self._browse_mask2former_checkpoint
-        )
-        checkpoint_layout.addWidget(self.btn_browse_checkpoint)
-        advanced_layout.addLayout(checkpoint_layout)
-
         config_layout = QHBoxLayout()
         config_layout.setContentsMargins(0, 0, 0, 0)
         config_layout.setSpacing(6)
@@ -1100,6 +1101,33 @@ class SegmentationWidget(QWidget):
         self.btn_browse_seg_config.clicked.connect(self._browse_seg_config)
         config_layout.addWidget(self.btn_browse_seg_config)
         advanced_layout.addLayout(config_layout)
+
+        # ---------------- GPU selection ----------------
+        gpu_layout = QHBoxLayout()
+        gpu_layout.setContentsMargins(0, 0, 0, 0)
+        gpu_layout.setSpacing(6)
+        gpu_layout.addWidget(QLabel('GPU IDs:'))
+
+        self.gpu_combo = QComboBox()
+        self.gpu_combo.setEditable(True)
+        self.gpu_combo.setToolTip(
+            'Select PyTorch-visible CUDA device index. '
+            'Examples: 0, 1, 0,1. '
+            'If CUDA_VISIBLE_DEVICES was set before launching napari, '
+            'cuda:0 may correspond to a different physical GPU '
+            'in nvidia-smi.'
+        )
+        self.gpu_combo.setMaximumWidth(lineedit_w)
+        gpu_layout.addWidget(self.gpu_combo)
+
+        self.btn_refresh_gpu = QPushButton('Refresh')
+        self.btn_refresh_gpu.clicked.connect(self._populate_gpu_combo)
+        gpu_layout.addWidget(self.btn_refresh_gpu)
+
+        gpu_layout.addStretch()
+        advanced_layout.addLayout(gpu_layout)
+
+        self._populate_gpu_combo()
 
         # ====================================================
         # Normalization and Filtering
@@ -1140,33 +1168,6 @@ class SegmentationWidget(QWidget):
 
         percentile_layout.addStretch()
         advanced_layout.addLayout(percentile_layout)
-
-        # Cell radius
-        cell_radius_layout = QHBoxLayout()
-        cell_radius_layout.setContentsMargins(0, 0, 0, 0)
-        cell_radius_layout.setSpacing(4)
-
-        lbl_cell_radius = QLabel('Cell radius (pixel):')
-        lbl_cell_radius.setFixedWidth(140)
-        cell_radius_layout.addWidget(lbl_cell_radius)
-
-        self.seg_cell_radius_spin = NoWheelDoubleSpinBox()
-        self.seg_cell_radius_spin.setRange(0.1, 1000.0)
-        self.seg_cell_radius_spin.setDecimals(1)
-        self.seg_cell_radius_spin.setSingleStep(0.5)
-        self.seg_cell_radius_spin.setValue(15.0)
-        self.seg_cell_radius_spin.setFixedWidth(small_int_w)
-        self.seg_cell_radius_spin.setStyleSheet(compact_spinbox_style)
-        self.seg_cell_radius_spin.setToolTip(
-            'Estimated cell radius in XY pixels. '
-            'The inference image will be resampled so that the cell radius '
-            'is approximately 15 pixels.'
-        )
-
-        cell_radius_layout.addWidget(self.seg_cell_radius_spin)
-        cell_radius_layout.addStretch()
-
-        advanced_layout.addLayout(cell_radius_layout)
 
         # gaussian_title_layout = QHBoxLayout()
         # gaussian_title_layout.setContentsMargins(0, 0, 0, 0)
@@ -1286,24 +1287,6 @@ class SegmentationWidget(QWidget):
         stride_layout.addStretch()
         advanced_layout.addLayout(stride_layout)
 
-        bg_layout = QHBoxLayout()
-        bg_layout.setContentsMargins(0, 0, 0, 0)
-        bg_layout.setSpacing(4)
-        lbl_bg = QLabel('Background intensity:')
-        lbl_bg.setFixedWidth(140)
-        bg_layout.addWidget(lbl_bg)
-
-        self.background_threshold_spin = NoWheelDoubleSpinBox()
-        self.background_threshold_spin.setRange(-1e9, 1e9)
-        self.background_threshold_spin.setDecimals(1)
-        self.background_threshold_spin.setSingleStep(0.1)
-        self.background_threshold_spin.setValue(1.0)
-        self.background_threshold_spin.setFixedWidth(small_int_w)
-        self.background_threshold_spin.setStyleSheet(compact_spinbox_style)
-        bg_layout.addWidget(self.background_threshold_spin)
-        bg_layout.addStretch()
-        advanced_layout.addLayout(bg_layout)
-
         batch_layout = QHBoxLayout()
         batch_layout.setContentsMargins(0, 0, 0, 0)
         batch_layout.setSpacing(4)
@@ -1378,48 +1361,6 @@ class SegmentationWidget(QWidget):
         min_edge_layout.addWidget(self.min_edge_area_spin)
         min_edge_layout.addStretch()
         advanced_layout.addLayout(min_edge_layout)
-
-        size3d_title = QLabel('Size filter (3D)')
-        size3d_title.setStyleSheet(section_title_style)
-        advanced_layout.addWidget(size3d_title)
-
-        size_min_layout = QHBoxLayout()
-        size_min_layout.setContentsMargins(0, 0, 0, 0)
-        size_min_layout.setSpacing(4)
-        lbl_size_min = QLabel('Min size (3D):')
-        lbl_size_min.setFixedWidth(140)
-        size_min_layout.addWidget(lbl_size_min)
-
-        self.size_filter_min_size_spin = NoWheelSpinBox()
-        self.size_filter_min_size_spin.setRange(0, 1000000000)
-        self.size_filter_min_size_spin.setValue(0)
-        self.size_filter_min_size_spin.setFixedWidth(small_int_w)
-        self.size_filter_min_size_spin.setStyleSheet(compact_spinbox_style)
-        self.size_filter_min_size_spin.setToolTip(
-            'Minimum 3D object size in voxels. 0 disables minimum-size filtering.'
-        )
-        size_min_layout.addWidget(self.size_filter_min_size_spin)
-        size_min_layout.addStretch()
-        advanced_layout.addLayout(size_min_layout)
-
-        size_max_layout = QHBoxLayout()
-        size_max_layout.setContentsMargins(0, 0, 0, 0)
-        size_max_layout.setSpacing(4)
-        lbl_size_max = QLabel('Max size (3D):')
-        lbl_size_max.setFixedWidth(140)
-        size_max_layout.addWidget(lbl_size_max)
-
-        self.size_filter_max_size_spin = NoWheelSpinBox()
-        self.size_filter_max_size_spin.setRange(1, 1000000000)
-        self.size_filter_max_size_spin.setValue(100000)
-        self.size_filter_max_size_spin.setFixedWidth(small_int_w)
-        self.size_filter_max_size_spin.setStyleSheet(compact_spinbox_style)
-        self.size_filter_max_size_spin.setToolTip(
-            'Maximum 3D object size in voxels. Default: 100000.'
-        )
-        size_max_layout.addWidget(self.size_filter_max_size_spin)
-        size_max_layout.addStretch()
-        advanced_layout.addLayout(size_max_layout)
 
         self.seg_advanced_widget.setVisible(False)
         auto_main_layout.addWidget(self.seg_advanced_widget)
@@ -1517,35 +1458,72 @@ class SegmentationWidget(QWidget):
         )
         finetune_layout.addWidget(self.btn_choose_and_curate)
 
-        ckpt_save_layout = QHBoxLayout()
-        ckpt_save_layout.addWidget(QLabel('Checkpoint Dir:'))
+        # ---------------- Fine-tuning instruction ----------------
+        finetune_note_header_layout = QHBoxLayout()
+        finetune_note_header_layout.setContentsMargins(0, 2, 0, 0)
+        finetune_note_header_layout.setSpacing(4)
 
-        self.finetune_checkpoint_save_edit = QLineEdit()
-        self.finetune_checkpoint_save_edit.setText(
-            self._default_finetune_checkpoint_path()
+        self.btn_toggle_finetune_note = QToolButton()
+        self.btn_toggle_finetune_note.setCheckable(True)
+        self.btn_toggle_finetune_note.setChecked(False)
+        self.btn_toggle_finetune_note.setArrowType(Qt.RightArrow)
+        self.btn_toggle_finetune_note.setToolTip(
+            'Show fine-tuning instructions'
         )
-        self.finetune_checkpoint_save_edit.setMaximumWidth(lineedit_w)
-        ckpt_save_layout.addWidget(self.finetune_checkpoint_save_edit)
-
-        self.btn_browse_finetune_checkpoint_save = QPushButton('Browse')
-        self.btn_browse_finetune_checkpoint_save.clicked.connect(
-            self._browse_finetune_checkpoint_save_path
+        self.btn_toggle_finetune_note.toggled.connect(
+            self._toggle_finetune_note
         )
-        ckpt_save_layout.addWidget(self.btn_browse_finetune_checkpoint_save)
+        finetune_note_header_layout.addWidget(self.btn_toggle_finetune_note)
 
-        finetune_layout.addLayout(ckpt_save_layout)
+        finetune_note_title = QLabel('Fine-tune')
+        finetune_note_header_layout.addWidget(finetune_note_title)
+        finetune_note_header_layout.addStretch()
 
-        self.btn_run_finetune = QPushButton('Run Fine-tune')
-        self.btn_run_finetune.clicked.connect(
-            self._run_finetune_from_curated_patches
+        finetune_layout.addLayout(finetune_note_header_layout)
+
+        # The instruction card is hidden by default.
+        self.finetune_note_widget = QWidget()
+        self.finetune_note_widget.setObjectName('FineTuneNoteWidget')
+        self.finetune_note_widget.setStyleSheet(
+            """
+            QWidget#FineTuneNoteWidget {
+                background-color: rgba(255, 255, 255, 10);
+                border: 1px solid #555555;
+                border-radius: 4px;
+            }
+
+            QWidget#FineTuneNoteWidget QLabel {
+                background-color: transparent;
+                border: none;
+                color: #b8b8b8;
+                font-weight: normal;
+            }
+            """
         )
-        finetune_layout.addWidget(self.btn_run_finetune)
+
+        finetune_note_layout = QVBoxLayout(self.finetune_note_widget)
+        finetune_note_layout.setContentsMargins(8, 6, 8, 6)
+        finetune_note_layout.setSpacing(2)
+
+        self.finetune_instruction_label = QLabel(
+            'After saving the curated patches, run '
+            'notebooks/02_finetune.ipynb to fine-tune the model.'
+        )
+        self.finetune_instruction_label.setWordWrap(True)
+        self.finetune_instruction_label.setTextInteractionFlags(
+            Qt.TextSelectableByMouse
+        )
+
+        finetune_note_layout.addWidget(self.finetune_instruction_label)
+
+        self.finetune_note_widget.setVisible(False)
+        finetune_layout.addWidget(self.finetune_note_widget)
 
         finetune_group.setLayout(finetune_layout)
+
         layout.addWidget(finetune_group)
 
         layout.addSpacing(15)
-
         layout.addStretch()
 
     def _init_analysis_tab(self):
@@ -2434,6 +2412,17 @@ class SegmentationWidget(QWidget):
         )
         self.seg_advanced_widget.setVisible(expanded)
 
+    def _toggle_finetune_note(self, expanded):
+        """
+        Show or hide the fine-tuning instruction card.
+        """
+        expanded = bool(expanded)
+
+        self.btn_toggle_finetune_note.setArrowType(
+            Qt.DownArrow if expanded else Qt.RightArrow
+        )
+        self.finetune_note_widget.setVisible(expanded)
+
     def _browse_seg_save_path(self):
         folder = QFileDialog.getExistingDirectory(
             self, 'Select Segmentation Output Folder'
@@ -2863,28 +2852,6 @@ class SegmentationWidget(QWidget):
             self._default_curated_patch_save_dir()
         )
 
-    def _default_finetune_checkpoint_path(self):
-        """
-        Fine-tuning output directory.
-
-        Default:
-            current segmentation output path
-        """
-        output_path = ''
-
-        if hasattr(self, 'save_seg_path_edit'):
-            output_path = self.save_seg_path_edit.text().strip()
-
-        if not output_path:
-            active = self._get_first_image_layer()
-            output_path = self._default_seg_output_path(active)
-
-        p = Path(output_path).expanduser()
-        if not p.is_absolute():
-            p = Path.cwd() / p
-
-        return str(p)
-
     def _browse_mask2former_checkpoint(self):
         default_dir = (
             self._mask2former_root()
@@ -2905,215 +2872,6 @@ class SegmentationWidget(QWidget):
         )
         if file_path:
             self.checkpoint_edit.setText(file_path)
-
-    def _browse_finetune_checkpoint_save_path(self):
-        default_path = self.finetune_checkpoint_save_edit.text().strip()
-
-        if not default_path:
-            default_path = self._default_finetune_checkpoint_path()
-
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            'Select Fine-tuning Output Directory',
-            default_path,
-        )
-
-        if folder:
-            self.finetune_checkpoint_save_edit.setText(folder)
-
-    @staticmethod
-    def _check_finetune_backend_available():
-        """
-        Check dependencies required by fine-tuning.
-
-        Fine-tuning requires the Detectron2/Mask2Former training backend.
-        One-click segmentation does not require this backend by default.
-        """
-        missing = []
-
-        try:
-            import torch  # noqa: F401
-        except Exception:
-            missing.append('torch')
-
-        try:
-            import torchvision  # noqa: F401
-        except Exception:
-            missing.append('torchvision')
-
-        try:
-            import detectron2  # noqa: F401
-        except Exception:
-            missing.append('detectron2')
-
-        try:
-            from focus3d.segmentation.FOCUS3D import fine_tune  # noqa: F401
-        except Exception as e:
-            missing.append(f'FOCUS3D fine_tune backend ({e})')
-
-        if missing:
-            return False, missing
-
-        return True, []
-
-    def _run_finetune_from_curated_patches(self):
-        curated_dir = self.curated_patch_save_dir_edit.text().strip()
-        output_dir = self.finetune_checkpoint_save_edit.text().strip()
-
-        if not curated_dir:
-            notifications.show_error(
-                'Please choose curated patch save directory.'
-            )
-            return
-
-        if not output_dir:
-            notifications.show_error(
-                'Please choose fine-tuning output directory.'
-            )
-            return
-
-        curated_dir = str(Path(curated_dir).expanduser())
-        output_dir = str(Path(output_dir).expanduser())
-
-        if not Path(curated_dir).exists():
-            notifications.show_error(
-                f'Curated patch directory does not exist:\n{curated_dir}\n\n'
-                f'Please save curated patches first.'
-            )
-            return
-
-        # Expected training data structure:
-        # curated_patch/
-        #   imagesTr/
-        #   labelsTr/
-        images_tr = Path(curated_dir) / 'imagesTr'
-        labels_tr = Path(curated_dir) / 'labelsTr'
-
-        if not images_tr.exists() or not labels_tr.exists():
-            notifications.show_error(
-                f'Curated patch directory must contain imagesTr and labelsTr:\n'
-                f'{curated_dir}'
-            )
-            return
-
-        config_file = self.seg_config_edit.text().strip()
-        if not config_file:
-            config_file = self._default_mask2former_config_text()
-            self.seg_config_edit.setText(config_file)
-
-        init_checkpoint = self.checkpoint_edit.text().strip()
-        if not init_checkpoint:
-            init_checkpoint = self._default_mask2former_checkpoint_text()
-            self.checkpoint_edit.setText(init_checkpoint)
-
-        cuda_visible_devices = self._selected_cuda_visible_devices()
-
-        ok, missing = self._check_finetune_backend_available()
-        if not ok:
-            notifications.show_error(
-                'Fine-tuning requires the Detectron2 training backend.\n\n'
-                'Missing or failed dependency:\n'
-                + '\n'.join(f'- {m}' for m in missing)
-                + '\n\nPlease install Detectron2 following the official guide before running fine-tuning.'
-            )
-            return
-
-        self.finetune_progress_dialog = QProgressDialog(
-            'Preparing fine-tuning...', 'Cancel', 0, 100, self
-        )
-        self.finetune_progress_dialog.setWindowTitle('Fine-tuning Progress')
-        self.finetune_progress_dialog.setAutoClose(True)
-        self.finetune_progress_dialog.setAutoReset(True)
-
-        # Fine-tune currently emits status-only values (-1).
-        # Use an indeterminate progress bar.
-        self.finetune_progress_dialog.setRange(0, 0)
-        self.finetune_progress_dialog.show()
-
-        self.finetune_thread = QThread()
-        self.finetune_worker = FineTuneWorker(
-            config_file=config_file,
-            curated_patch_dir=curated_dir,
-            output_dir=output_dir,
-            init_checkpoint=init_checkpoint,
-            cuda_visible_devices=cuda_visible_devices,
-            resume=True,
-            opts=[],
-        )
-
-        self.finetune_worker.moveToThread(self.finetune_thread)
-
-        self.finetune_thread.started.connect(self.finetune_worker.run)
-
-        self.finetune_worker.progress.connect(self._on_finetune_progress)
-        self.finetune_worker.finished.connect(self._on_finetune_finished)
-        self.finetune_worker.cancelled.connect(self._on_finetune_cancelled)
-
-        self.finetune_progress_dialog.canceled.connect(
-            self.finetune_worker.cancel
-        )
-        self.finetune_progress_dialog.canceled.connect(
-            self.finetune_thread.quit
-        )
-
-        self.finetune_worker.finished.connect(self.finetune_thread.quit)
-        self.finetune_worker.cancelled.connect(self.finetune_thread.quit)
-
-        self.finetune_worker.finished.connect(self.finetune_worker.deleteLater)
-        self.finetune_thread.finished.connect(self.finetune_thread.deleteLater)
-
-        self.finetune_thread.start()
-
-    def _on_finetune_progress(self, value, message):
-        if (
-            hasattr(self, 'finetune_progress_dialog')
-            and self.finetune_progress_dialog is not None
-        ):
-            self.finetune_progress_dialog.setLabelText(str(message))
-
-            # value < 0 means status-only.
-            # Keep indeterminate progress bar.
-            if int(value) >= 0:
-                self.finetune_progress_dialog.setRange(0, 100)
-                self.finetune_progress_dialog.setValue(int(value))
-
-    def _on_finetune_finished(self, result, error_msg):
-        if (
-            hasattr(self, 'finetune_progress_dialog')
-            and self.finetune_progress_dialog is not None
-        ):
-            self.finetune_progress_dialog.close()
-
-        if error_msg:
-            notifications.show_error(error_msg)
-            return
-
-        if result is None:
-            notifications.show_warning('Fine-tuning returned no result.')
-            return
-
-        final_checkpoint = result.get('final_checkpoint', None)
-        output_dir = result.get('output_dir', None)
-
-        if final_checkpoint:
-            self.checkpoint_edit.setText(final_checkpoint)
-            notifications.show_info(
-                f'Fine-tuning completed.\nNew checkpoint:\n{final_checkpoint}'
-            )
-        else:
-            notifications.show_warning(
-                f'Fine-tuning completed, but no checkpoint was found.\n'
-                f'Output directory:\n{output_dir}'
-            )
-
-    def _on_finetune_cancelled(self):
-        if (
-            hasattr(self, 'finetune_progress_dialog')
-            and self.finetune_progress_dialog is not None
-        ):
-            self.finetune_progress_dialog.close()
-
-        notifications.show_info('Fine-tuning cancelled.')
 
     def _toggle_contour(self, checked):
         for layer in self.viewer.layers:
@@ -3701,18 +3459,12 @@ class SegmentationWidget(QWidget):
         # ------------------------------------------------------------
         # 1. Extract labels from result
         # ------------------------------------------------------------
-        confidence = None
         instance_path = None
-        confidence_path = None
-        log_path = None
         mode = None
 
         if isinstance(result, dict):
             labels = result.get('instance_map', None)
-            confidence = result.get('confidence_map', None)
             instance_path = result.get('instance_map_path', None)
-            confidence_path = result.get('confidence_map_path', None)
-            log_path = result.get('log_json_path', None)
             mode = result.get('mode', 'auto')
         else:
             labels = result
@@ -3836,7 +3588,13 @@ class SegmentationWidget(QWidget):
             )
             curation_dir.mkdir(parents=True, exist_ok=True)
 
-        editable_zarr_path = curation_dir / 'curation_labels.zarr'
+        if instance_path:
+            editable_zarr_path = Path(instance_path).with_suffix('.zarr')
+        else:
+            safe_name = self._sanitize_name_for_path(name)
+            editable_zarr_path = (
+                curation_dir / f'{safe_name}_instance_map.zarr'
+            )
 
         try:
             labels_to_show, max_label = _make_editable_zarr(
@@ -3879,36 +3637,6 @@ class SegmentationWidget(QWidget):
         with contextlib.suppress(Exception):
             self.viewer.layers.selection.active = layer
 
-        # ------------------------------------------------------------
-        # 4. Optionally add confidence map as hidden image layer
-        #    Confidence is image-only, so dask is OK here.
-        # ------------------------------------------------------------
-        if confidence is not None:
-            try:
-                conf_to_show = confidence
-                if (
-                    isinstance(confidence, np.ndarray)
-                    and confidence.nbytes > 100e6
-                ):
-                    conf_to_show = da.from_array(confidence, chunks='auto')
-
-                conf_name = f'{name}_confidence'
-
-                if conf_name in self.viewer.layers:
-                    self.viewer.layers.remove(conf_name)
-
-                conf_layer = self.viewer.add_image(
-                    conf_to_show,
-                    name=conf_name,
-                    visible=False,
-                )
-                with contextlib.suppress(Exception):
-                    conf_layer.colormap = 'magma'
-            except Exception as e:
-                notifications.show_warning(
-                    f'Failed to add confidence map: {e}'
-                )
-
         # Force segmentation layer to be the shown/active layer.
         try:
             layer.visible = True
@@ -3936,7 +3664,6 @@ class SegmentationWidget(QWidget):
                 note=(
                     f'Editable curation label stored at {editable_zarr_path}; '
                     f'original_instance={instance_path}; '
-                    f'confidence={confidence_path}; log={log_path}'
                 ),
             )
         except Exception as e:
@@ -3952,8 +3679,6 @@ class SegmentationWidget(QWidget):
 
         if instance_path:
             msg += f'\nOriginal instance map saved to:\n{instance_path}'
-        if log_path:
-            msg += f'\nLog saved to:\n{log_path}'
 
         notifications.show_info(msg)
 
