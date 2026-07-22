@@ -195,9 +195,6 @@ The complete descriptions of all controls are maintained in:
 - [Keyboard shortcuts](docs/MENU_REFERENCE.md#keyboard-shortcuts)
 - [Output files and folders](docs/MENU_REFERENCE.md#output-files-and-folders)
 
-Keeping the full control reference in a separate document makes this README easier to follow as a beginner-oriented workflow.
-
-</details>
 
 ## Issues
 
