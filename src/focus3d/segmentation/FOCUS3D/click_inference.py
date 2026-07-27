@@ -10,77 +10,21 @@ import torch
 import torch.nn.functional as F
 from scipy import ndimage as ndi
 
-
-def _is_windows_focus3d_backend():
-    """
-    Decide whether to use the Windows no-Detectron2 backend.
-
-    Default:
-        Windows -> inference_win.py
-        Linux   -> inference.py
-
-    Override:
-        CELLSEG_FOCUS3D_BACKEND=windows
-        CELLSEG_FOCUS3D_BACKEND=detectron2
-    """
-    backend = os.environ.get('CELLSEG_FOCUS3D_BACKEND', 'auto').strip().lower()
-
-    if backend in {'windows', 'win', 'nod2', 'no_detectron2', 'pytorch'}:
-        return True
-
-    if backend in {'detectron2', 'd2', 'linux'}:
-        return False
-
-    return os.name == 'nt'
-
-
 import sys
 
 _FOCUS3D_DIR = Path(__file__).resolve().parent
 if str(_FOCUS3D_DIR) not in sys.path:
     sys.path.insert(0, str(_FOCUS3D_DIR))
 
-if _is_windows_focus3d_backend():
-    # Windows / no-Detectron2 path
-    if __package__:
-        from .inference_win import normalize_img, read_volume
-    else:
-        from inference_win import normalize_img, read_volume
+
+if __package__:
+    from .inference_win import normalize_img, read_volume
 else:
-    # Linux / Detectron2 path
-    if __package__:
-        from .inference import normalize_img, read_volume
-    else:
-        from inference import normalize_img, read_volume
+    from inference_win import normalize_img, read_volume
+
 # ============================================================
 # Refine local area
 # ============================================================
-
-
-def _load_clicked_inference_image(image):
-    """
-    Support both image path and already-loaded ndarray.
-
-    Returns
-    -------
-    image_zyx : np.ndarray
-        3D image in Z/Y/X order.
-    """
-    if isinstance(image, (str, Path)):
-        image_zyx = read_volume(image)
-    else:
-        image_zyx = np.asarray(image)
-
-    image_zyx = np.squeeze(image_zyx)
-
-    if image_zyx.ndim != 3:
-        raise ValueError(
-            f'Clicked inference expects a 3D image in Z/Y/X order, '
-            f'got shape={image_zyx.shape}.'
-        )
-
-    return image_zyx.astype(np.float32, copy=False)
-
 
 def crop_centered_patch_3d(
     volume: np.ndarray,

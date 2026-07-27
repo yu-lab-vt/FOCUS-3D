@@ -1,15 +1,9 @@
-import os
 import json
 import math
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
-import sys
-
-FOCUS3D_ROOT = Path(__file__).resolve().parent
-if str(FOCUS3D_ROOT) not in sys.path:
-    sys.path.insert(0, str(FOCUS3D_ROOT))
-from mask2former import add_maskformer2_config
+from .mask2former.config import add_maskformer2_config
 from detectron2.config import get_cfg
 from detectron2.modeling import build_model
 from detectron2.checkpoint import DetectionCheckpointer

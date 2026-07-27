@@ -1381,20 +1381,20 @@ class SegmentationWidget(QWidget):
         local_refine_group.setStyleSheet(group_style)
         local_refine_layout = QVBoxLayout()
 
-        self.btn_enter_local_refinement = QPushButton('Enter Inactive Mode')
+        self.btn_enter_local_refinement = QPushButton('Enter Interactive Mode')
         self.btn_enter_local_refinement.clicked.connect(
             self._enter_local_refinement_mode
         )
         local_refine_layout.addWidget(self.btn_enter_local_refinement)
 
-        self.btn_exit_local_refinement = QPushButton('Exit Inactive Mode')
+        self.btn_exit_local_refinement = QPushButton('Exit Interactive Mode')
         self.btn_exit_local_refinement.clicked.connect(
             self._exit_local_refinement_mode
         )
         self.btn_exit_local_refinement.setEnabled(False)
         local_refine_layout.addWidget(self.btn_exit_local_refinement)
 
-        self.local_refine_status_label = QLabel('Inactive')
+        self.local_refine_status_label = QLabel('Interactive')
         self.local_refine_status_label.setStyleSheet('color: #aaaaaa;')
         local_refine_layout.addWidget(self.local_refine_status_label)
 
@@ -3088,7 +3088,12 @@ class SegmentationWidget(QWidget):
 
         return labels_layers[0]
 
-    def _create_empty_label(self):
+    def _create_empty_label(
+        self,
+        *args,
+        image_layer=None,
+        show_notification=True,
+    ):
         """
         Create an all-zero editable label layer with the same shape as
         the current image layer.
@@ -3096,7 +3101,9 @@ class SegmentationWidget(QWidget):
         The empty label is stored as zarr to avoid allocating a large
         dense numpy array in memory.
         """
-        image_layer = self._get_active_image(show_error=False)
+
+        if image_layer is None:
+            image_layer = self._get_active_image(show_error=False)
 
         if image_layer is None:
             image_layer = self._get_first_image_layer()
@@ -3144,6 +3151,16 @@ class SegmentationWidget(QWidget):
 
         editable_zarr_path = curation_dir / 'curation_labels.zarr'
 
+        # Do not silently overwrite an existing editable label.
+        if editable_zarr_path.exists():
+            index = 1
+            while True:
+                candidate = curation_dir / f'curation_labels_{index}.zarr'
+                if not candidate.exists():
+                    editable_zarr_path = candidate
+                    break
+                index += 1
+
         # If a previous empty label layer with the same name exists, remove it first.
         layer_name = f'{image_layer.name}_empty_label'
         with contextlib.suppress(Exception):
@@ -3151,12 +3168,7 @@ class SegmentationWidget(QWidget):
                 self.viewer.layers.remove(layer_name)
 
         try:
-            import shutil
-
             import zarr
-
-            if editable_zarr_path.exists():
-                shutil.rmtree(editable_zarr_path)
 
             chunks = (
                 1,
@@ -3222,10 +3234,13 @@ class SegmentationWidget(QWidget):
                 f'Empty label created, but failed to initialize curation log: {e}'
             )
 
-        notifications.show_info(
-            f'Empty label created with shape {shape}.\n'
-            f'Editable label saved to:\n{editable_zarr_path}'
-        )
+        if show_notification:
+            notifications.show_info(
+                f'Empty label created with shape {shape}.\n'
+                f'Editable label saved to:\n{editable_zarr_path}'
+            )
+
+        return layer
 
     # ---------- Segmentation actions ----------
     def _segment_3d(self):

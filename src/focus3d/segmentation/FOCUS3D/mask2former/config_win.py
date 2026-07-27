@@ -1,5 +1,6 @@
 """
-Detectron2-free config system for Windows FOCUS3D inference/fine-tuning.
+Detectron2-free config system for cross-platform FOCUS-3D inference.
+
 
 This file replaces:
     from detectron2.config import get_cfg

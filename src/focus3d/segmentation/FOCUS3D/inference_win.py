@@ -1,7 +1,6 @@
 import json
 import math
 import shutil
-import sys
 import time
 import traceback
 from collections.abc import Callable
@@ -16,22 +15,10 @@ from scipy.ndimage import find_objects
 from skimage.measure import label as sk_label
 from tqdm.auto import tqdm
 
-_FOCUS3D_DIR = Path(__file__).resolve().parent
-if str(_FOCUS3D_DIR) not in sys.path:
-    sys.path.insert(0, str(_FOCUS3D_DIR))
-
-if __package__:
-    # Imported as cellseg.segmentation.FOCUS3D.inference_win
-    from .mask2former.config_win import get_cfg
-    from .mask2former.maskformer_model_win import (
-        build_maskformer_model_from_cfg,
-    )
-else:
-    # Imported directly from FOCUS3D directory
-    from mask2former.config_win import get_cfg
-    from mask2former.maskformer_model_win import (
-        build_maskformer_model_from_cfg,
-    )
+from .mask2former.config_win import get_cfg
+from .mask2former.maskformer_model_win import (
+    build_maskformer_model_from_cfg,
+)
 
 def identity_collate(batch):
     return batch
@@ -136,13 +123,13 @@ def build_predictor(cfg):
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
-    print(f'[Windows no-D2] Missing keys: {len(missing)}')
-    if missing:
-        print('  First missing keys:', missing[:20])
+    # print(f'[Windows no-D2] Missing keys: {len(missing)}')
+    # if missing:
+    #     print('  First missing keys:', missing[:20])
 
-    print(f'[Windows no-D2] Unexpected keys: {len(unexpected)}')
-    if unexpected:
-        print('  First unexpected keys:', unexpected[:20])
+    # print(f'[Windows no-D2] Unexpected keys: {len(unexpected)}')
+    # if unexpected:
+    #     print('  First unexpected keys:', unexpected[:20])
 
     model.eval()
     model.to(cfg.MODEL.DEVICE)
@@ -195,17 +182,17 @@ def activate_inference_device(device: str | None = None) -> str:
         torch_device = torch.device(device)
         torch.cuda.set_device(torch_device)
 
-        print(f'[FOCUS3D inference_win] requested device: {device}')
+        print(f'[FOCUS3D inference] requested device: {device}')
         print(
-            f'[FOCUS3D inference_win] current cuda device: '
+            f'[FOCUS3D inference] current cuda device: '
             f'cuda:{torch.cuda.current_device()}'
         )
         print(
-            f'[FOCUS3D inference_win] GPU name: '
+            f'[FOCUS3D inference] GPU name: '
             f'{torch.cuda.get_device_name(torch_device.index)}'
         )
     else:
-        print('[FOCUS3D inference_win] using CPU')
+        print('[FOCUS3D inference] using CPU')
 
     return device
 

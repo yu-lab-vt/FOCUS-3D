@@ -729,8 +729,12 @@ class ClickedLocalRefineWorker(QObject):
             result['cuda_visible_devices'] = self.cuda_visible_devices
 
             if not result.get('success', False):
-                reason = result.get('reason', 'unknown reason')
-                raise RuntimeError(f'Clicked inference failed: {reason}')
+                self.progress.emit(
+                    100,
+                    'No cell was detected at the clicked position.',
+                )
+                self.finished.emit(result)
+                return
 
             if result.get('instance_mask_full', None) is None:
                 raise RuntimeError(
@@ -1402,7 +1406,7 @@ def _on_one_click_model_loaded(self, model, cache_key, runtime_info):
             self.btn_exit_local_refinement.setEnabled(False)
         if hasattr(self, 'local_refine_status_label'):
             self.local_refine_status_label.setText(
-                'One-click segmentation inactive'
+                'One-click segmentation interactive'
             )
             self.local_refine_status_label.setStyleSheet('color: #aaaaaa;')
 
@@ -1488,7 +1492,7 @@ def _on_one_click_model_load_error(self, error_msg):
 
     if hasattr(self, 'local_refine_status_label'):
         self.local_refine_status_label.setText(
-            'One-click segmentation inactive'
+            'One-click segmentation interactive'
         )
         self.local_refine_status_label.setStyleSheet('color: #aaaaaa;')
 
@@ -1505,15 +1509,28 @@ def _enter_local_refinement_mode(self):
     freeze when the user clicks Enter One-click Segmentation.
     """
     image_layer = self._get_first_image_layer_for_refine()
-    labels_layer = self._get_labels_layer()
 
     if image_layer is None:
         notifications.show_error('Please load an image layer first.')
         return
 
+    labels_layer = self._get_labels_layer()
+
     if labels_layer is None:
-        notifications.show_error('Please load or create a label layer first.')
-        return
+        labels_layer = self._create_empty_label(
+            image_layer=image_layer,
+            show_notification=False,
+        )
+
+        if labels_layer is None:
+            # _create_empty_label() already displayed the concrete error.
+            return
+
+        notifications.show_info(
+            'No label layer was found.\n'
+            f'An empty editable label layer "{labels_layer.name}" '
+            'has been created automatically.'
+        )
 
     if image_layer.data.ndim != 3 or labels_layer.data.ndim != 3:
         notifications.show_error(
@@ -1657,7 +1674,7 @@ def _exit_local_refinement_mode(self):
         self.btn_exit_local_refinement.setEnabled(False)
 
     if hasattr(self, 'local_refine_status_label'):
-        self.local_refine_status_label.setText('Inactive')
+        self.local_refine_status_label.setText('interactive')
         self.local_refine_status_label.setStyleSheet('color: #aaaaaa;')
 
     notifications.show_info('One-click segmentation mode deactivated.')
@@ -1670,11 +1687,23 @@ def _start_clicked_local_refinement(self, coord_zyx):
     image_layer = self._get_first_image_layer_for_refine()
     labels_layer = self._get_labels_layer()
 
-    if image_layer is None or labels_layer is None:
-        notifications.show_error(
-            'Please load both image and label layers first.'
-        )
+    if image_layer is None:
+        notifications.show_error('Please load an image layer first.')
         return
+
+    if labels_layer is None:
+        labels_layer = self._create_empty_label(
+            image_layer=image_layer,
+            show_notification=False,
+        )
+
+        if labels_layer is None:
+            return
+
+        notifications.show_info(
+            'The label layer was missing, so a new empty editable '
+            'label layer was created automatically.'
+        )
 
     # Prefer original image path, because infer_clicked_instance already supports
     # file path and avoids copying the whole volume.
@@ -1864,6 +1893,64 @@ def _on_clicked_local_refinement_finished(self, result):
         and self.local_refine_progress is not None
     ):
         self.local_refine_progress.close()
+
+    if not isinstance(result, dict):
+        self._local_refine_busy = False
+        notifications.show_error(
+            'One-click segmentation returned an invalid result.'
+        )
+        return
+
+    # ------------------------------------------------------------
+    # No cell detected: this is a normal inference outcome.
+    # Keep interactive mode active and ask the user to click again.
+    # ------------------------------------------------------------
+    if not result.get('success', False):
+        self._local_refine_busy = False
+
+        reason = str(result.get('reason', 'unknown reason')).strip()
+        reason_lower = reason.lower()
+
+        no_cell_markers = (
+            'does not contain the clicked voxel',
+            'selected instance is too small',
+            'empty pred_masks or pred_scores',
+            'empty mask',
+            'click probability',
+        )
+
+        if any(marker in reason_lower for marker in no_cell_markers):
+            message = (
+                'No cell was detected near the clicked position. '
+                'Please click closer to the center of a visible cell and try again.'
+            )
+        else:
+            message = (
+                'No usable cell mask was produced at the clicked position.\n'
+                f'Detail: {reason}'
+            )
+
+        if getattr(self, '_local_refine_mode_active', False):
+            if hasattr(self, 'btn_enter_local_refinement'):
+                self.btn_enter_local_refinement.setEnabled(False)
+
+            if hasattr(self, 'btn_exit_local_refinement'):
+                self.btn_exit_local_refinement.setEnabled(True)
+
+            if hasattr(self, 'local_refine_status_label'):
+                self.local_refine_status_label.setText(
+                    'Active: no cell detected; click another position'
+                )
+                self.local_refine_status_label.setStyleSheet('color: #ffcc66;')
+        else:
+            if hasattr(self, 'btn_enter_local_refinement'):
+                self.btn_enter_local_refinement.setEnabled(True)
+
+            if hasattr(self, 'btn_exit_local_refinement'):
+                self.btn_exit_local_refinement.setEnabled(False)
+
+        notifications.show_warning(message)
+        return
 
     labels_layer = self._get_labels_layer()
     if labels_layer is None:
@@ -2126,9 +2213,30 @@ def _on_clicked_local_refinement_error(self, error_msg):
         if hasattr(self, 'btn_exit_local_refinement'):
             self.btn_exit_local_refinement.setEnabled(False)
 
-    notifications.show_error(
-        f'Clicked one-click segmentation failed: {error_msg}'
-    )
+    full_error = ''
+
+    try:
+        # Existing operations.
+        ...
+    except Exception:
+        full_error = traceback.format_exc()
+    finally:
+        # Restore UI state.
+        ...
+
+    if full_error:
+        print(
+            f'\n[One-click segmentation error]\n{full_error}',
+            flush=True,
+        )
+
+        error_lines = [
+            line.strip() for line in full_error.splitlines() if line.strip()
+        ]
+
+    short_error = error_lines[-1] if error_lines else 'Unknown error.'
+
+    notifications.show_error(f'One-click segmentation failed.\n{short_error}')
 
 
 def _install_local_refinement_callbacks(self):

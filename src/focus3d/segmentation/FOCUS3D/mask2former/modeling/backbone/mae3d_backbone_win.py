@@ -19,7 +19,7 @@ except ImportError:
 from dataclasses import dataclass
 from functools import partial
 
-from .vitadapter import ViTAdapter
+from .vitadapter.vitadapter_win import ViTAdapter
 
 # Import the 3D MAE model (adjust the import path as needed)
 try:

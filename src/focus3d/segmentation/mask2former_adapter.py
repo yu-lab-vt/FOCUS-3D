@@ -230,58 +230,111 @@ def _resolve_image_path(path: str | Path) -> str | None:
     return None
 
 
+# def _load_mask2former_inference_module():
+#     """
+#     Dynamically load FOCUS3D inference module.
+
+#     Backend selection:
+#     - Detectron2: FOCUS3D/inference.py
+#     - no Detectron2: FOCUS3D/inference_win.py
+#     """
+#     inference_py, backend_name = _select_inference_file()
+
+#     cache_key = (
+#         str(inference_py.resolve())
+#         if inference_py.exists()
+#         else str(inference_py)
+#     )
+#     if cache_key in _INFERENCE_MODULE_CACHE:
+#         return _INFERENCE_MODULE_CACHE[cache_key]
+
+#     if not inference_py.exists():
+#         raise FileNotFoundError(
+#             f"Cannot find FOCUS3D inference file for backend '{backend_name}':\n"
+#             f'{inference_py}\n\n'
+#             f'Expected files:\n'
+#             f'  Detectron2 backend: {INFERENCE_PY_DETECTRON2}\n'
+#             f'  Windows backend:    {INFERENCE_PY_NODETECTRON2}\n'
+#         )
+
+#     # Needed because inference.py / inference_win.py may import local modules
+#     # from the FOCUS3D folder.
+#     mask2former_dir_str = str(MASK2FORMER_DIR)
+#     if mask2former_dir_str not in sys.path:
+#         sys.path.insert(0, mask2former_dir_str)
+
+#     module_name = f'_cellseg_focus3d_inference_{backend_name}'
+
+#     spec = importlib.util.spec_from_file_location(
+#         module_name,
+#         str(inference_py),
+#     )
+#     if spec is None or spec.loader is None:
+#         raise ImportError(
+#             f'Failed to load inference module from {inference_py}'
+#         )
+
+#     module = importlib.util.module_from_spec(spec)
+#     sys.modules[module_name] = module
+#     spec.loader.exec_module(module)
+
+#     if not hasattr(module, 'infer_volume'):
+#         raise AttributeError(f'{inference_py} does not define infer_volume().')
+
+#     _INFERENCE_MODULE_CACHE[cache_key] = module
+#     return module
+
+
 def _load_mask2former_inference_module():
     """
-    Dynamically load FOCUS3D inference module.
+    Load the packaged no-Detectron2 inference implementation.
 
-    Backend selection:
-    - Detectron2: FOCUS3D/inference.py
-    - no Detectron2: FOCUS3D/inference_win.py
+    Use a package-qualified import so inference_win.py can use its
+    relative imports and cannot accidentally resolve another top-level
+    mask2former package.
     """
     inference_py, backend_name = _select_inference_file()
 
-    cache_key = (
-        str(inference_py.resolve())
-        if inference_py.exists()
-        else str(inference_py)
+    print(
+        f'[FOCUS3D adapter] selected backend: {backend_name}',
+        flush=True,
     )
-    if cache_key in _INFERENCE_MODULE_CACHE:
-        return _INFERENCE_MODULE_CACHE[cache_key]
+    print(
+        f'[FOCUS3D adapter] inference file: {inference_py}',
+        flush=True,
+    )
 
     if not inference_py.exists():
         raise FileNotFoundError(
-            f"Cannot find FOCUS3D inference file for backend '{backend_name}':\n"
-            f'{inference_py}\n\n'
-            f'Expected files:\n'
-            f'  Detectron2 backend: {INFERENCE_PY_DETECTRON2}\n'
-            f'  Windows backend:    {INFERENCE_PY_NODETECTRON2}\n'
+            f'Cannot find no-Detectron2 inference backend: {inference_py}'
         )
 
-    # Needed because inference.py / inference_win.py may import local modules
-    # from the FOCUS3D folder.
-    mask2former_dir_str = str(MASK2FORMER_DIR)
-    if mask2former_dir_str not in sys.path:
-        sys.path.insert(0, mask2former_dir_str)
+    # The adapter module is expected to be inside a package such as:
+    # focus3d.segmentation
+    # Therefore this resolves to:
+    # focus3d.segmentation.FOCUS3D.inference_win
+    module_name = f'{__package__}.FOCUS3D.inference_win'
 
-    module_name = f'_cellseg_focus3d_inference_{backend_name}'
-
-    spec = importlib.util.spec_from_file_location(
-        module_name,
-        str(inference_py),
-    )
-    if spec is None or spec.loader is None:
-        raise ImportError(
-            f'Failed to load inference module from {inference_py}'
+    if module_name in sys.modules:
+        module = sys.modules[module_name]
+    else:
+        print(
+            f'[FOCUS3D adapter] importing module: {module_name}',
+            flush=True,
         )
+        os.environ['CELLSEG_FOCUS3D_BACKEND'] = 'pytorch'
+        module = importlib.import_module(module_name)
 
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+        print(
+            f'[FOCUS3D adapter] imported module from: {module.__file__}',
+            flush=True,
+        )
 
     if not hasattr(module, 'infer_volume'):
-        raise AttributeError(f'{inference_py} does not define infer_volume().')
+        raise AttributeError(
+            f'{module.__file__} does not define infer_volume().'
+        )
 
-    _INFERENCE_MODULE_CACHE[cache_key] = module
     return module
 
 
