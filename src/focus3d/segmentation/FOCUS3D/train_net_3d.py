@@ -1,5 +1,14 @@
 # train_net_3d.py
 # Training script for 3D cell segmentation using modified Mask2Former components.
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=(
+        r"`torch\.cuda\.amp\.autocast\(args\.\.\.\)` "
+        r"is deprecated\..*"
+    ),
+)
 import copy
 import itertools
 import logging
@@ -33,11 +42,13 @@ FOCUS3D_ROOT = Path(__file__).resolve().parent
 if str(FOCUS3D_ROOT) not in sys.path:
     sys.path.insert(0, str(FOCUS3D_ROOT))
 # Import the modified components (ensure they are registered)
-from mask2former import add_maskformer2_config
+from mask2former.config import add_maskformer2_config
+from mask2former.maskformer_model import MaskFormer  # noqa: F401
 from mask2former.data.data_mapper import (
     MaskFormer3DInstanceDatasetMapper,
     register_real_dataset,
 )
+
 from mask2former.modeling.backbone.mae3d_backbone import D2MAE3DBackbone
 
 
@@ -52,8 +63,13 @@ class Trainer(DefaultTrainer):
         find_unused_parameters=True for DDP.
         """
         TrainerBase.__init__(self)
-        cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
 
+        cfg = DefaultTrainer.auto_scale_workers(
+            cfg,
+            comm.get_world_size(),
+        )
+
+        # These components must be constructed in this order.
         model = self.build_model(cfg)
         optimizer = self.build_optimizer(cfg, model)
         data_loader = self.build_train_loader(cfg)
@@ -63,13 +79,22 @@ class Trainer(DefaultTrainer):
             broadcast_buffers=False,
             find_unused_parameters=True,
         )
-        self.model = model
-        if cfg.SOLVER.AMP.ENABLED:
-            self._trainer = AMPTrainer(model, data_loader, optimizer)
-        else:
-            self._trainer = SimpleTrainer(model, data_loader, optimizer)
 
-        self.scheduler = self.build_lr_scheduler(cfg, optimizer)
+        trainer_cls = (
+            AMPTrainer
+            if cfg.SOLVER.AMP.ENABLED
+            else SimpleTrainer
+        )
+        self._trainer = trainer_cls(
+            model,
+            data_loader,
+            optimizer,
+        )
+
+        self.scheduler = self.build_lr_scheduler(
+            cfg,
+            optimizer,
+        )
 
         self.checkpointer = DetectionCheckpointer(
             model,
