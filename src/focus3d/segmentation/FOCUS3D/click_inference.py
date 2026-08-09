@@ -168,26 +168,10 @@ def select_clicked_query_instance(
     """
     Select the query corresponding to the clicked point and return one instance mask.
 
-    Query ranking score:
-        rank_score = click_prob * pred_score * mask_quality
-
-    Args:
-        model_output: One output dictionary from model([input])[0].
-        click_local_zyx: Click coordinate inside the cropped patch.
-        patch_shape: Expected patch shape in (Z, Y, X).
-        score_thresh: Minimum query classification score.
-        click_prob_thresh: Minimum mask probability at the clicked voxel.
-        mask_thresh: Default mask binarization threshold.
-        min_voxels: Minimum size of the final instance.
-        keep_clicked_component: If True, only keep the connected component containing the click.
-        adaptive_threshold_if_needed: If True, lower the mask threshold when the clicked voxel
-            is below mask_thresh but still above click_prob_thresh.
-        min_adaptive_thresh: Lower bound of adaptive threshold.
-
-    Returns:
-        A dictionary containing selected mask, probability map, query index, and debug info.
+    Query ranking is performed at the model's native mask resolution.
+    Only the selected query is resized to patch_shape.
     """
-    D, H, W = patch_shape
+    D, H, W = [int(v) for v in patch_shape]
     cz, cy, cx = [int(v) for v in click_local_zyx]
 
     if not (0 <= cz < D and 0 <= cy < H and 0 <= cx < W):
@@ -207,15 +191,19 @@ def select_clicked_query_instance(
             'selected_query': None,
         }
 
+    # ------------------------------------------------------------
+    # 1. Get raw model outputs
+    # ------------------------------------------------------------
     scores = model_output['pred_scores'].detach().float()
-    masks = model_output['pred_masks'].detach().float()
 
-    # Make scores shape (Q,).
+    # Keep mask in its original dtype here.
+    # Do not convert all query masks to float32 unnecessarily.
+    masks = model_output['pred_masks'].detach()
+
     if scores.ndim > 1:
         scores = scores.max(dim=-1).values
     scores = scores.flatten()
 
-    # Accept masks with shape (Q, D, H, W) or (Q, 1, D, H, W).
     if masks.ndim == 5 and masks.shape[1] == 1:
         masks = masks[:, 0]
 
@@ -226,7 +214,8 @@ def select_clicked_query_instance(
 
     if masks.shape[0] != scores.shape[0]:
         raise ValueError(
-            f'Number of masks and scores mismatch: masks={masks.shape[0]}, scores={scores.shape[0]}'
+            f'Number of masks and scores mismatch: '
+            f'masks={masks.shape[0]}, scores={scores.shape[0]}'
         )
 
     if masks.numel() == 0 or scores.numel() == 0:
@@ -238,28 +227,25 @@ def select_clicked_query_instance(
             'selected_query': None,
         }
 
-    # Resize masks to patch_shape if needed.
-    if tuple(masks.shape[-3:]) != tuple(patch_shape):
-        masks = F.interpolate(
-            masks[:, None],
-            size=patch_shape,
-            mode='trilinear',
-            align_corners=False,
-        )[:, 0]
+    # ------------------------------------------------------------
+    # 2. Work at native mask resolution for query selection
+    # ------------------------------------------------------------
+    md, mh, mw = [int(v) for v in masks.shape[-3:]]
 
-    # Convert logits to probabilities if needed.
-    if bool((masks.min() < 0 or masks.max() > 1).item()):
-        mask_prob = masks.sigmoid()
+    masks_are_logits = bool(
+        (
+            (masks.amin() < 0)
+            | (masks.amax() > 1)
+        ).item()
+    )
+
+    if masks_are_logits:
+        native_prob = masks.sigmoid()
     else:
-        mask_prob = masks.clamp(0.0, 1.0)
+        native_prob = masks.clamp(0.0, 1.0)
 
-    # Probability of each query at the clicked voxel.
-    # Use a local neighborhood around the clicked voxel instead of one single voxel.
-    # This is more robust when the user clicks on a boundary, membrane, weak signal,
-    # or a small local hole inside the predicted mask.
-    click_radius_zyx = (1, 3, 3)  # local window size: z +/-1, y/x +/-3
-
-    rz, ry, rx = click_radius_zyx
+    # Original click neighborhood in patch coordinates.
+    rz, ry, rx = 1, 3, 3
 
     z0 = max(0, cz - rz)
     z1 = min(D, cz + rz + 1)
@@ -270,70 +256,165 @@ def select_clicked_query_instance(
     x0 = max(0, cx - rx)
     x1 = min(W, cx + rx + 1)
 
-    local_prob = mask_prob[:, z0:z1, y0:y1, x0:x1]
+    # Map the click neighborhood into the native mask resolution.
+    mz0 = max(0, int(np.floor(z0 * md / D)))
+    mz1 = min(md, int(np.ceil(z1 * md / D)))
 
-    # Max response in the local click neighborhood.
-    click_prob = local_prob.flatten(1).max(dim=1).values
+    my0 = max(0, int(np.floor(y0 * mh / H)))
+    my1 = min(mh, int(np.ceil(y1 * mh / H)))
 
-    # Same mask-quality definition as your current patch postprocess.
-    mask_bin = mask_prob > mask_thresh
-    mask_area = mask_bin.flatten(1).sum(dim=1)
+    mx0 = max(0, int(np.floor(x0 * mw / W)))
+    mx1 = min(mw, int(np.ceil(x1 * mw / W)))
 
-    mask_quality = (mask_prob.flatten(1) * mask_bin.flatten(1)).sum(dim=1) / (
-        mask_area + 1e-6
+    # Safety for very small native mask dimensions.
+    mz1 = max(mz1, min(md, mz0 + 1))
+    my1 = max(my1, min(mh, my0 + 1))
+    mx1 = max(mx1, min(mw, mx0 + 1))
+
+    local_prob = native_prob[
+        :,
+        mz0:mz1,
+        my0:my1,
+        mx0:mx1,
+    ]
+
+    click_prob_native = local_prob.flatten(1).max(dim=1).values
+
+    # Mask quality at native resolution.
+    native_mask_bin = native_prob > float(mask_thresh)
+    native_mask_area = native_mask_bin.flatten(1).sum(dim=1)
+
+    mask_quality_native = (
+        native_prob.float().flatten(1)
+        * native_mask_bin.flatten(1)
+    ).sum(dim=1) / (
+        native_mask_area.float() + 1e-6
     )
 
-    # Rank queries by whether they explain the clicked point.
-    rank_score = (
-        click_prob * scores.clamp(min=0.0) * mask_quality.clamp(min=0.0)
+    rank_score_native = (
+        click_prob_native.float()
+        * scores.clamp(min=0.0)
+        * mask_quality_native.clamp(min=0.0)
     )
 
-    valid = torch.ones_like(rank_score, dtype=torch.bool)
+    # Approximate native mask area in patch-resolution voxel units.
+    area_scale = float(D * H * W) / float(md * mh * mw)
+    estimated_patch_area = native_mask_area.float() * area_scale
+
+    valid = torch.ones_like(rank_score_native, dtype=torch.bool)
     valid &= scores >= float(score_thresh)
-    valid &= click_prob >= float(click_prob_thresh)
-    valid &= mask_area >= int(min_voxels)
+    valid &= click_prob_native >= float(click_prob_thresh)
+    valid &= estimated_patch_area >= int(min_voxels)
 
     if valid.any():
-        rank_score_valid = rank_score.clone()
+        rank_score_valid = rank_score_native.clone()
         rank_score_valid[~valid] = -1.0
         selected_query = int(torch.argmax(rank_score_valid).item())
     else:
-        # Fallback: choose the query with the highest clicked-point probability.
-        selected_query = int(torch.argmax(click_prob).item())
+        selected_query = int(torch.argmax(click_prob_native).item())
 
-        best_click_prob = float(click_prob[selected_query].item())
+        best_click_prob = float(click_prob_native[selected_query].item())
 
-        # Do not fail too early. For clicked-instance inference, a low click probability
-        # can still be useful if this is the best query around the clicked region.
         if best_click_prob < float(click_prob_thresh):
             print(
-                f'[Warning] best local click probability is low: '
-                f'{best_click_prob:.4f} < click_prob_thresh={click_prob_thresh:.4f}. '
+                f'[Warning] best native local click probability is low: '
+                f'{best_click_prob:.4f} < '
+                f'click_prob_thresh={click_prob_thresh:.4f}. '
                 f'Still trying to return the best local query.'
             )
 
-    selected_prob = (
-        mask_prob[selected_query].detach().cpu().numpy().astype(np.float32)
-    )
-    selected_click_prob = float(click_prob[selected_query].item())
-    selected_score = float(scores[selected_query].item())
-    selected_mask_quality = float(mask_quality[selected_query].item())
-    selected_rank_score = float(rank_score[selected_query].item())
+    # ------------------------------------------------------------
+    # 3. Resize ONLY the selected query
+    # ------------------------------------------------------------
+    selected_mask = masks[
+        selected_query:selected_query + 1
+    ]
 
-    # If the clicked voxel is slightly below mask_thresh, use a lower threshold.
+    if tuple(selected_mask.shape[-3:]) != tuple(patch_shape):
+        selected_mask = F.interpolate(
+            selected_mask[:, None],
+            size=patch_shape,
+            mode='trilinear',
+            align_corners=False,
+        )[:, 0]
+
+    selected_mask = selected_mask[0]
+
+    if masks_are_logits:
+        selected_prob_tensor = selected_mask.sigmoid()
+    else:
+        selected_prob_tensor = selected_mask.clamp(0.0, 1.0)
+
+    # ------------------------------------------------------------
+    # 4. Recalculate final metrics at full patch resolution
+    # ------------------------------------------------------------
+    selected_click_prob = float(
+        selected_prob_tensor[
+            z0:z1,
+            y0:y1,
+            x0:x1,
+        ].max().item()
+    )
+
+    selected_mask_bin_default = selected_prob_tensor > float(mask_thresh)
+    selected_area_default = selected_mask_bin_default.sum()
+
+    selected_mask_quality = float(
+        (
+            selected_prob_tensor.float()
+            * selected_mask_bin_default
+        ).sum().item()
+        / (
+            float(selected_area_default.item()) + 1e-6
+        )
+    )
+
+    selected_score = float(scores[selected_query].item())
+
+    selected_rank_score = float(
+        selected_click_prob
+        * max(selected_score, 0.0)
+        * max(selected_mask_quality, 0.0)
+    )
+
+    selected_prob = (
+        selected_prob_tensor
+        .detach()
+        .float()
+        .cpu()
+        .numpy()
+        .astype(np.float32, copy=False)
+    )
+
+    # ------------------------------------------------------------
+    # 5. Threshold selected mask
+    # ------------------------------------------------------------
     used_mask_thresh = float(mask_thresh)
-    if adaptive_threshold_if_needed and selected_click_prob < mask_thresh:
+
+    if (
+        adaptive_threshold_if_needed
+        and selected_click_prob < float(mask_thresh)
+    ):
         used_mask_thresh = max(
             float(min_adaptive_thresh),
-            float(selected_click_prob) * 0.85,
+            selected_click_prob * 0.85,
         )
 
     instance_mask = selected_prob > used_mask_thresh
 
-    # Keep only the connected component that contains the clicked voxel.
+    # ------------------------------------------------------------
+    # 6. Keep connected component containing click
+    # ------------------------------------------------------------
     if keep_clicked_component:
-        structure = ndi.generate_binary_structure(rank=3, connectivity=1)
-        labeled_cc, num_cc = ndi.label(instance_mask, structure=structure)
+        structure = ndi.generate_binary_structure(
+            rank=3,
+            connectivity=1,
+        )
+
+        labeled_cc, _ = ndi.label(
+            instance_mask,
+            structure=structure,
+        )
 
         clicked_cc_id = int(labeled_cc[cz, cy, cx])
 
@@ -342,7 +423,10 @@ def select_clicked_query_instance(
         else:
             return {
                 'success': False,
-                'reason': 'selected query mask does not contain the clicked voxel after thresholding',
+                'reason': (
+                    'selected query mask does not contain the '
+                    'clicked voxel after thresholding'
+                ),
                 'instance_mask_patch': empty_mask,
                 'instance_prob_patch': selected_prob,
                 'selected_query': selected_query,
@@ -356,7 +440,10 @@ def select_clicked_query_instance(
     if int(instance_mask.sum()) < int(min_voxels):
         return {
             'success': False,
-            'reason': f'selected instance is too small: {int(instance_mask.sum())} voxels',
+            'reason': (
+                f'selected instance is too small: '
+                f'{int(instance_mask.sum())} voxels'
+            ),
             'instance_mask_patch': empty_mask,
             'instance_prob_patch': selected_prob,
             'selected_query': selected_query,
@@ -380,7 +467,6 @@ def select_clicked_query_instance(
         'used_mask_thresh': used_mask_thresh,
     }
 
-
 def infer_clicked_instance(
     image,
     coord_zyx,
@@ -396,8 +482,8 @@ def infer_clicked_instance(
     mask_thresh=0.50,
     min_voxels=20,
     keep_clicked_component=True,
-    return_full_size=True,
-    show_result=True,
+    return_full_size=False,
+    show_result=False,
     z_show_radius=2,
     use_amp=True,
     amp_dtype='float16',
@@ -450,11 +536,6 @@ def infer_clicked_instance(
                 f'Expected a 3D image after squeeze, got shape {raw_volume.shape}'
             )
 
-        raw_volume = raw_volume.astype(np.float32, copy=False)
-
-    # Start timing after image import succeeds.
-    t_after_image_import = time.time()
-
     # ------------------------------------------------------------
     # 2. Normalize image
     # ------------------------------------------------------------
@@ -497,7 +578,7 @@ def infer_clicked_instance(
         'coord': crop_info['patch_start_zyx'],
     }
 
-    t_model_start = time.time()
+
 
     with (
         torch.inference_mode(),
@@ -507,12 +588,14 @@ def infer_clicked_instance(
             enabled=amp_enabled,
         ),
     ):
-        outputs = model([sample])
+        if hasattr(model, 'forward_one_click'):
+            outputs = model.forward_one_click([sample])
+        else:
+            # Backward-compatible fallback.
+            outputs = model([sample])
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
-
-    model_forward_time_sec = time.time() - t_model_start
 
     model_output = outputs[0]
 
@@ -534,9 +617,6 @@ def infer_clicked_instance(
         **selected,
         'crop_info': crop_info,
         'norm_stats': norm_stats,
-        'patch': patch,
-        'model_output': model_output,
-        'model_forward_time_sec': float(model_forward_time_sec),
     }
 
     # ------------------------------------------------------------
@@ -555,30 +635,6 @@ def infer_clicked_instance(
 
         result['instance_mask_full'] = full_mask
 
-    # ------------------------------------------------------------
-    # 7. Record total clicked-instance inference time
-    # ------------------------------------------------------------
-    clicked_infer_time_sec = time.time() - t_after_image_import
-    result['clicked_infer_time_sec'] = float(clicked_infer_time_sec)
-
-    print(
-        f'[Clicked inference] total time after image import: '
-        f'{clicked_infer_time_sec:.4f} sec'
-    )
-    print(
-        f'[Clicked inference] model forward time: '
-        f'{model_forward_time_sec:.4f} sec'
-    )
-
-    if selected.get('success', False):
-        print(
-            f'[Clicked inference] selected_query={selected.get("selected_query")}, '
-            f'click_prob={selected.get("click_prob", 0):.4f}, '
-            f'score={selected.get("score", 0):.4f}, '
-            f'mask_quality={selected.get("mask_quality", 0):.4f}'
-        )
-    else:
-        print(f'[Clicked inference] failed: {selected.get("reason")}')
 
     # ------------------------------------------------------------
     # 8. Show z-5 to z+5 visualization

@@ -229,163 +229,6 @@ class MaskFormer(nn.Module):
         overlay = np.clip(overlay * 255.0, 0, 255).astype(np.uint8)
         return overlay
 
-    def _save_query_debug_outputs(
-        self,
-        batched_inputs,
-        debug_topk_masks,
-        debug_topk_scores,
-        debug_topk_indices,
-        mode: str,
-        cur_iter: int = None,
-    ):
-        if not self.debug_query_enabled:
-            return
-        if debug_topk_masks is None or len(debug_topk_masks) == 0:
-            return
-
-        save_root = os.path.join(self.debug_query_root, mode)
-        os.makedirs(save_root, exist_ok=True)
-
-        batch_indices = (
-            [0]
-            if self.debug_query_only_first_sample
-            else list(range(len(batched_inputs)))
-        )
-
-        for b in batch_indices:
-            input_per_image = batched_inputs[b]
-
-            # 原始 patch 图像，注意这里取的是未归一化前的输入
-            image_tensor = input_per_image['image']
-            if torch.is_tensor(image_tensor):
-                image_vol = image_tensor.detach().cpu().numpy()
-            else:
-                image_vol = np.asarray(image_tensor)
-
-            # [1,D,H,W] -> [D,H,W]
-            if image_vol.ndim == 4 and image_vol.shape[0] == 1:
-                image_vol = image_vol[0]
-            gray_uint8 = self._to_uint8_grayscale_volume(image_vol)
-
-            if 'coord' in input_per_image:
-                z0, y0, x0 = input_per_image['coord']
-                base_name = f'z{z0:04d}_y{y0:04d}_x{x0:04d}'
-            elif 'file_name' in input_per_image:
-                base_name = os.path.splitext(
-                    os.path.basename(input_per_image['file_name'])
-                )[0]
-            else:
-                base_name = f'sample_{b}'
-
-            if cur_iter is not None:
-                base_name = f'iter{cur_iter:07d}_{base_name}'
-
-            for layer_id in range(len(debug_topk_masks)):
-                layer_masks = (
-                    debug_topk_masks[layer_id][b].numpy().astype(np.float32)
-                )  # [K,D,H,W]
-                layer_scores = (
-                    debug_topk_scores[layer_id][b].numpy()
-                    if debug_topk_scores is not None
-                    else None
-                )
-                layer_indices = (
-                    debug_topk_indices[layer_id][b].numpy()
-                    if debug_topk_indices is not None
-                    else None
-                )
-
-                layer_dir = os.path.join(
-                    save_root, f'{base_name}_layer{layer_id:02d}'
-                )
-                os.makedirs(layer_dir, exist_ok=True)
-
-                # 保存 query 的 raw prob tif
-                if self.debug_query_save_raw:
-                    target_size = tuple(gray_uint8.shape)  # (D, H, W)
-
-                    layer_masks_resized = []
-                    for q in range(layer_masks.shape[0]):
-                        mask_q = layer_masks[q]  # [d, h, w]
-
-                        if tuple(mask_q.shape) != target_size:
-                            mask_q_t = torch.from_numpy(mask_q)[
-                                None, None
-                            ].float()
-                            mask_q_t = F.interpolate(
-                                mask_q_t,
-                                size=target_size,
-                                mode='trilinear',
-                                align_corners=False,
-                            )
-                            mask_q = mask_q_t[0, 0].numpy().astype(np.float32)
-                        else:
-                            mask_q = mask_q.astype(np.float32, copy=False)
-
-                        layer_masks_resized.append(mask_q)
-
-                    # [Q, D, H, W]
-                    layer_masks_stack = np.stack(
-                        layer_masks_resized, axis=0
-                    ).astype(np.float32)
-
-                    tifffile.imwrite(
-                        os.path.join(layer_dir, 'topk_masks_query_z.tif'),
-                        layer_masks_stack,
-                        imagej=True,
-                        metadata={'axes': 'TZYX'},  # T=query, Z=z
-                    )
-
-                # 保存叠加图：每个 query 一个 overlay tif
-                if self.debug_query_save_overlay:
-                    target_size = tuple(gray_uint8.shape)  # (D, H, W)
-
-                    for q in range(layer_masks.shape[0]):
-                        mask_q = layer_masks[q]  # [d, h, w], float32
-
-                        # 如果尺寸不一致，先插值到原图 patch 尺寸
-                        if tuple(mask_q.shape) != target_size:
-                            mask_q_t = torch.from_numpy(mask_q)[
-                                None, None
-                            ].float()  # [1,1,d,h,w]
-                            mask_q_t = F.interpolate(
-                                mask_q_t,
-                                size=target_size,
-                                mode='trilinear',
-                                align_corners=False,
-                            )
-                            mask_q = mask_q_t[0, 0].numpy().astype(np.float32)
-                        else:
-                            mask_q = mask_q.astype(np.float32, copy=False)
-
-                        overlay_vol = self._build_overlay_volume(
-                            gray_vol_uint8=gray_uint8,
-                            mask_prob_vol=mask_q,
-                            alpha=0.45,
-                            threshold=0.5,
-                        )
-
-                        tifffile.imwrite(
-                            os.path.join(
-                                layer_dir, f'query{q:02d}_overlay.tif'
-                            ),
-                            overlay_vol,  # [D,H,W,3]
-                            imagej=True,
-                        )
-
-                if layer_scores is not None:
-                    np.savetxt(
-                        os.path.join(layer_dir, 'topk_scores.txt'),
-                        layer_scores,
-                        fmt='%.6f',
-                    )
-
-                if layer_indices is not None:
-                    np.savetxt(
-                        os.path.join(layer_dir, 'topk_indices.txt'),
-                        layer_indices,
-                        fmt='%d',
-                    )
 
     def forward(self, batched_inputs):
         """
@@ -661,6 +504,101 @@ class MaskFormer(nn.Module):
                     processed_results[-1].update(instance_r)
 
             return processed_results
+
+    def forward_one_click(self, batched_inputs):
+        """
+        Fast inference path for one-click segmentation.
+
+        Differences from normal forward():
+        - Runs the same backbone, pixel decoder, and transformer decoder.
+        - Does NOT call instance_inference().
+        - Does NOT upsample all query masks to the input patch size.
+        - Returns all queries at the transformer's native mask resolution.
+        - Query selection and single-mask upsampling are handled later by
+        click_inference.select_clicked_query_instance().
+
+        Returns:
+            list[dict], one dict per input sample:
+                pred_scores:  [Q]
+                pred_classes: [Q]
+                pred_masks:   [Q, d, h, w] raw mask logits
+        """
+        if self.training:
+            raise RuntimeError(
+                'forward_one_click() is inference-only. '
+                'Call model.eval() before one-click inference.'
+            )
+
+        # ------------------------------------------------------------
+        # 1. Same input preprocessing as normal forward()
+        # ------------------------------------------------------------
+        images = [
+            x['image'].to(self.device)
+            for x in batched_inputs
+        ]
+
+        images = [
+            (x - self.pixel_mean) / self.pixel_std
+            for x in images
+        ]
+
+        images = torch.stack(images, dim=0)
+
+        # ------------------------------------------------------------
+        # 2. Same backbone and pixel decoder
+        # ------------------------------------------------------------
+        features = self.backbone(images)
+
+        mask_features, _, multi_scale_features = (
+            self.pixel_decoder.forward_features(features)
+        )
+
+        # ------------------------------------------------------------
+        # 3. Same transformer decoder
+        # ------------------------------------------------------------
+        # Disable query debug visualization for the interactive fast path.
+        self.transformer_decoder.debug_vis_enabled = False
+
+        outputs, _ = self.transformer_decoder(
+            multi_scale_features,
+            mask_features,
+            targets=None,
+        )
+
+        mask_cls_results = outputs['pred_logits']   # [B, Q, C+1]
+        mask_pred_results = outputs['pred_masks']  # [B, Q, d, h, w]
+
+        # ------------------------------------------------------------
+        # 4. Build one score per query
+        # ------------------------------------------------------------
+        # Remove the final "no-object" class.
+        class_prob = F.softmax(
+            mask_cls_results,
+            dim=-1,
+        )[..., :-1]  # [B, Q, C]
+
+        pred_scores, pred_classes = class_prob.max(
+            dim=-1
+        )  # both [B, Q]
+
+        # ------------------------------------------------------------
+        # 5. IMPORTANT:
+        # Return native-resolution masks directly.
+        # No instance_inference().
+        # No F.interpolate() here.
+        # ------------------------------------------------------------
+        processed_results = []
+
+        for b in range(images.shape[0]):
+            processed_results.append(
+                {
+                    'pred_scores': pred_scores[b],
+                    'pred_classes': pred_classes[b],
+                    'pred_masks': mask_pred_results[b],
+                }
+            )
+
+        return processed_results
 
     def prepare_targets(self, targets, images):
         d_pad, h_pad, w_pad = images.shape[-3:]  # get depth, height, width

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -695,12 +696,8 @@ class ClickedLocalRefineWorker(QObject):
                     'This should not happen if _enter_local_refinement_mode() loaded the model correctly.'
                 )
 
-            # Extra safety: model must stay on the same device used for one-click.
-            try:
-                model.to(device)
+            with suppress(Exception):
                 model.eval()
-            except Exception:
-                pass
 
             self.progress.emit(
                 45, f'Running clicked inference at zyx={self.coord_zyx}...'
@@ -715,7 +712,7 @@ class ClickedLocalRefineWorker(QObject):
                 click_prob_thresh=self.click_prob_thresh,
                 mask_thresh=self.mask_thresh,
                 min_voxels=self.min_voxels,
-                return_full_size=True,
+                return_full_size=False,
                 show_result=False,
             )
 
@@ -736,9 +733,14 @@ class ClickedLocalRefineWorker(QObject):
                 self.finished.emit(result)
                 return
 
-            if result.get('instance_mask_full', None) is None:
+            if result.get('instance_mask_patch', None) is None:
                 raise RuntimeError(
-                    'Clicked inference succeeded, but instance_mask_full is missing.'
+                    'Clicked inference succeeded, but instance_mask_patch is missing.'
+                )
+
+            if result.get('crop_info', None) is None:
+                raise RuntimeError(
+                    'Clicked inference succeeded, but crop_info is missing.'
                 )
 
             self.progress.emit(100, 'Clicked one-click segmentation finished.')
@@ -1011,7 +1013,7 @@ def _on_refine_selected_cell_finished(self, result):
 
     notifications.show_info(
         f'Refined cell {label_val}: '
-        f'{result["old_voxels"]} → {result["new_voxels"]} voxels. Ctrl+Z to undo.'
+        f'{result["old_voxels"]} → {result["new_voxels"]} voxels.'
     )
 
 
@@ -1684,6 +1686,7 @@ def _start_clicked_local_refinement(self, coord_zyx):
     """
     Start clicked one-click segmentation in a background thread.
     """
+    self._one_click_start_time = time.perf_counter()
     image_layer = self._get_first_image_layer_for_refine()
     labels_layer = self._get_labels_layer()
 
@@ -1705,20 +1708,22 @@ def _start_clicked_local_refinement(self, coord_zyx):
             'label layer was created automatically.'
         )
 
-    # Prefer original image path, because infer_clicked_instance already supports
-    # file path and avoids copying the whole volume.
-    image_input = None
-    try:
-        image_input = getattr(image_layer.source, 'path', None)
-    except Exception:
+    # Reuse the image data already loaded by napari.
+    # Avoid reopening and rereading the original volume for every click.
+    if isinstance(image_layer.data, np.ndarray):
+        image_input = image_layer.data
+    else:
         image_input = None
 
-    if image_input is None or str(image_input).strip() == '':
-        # Fallback: pass the actual array.
-        # click_inference.py should support ndarray input.
-        image_input = np.asarray(image_layer.data)
-    else:
-        image_input = str(image_input)
+        try:
+            image_input = getattr(image_layer.source, 'path', None)
+        except Exception:
+            image_input = None
+
+        if image_input is None or str(image_input).strip() == '':
+            image_input = image_layer.data
+        else:
+            image_input = str(image_input)
 
     self._local_refine_busy = True
 
@@ -1972,21 +1977,44 @@ def _on_clicked_local_refinement_finished(self, result):
         label_data = label_data.compute()
         labels_layer.data = label_data
 
-    instance_mask = np.asarray(result['instance_mask_full']).astype(bool)
+    instance_mask_patch = np.asarray(result['instance_mask_patch']).astype(
+        bool, copy=False
+    )
+
+    crop_info = result['crop_info']
+
     coord_zyx = tuple(int(v) for v in result['coord_zyx'])
     z, y, x = coord_zyx
 
-    if tuple(instance_mask.shape) != tuple(label_data.shape):
+    valid_global_slices = crop_info['valid_global_slices']
+    valid_patch_slices = crop_info['valid_patch_slices']
+
+    # Extract only the part of the predicted patch that corresponds
+    # to real voxels in the original image.
+    valid_instance_mask = instance_mask_patch[valid_patch_slices]
+
+    if not np.any(valid_instance_mask):
         self._local_refine_busy = False
-        notifications.show_error(
-            f'Mask shape mismatch: mask={instance_mask.shape}, '
-            f'label={label_data.shape}.'
+        notifications.show_warning(
+            'Clicked inference returned an empty valid mask.'
         )
         return
 
-    if not np.any(instance_mask):
+    global_z_slice, global_y_slice, global_x_slice = valid_global_slices
+
+    expected_valid_shape = (
+        global_z_slice.stop - global_z_slice.start,
+        global_y_slice.stop - global_y_slice.start,
+        global_x_slice.stop - global_x_slice.start,
+    )
+
+    if tuple(valid_instance_mask.shape) != tuple(expected_valid_shape):
         self._local_refine_busy = False
-        notifications.show_warning('Clicked inference returned an empty mask.')
+        notifications.show_error(
+            f'Local mask mapping mismatch: '
+            f'mask={valid_instance_mask.shape}, '
+            f'expected={expected_valid_shape}.'
+        )
         return
 
     # Read clicked voxel safely. For zarr this returns scalar-like value.
@@ -2000,13 +2028,33 @@ def _on_clicked_local_refinement_finished(self, result):
         mode_note = 'create new label'
 
     # ------------------------------------------------------------
-    # 1. New mask bbox from clicked inference result
+    # 1. New mask bbox from local clicked inference result
     # ------------------------------------------------------------
-    new_bbox = _bbox_from_mask_3d(instance_mask)
-    if new_bbox is None:
+    local_bbox = _bbox_from_mask_3d(valid_instance_mask)
+
+    if local_bbox is None:
         self._local_refine_busy = False
         notifications.show_warning('Cannot locate refined mask bbox.')
         return
+
+    local_z0, local_z1, local_y0, local_y1, local_x0, local_x1 = local_bbox
+
+    # Convert bbox from valid-patch coordinates to global image coordinates.
+    new_bbox = (
+        int(global_z_slice.start + local_z0),
+        int(global_z_slice.start + local_z1),
+        int(global_y_slice.start + local_y0),
+        int(global_y_slice.start + local_y1),
+        int(global_x_slice.start + local_x0),
+        int(global_x_slice.start + local_x1),
+    )
+
+    # Keep only the tight predicted mask.
+    new_mask_tight = valid_instance_mask[
+        local_z0:local_z1,
+        local_y0:local_y1,
+        local_x0:local_x1,
+    ]
 
     # ------------------------------------------------------------
     # 2. Estimate old bbox locally if replacing an existing label
@@ -2042,7 +2090,29 @@ def _on_clicked_local_refinement_finished(self, result):
     old_crop = np.asarray(label_data[z0:z1, y0:y1, x0:x1]).copy()
     new_crop = old_crop.copy()
 
-    mask_crop = instance_mask[z0:z1, y0:y1, x0:x1]
+    # Build only a bbox-sized temporary mask.
+    # Do NOT allocate a full-volume binary mask.
+    mask_crop = np.zeros(
+        old_crop.shape,
+        dtype=bool,
+    )
+
+    new_z0, new_z1, new_y0, new_y1, new_x0, new_x1 = new_bbox
+
+    dst_z0 = new_z0 - z0
+    dst_z1 = new_z1 - z0
+
+    dst_y0 = new_y0 - y0
+    dst_y1 = new_y1 - y0
+
+    dst_x0 = new_x0 - x0
+    dst_x1 = new_x1 - x0
+
+    mask_crop[
+        dst_z0:dst_z1,
+        dst_y0:dst_y1,
+        dst_x0:dst_x1,
+    ] = new_mask_tight
 
     # Prevent overwriting neighboring cells.
     # This is the local-crop replacement of:
@@ -2091,7 +2161,11 @@ def _on_clicked_local_refinement_finished(self, result):
         label_data[z0:z1, y0:y1, x0:x1] = new_crop
 
     labels_layer.selected_label = target_label
-    labels_layer.refresh()
+    labels_layer.refresh(
+        thumbnail=False,
+        extent=False,
+        highlight=False,
+    )
 
     old_voxels = int(np.sum(old_crop == target_label))
     new_voxels = int(np.sum(mask_crop))
@@ -2106,8 +2180,7 @@ def _on_clicked_local_refinement_finished(self, result):
             f'selected_query={result.get("selected_query")}; '
             f'click_prob={result.get("click_prob")}; '
             f'bbox=(z:{z0}-{z1}, y:{y0}-{y1}, x:{x0}-{x1}); '
-            f'old_voxels={old_voxels}, new_voxels={new_voxels}; '
-            f'time={result.get("clicked_infer_time_sec")} sec.'
+            f'old_voxels={old_voxels}, new_voxels={new_voxels}.'
         ),
     )
 
@@ -2116,6 +2189,7 @@ def _on_clicked_local_refinement_finished(self, result):
     if getattr(self, '_local_refine_mode_active', False):
         self.btn_enter_local_refinement.setEnabled(False)
         self.btn_exit_local_refinement.setEnabled(True)
+
         if hasattr(self, 'local_refine_status_label'):
             self.local_refine_status_label.setText(
                 'Active: click another cell'
@@ -2125,10 +2199,29 @@ def _on_clicked_local_refinement_finished(self, result):
         self.btn_enter_local_refinement.setEnabled(True)
         self.btn_exit_local_refinement.setEnabled(False)
 
-    notifications.show_info(
-        f'one-click segmentation updated label {target_label}: '
-        f'{old_voxels} → {new_voxels} voxels. Ctrl+Z to undo.'
-    )
+    # End-to-end one-click segmentation time.
+    one_click_time_sec = None
+
+    start_time = getattr(self, '_one_click_start_time', None)
+    if start_time is not None:
+        one_click_time_sec = time.perf_counter() - start_time
+
+    if one_click_time_sec is not None:
+        print(
+            f'[One-click] total time: {one_click_time_sec:.4f} sec',
+            flush=True,
+        )
+
+        notifications.show_info(
+            f'one-click segmentation updated label {target_label}: '
+            f'{old_voxels} → {new_voxels} voxels '
+            f'in {one_click_time_sec:.2f} s. '
+        )
+    else:
+        notifications.show_info(
+            f'one-click segmentation updated label {target_label}: '
+            f'{old_voxels} → {new_voxels} voxels. '
+        )
 
 
 def _get_label_bbox_near_click_for_local_refine(
@@ -2213,26 +2306,16 @@ def _on_clicked_local_refinement_error(self, error_msg):
         if hasattr(self, 'btn_exit_local_refinement'):
             self.btn_exit_local_refinement.setEnabled(False)
 
-    full_error = ''
+    error_text = str(error_msg)
 
-    try:
-        # Existing operations.
-        ...
-    except Exception:
-        full_error = traceback.format_exc()
-    finally:
-        # Restore UI state.
-        ...
+    print(
+        f'\n[One-click segmentation error]\n{error_text}',
+        flush=True,
+    )
 
-    if full_error:
-        print(
-            f'\n[One-click segmentation error]\n{full_error}',
-            flush=True,
-        )
-
-        error_lines = [
-            line.strip() for line in full_error.splitlines() if line.strip()
-        ]
+    error_lines = [
+        line.strip() for line in error_text.splitlines() if line.strip()
+    ]
 
     short_error = error_lines[-1] if error_lines else 'Unknown error.'
 
