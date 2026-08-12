@@ -3,7 +3,7 @@ import math
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
-from .mask2former.config import add_maskformer2_config
+from mask2former import add_maskformer2_config
 from detectron2.config import get_cfg
 from detectron2.modeling import build_model
 from detectron2.checkpoint import DetectionCheckpointer
@@ -43,6 +43,8 @@ def build_predictor(cfg):
     checkpointer.load(cfg.MODEL.WEIGHTS)
     model.eval()
     model.to(cfg.MODEL.DEVICE)
+    if str(cfg.MODEL.DEVICE).startswith("cuda"):
+        torch.backends.cudnn.benchmark = True
     return model
 
 def _is_cancel_requested(cancel_callback=None) -> bool:
@@ -74,6 +76,147 @@ def _emit_progress(progress_callback, value, message):
         progress_callback(int(value), str(message))
     except Exception:
         pass
+
+def normalize_and_pad_volume(
+    volume,
+    p_low: float,
+    p_high: float,
+    patch_size,
+    stride,
+    chunk_z: int = 8,
+):
+    z, y, x = volume.shape
+    pz, py, px = patch_size
+    sz, sy, sx = stride
+
+    z_target = compute_padded_length(
+        z, pz, sz
+    )
+    y_target = compute_padded_length(
+        y, py, sy
+    )
+    x_target = compute_padded_length(
+        x, px, sx
+    )
+
+    pad_z = z_target - z
+    pad_y = y_target - y
+    pad_x = x_target - x
+
+    padded = np.empty(
+        (z_target, y_target, x_target),
+        dtype=np.float32,
+    )
+
+    if p_high <= p_low:
+        padded.fill(0.0)
+    else:
+        inv_range = 1.0 / (
+            p_high - p_low
+        )
+
+        for z0 in range(0, z, chunk_z):
+            z1 = min(
+                z0 + chunk_z,
+                z,
+            )
+
+            chunk = np.asarray(
+                volume[z0:z1],
+                dtype=np.float32,
+            )
+
+            np.clip(
+                chunk,
+                p_low,
+                p_high,
+                out=chunk,
+            )
+
+            chunk -= p_low
+            chunk *= inv_range
+
+            padded[
+                z0:z1,
+                :y,
+                :x,
+            ] = chunk
+
+    # --------------------------------------------------------
+    # Reproduce np.pad(..., mode="reflect")
+    # without copying the whole volume.
+    # --------------------------------------------------------
+
+    if pad_x > 0:
+        x_idx = np.pad(
+            np.arange(x),
+            (0, pad_x),
+            mode="reflect",
+        )[x:]
+
+        padded[
+            :z,
+            :y,
+            x:
+        ] = np.take(
+            padded[:z, :y, :x],
+            x_idx,
+            axis=2,
+        )
+
+    if pad_y > 0:
+        y_idx = np.pad(
+            np.arange(y),
+            (0, pad_y),
+            mode="reflect",
+        )[y:]
+
+        padded[
+            :z,
+            y:,
+            :
+        ] = np.take(
+            padded[:z, :y, :],
+            y_idx,
+            axis=1,
+        )
+
+    if pad_z > 0:
+        z_idx = np.pad(
+            np.arange(z),
+            (0, pad_z),
+            mode="reflect",
+        )[z:]
+
+        padded[
+            z:,
+            :,
+            :
+        ] = np.take(
+            padded[:z, :, :],
+            z_idx,
+            axis=0,
+        )
+
+    pad_info = {
+        "original_shape": [
+            int(z),
+            int(y),
+            int(x),
+        ],
+        "padded_shape": [
+            int(z_target),
+            int(y_target),
+            int(x_target),
+        ],
+        "pad_width": [
+            [0, int(pad_z)],
+            [0, int(pad_y)],
+            [0, int(pad_x)],
+        ],
+    }
+
+    return padded, pad_info
 
 def infer_volume(
     image_path: Union[str, Path],
@@ -147,6 +290,8 @@ def infer_volume(
     _raise_if_cancelled(cancel_callback)
 
     model = build_predictor(cfg)
+    model.fast_score_thresh = float(score_thresh)
+    model.fast_mask_thresh = float(mask_thresh)
 
     _raise_if_cancelled(cancel_callback)
 
@@ -226,30 +371,53 @@ def infer_volume(
     if save_resampled_image and resample_info["enabled"]:
         save_volume(
             output_dir / f"{Path(image_path).stem}_resampled_image.tif",
-            infer_raw_volume.astype(np.float32),
+            infer_raw_volume.astype(np.float32, copy=False),
         )
 
-    norm_volume, norm_stats = normalize_img(
+    # ============================================================
+    # Resolve stride FIRST
+    # ============================================================
+    if stride is None:
+        stride = tuple(s // 2 for s in patch_size)
+    else:
+        stride = tuple(stride)
+
+    patch_size = tuple(patch_size)
+
+    # ============================================================
+    # Compute global percentiles ONCE
+    # ============================================================
+    percentile_list = [
+        float(lower_percentile),
+        float(upper_percentile),
+    ]
+
+    if background_threshold is None:
+        percentile_list.append(5.0)
+
+    percentile_values = compute_percentiles_fast(
         infer_raw_volume,
-        lower_percentile=lower_percentile,
-        upper_percentile=upper_percentile,
+        percentile_list,
+        chunk_z=8,
     )
 
-    # --------------------------------------------------------
+    p_low = float(percentile_values[0])
+    p_high = float(percentile_values[1])
+
+    norm_stats = {
+        "p_low": p_low,
+        "p_high": p_high,
+    }
+
+    # ============================================================
     # Resolve background threshold
-    # --------------------------------------------------------
+    # ============================================================
     if background_threshold is None:
-        # Automatically estimate background from the global
-        # 2nd percentile of the inference-resolution raw volume.
-        bg_raw = float(np.percentile(infer_raw_volume, 5.0))
-        background_threshold_source = "global_2nd_percentile"
+        bg_raw = float(percentile_values[2])
+        background_threshold_source = "global_5th_percentile"
     else:
-        # Explicit user input always takes priority.
         bg_raw = float(background_threshold)
         background_threshold_source = "user"
-
-    p_low = float(norm_stats["p_low"])
-    p_high = float(norm_stats["p_high"])
 
     if p_high <= p_low:
         background_threshold_norm = 0.0
@@ -259,7 +427,11 @@ def infer_volume(
             / (p_high - p_low)
         )
         background_threshold_norm = float(
-            np.clip(background_threshold_norm, 0.0, 1.0)
+            np.clip(
+                background_threshold_norm,
+                0.0,
+                1.0,
+            )
         )
 
     print(
@@ -278,18 +450,25 @@ def infer_volume(
         background_threshold_source
     )
 
-    # --------------------------------------------------------
-    # Patch / stride planning and padding
-    # --------------------------------------------------------
-    print(f'\n[Step 3] "Generating patches..."')
-    if stride is None:
-        stride = tuple(s // 2 for s in patch_size)
-    else:
-        stride = tuple(stride)
-    padded_volume, pad_info = pad_volume_for_sliding_window(norm_volume, patch_size, stride)
+    # ============================================================
+    # Normalize + pad in ONE output volume
+    # ============================================================
+    print('\n[Step 3] "Normalizing and generating patches..."')
+
+    padded_volume, pad_info = normalize_and_pad_volume(
+        volume=infer_raw_volume,
+        p_low=p_low,
+        p_high=p_high,
+        patch_size=patch_size,
+        stride=stride,
+        chunk_z=8,
+    )
 
     if save_intermediate:
-        save_volume(output_dir / "padded_normalized_image.tif", padded_volume.astype(np.float32))
+        save_volume(
+            output_dir / "padded_normalized_image.tif",
+            padded_volume,
+        )
 
     all_coords = generate_patch_coords(padded_volume.shape, patch_size, stride)
     max_z = max(c[0] for c in all_coords)
@@ -304,16 +483,51 @@ def infer_volume(
     _emit_progress(progress_callback, 10, 'Generating valid inference patches...')
     _raise_if_cancelled(cancel_callback)
 
-    for idx, (z0, y0, x0) in enumerate(all_coords):
-        if idx % 16 == 0:
-            _raise_if_cancelled(cancel_callback)
+    if background_threshold_norm <= 0.0:
+        infer_coords = all_coords
+        skipped_coords = []
 
-        patch = padded_volume[z0:z0+pz, y0:y0+py, x0:x0+px]
+    else:
+        infer_coords = []
+        skipped_coords = []
 
-        if np.percentile(patch, 99.9) < background_threshold_norm:
-            skipped_coords.append((z0, y0, x0))
-        else:
-            infer_coords.append((z0, y0, x0))
+        for idx, (z0, y0, x0) in enumerate(all_coords):
+            if idx % 16 == 0:
+                _raise_if_cancelled(
+                    cancel_callback
+                )
+
+            patch = padded_volume[
+                z0:z0+pz,
+                y0:y0+py,
+                x0:x0+px,
+            ]
+
+            # Cheap exact early-out.
+            #
+            # If even the maximum is below threshold,
+            # percentile(99.9) must also be below threshold.
+            if patch.max() < background_threshold_norm:
+                skipped_coords.append(
+                    (z0, y0, x0)
+                )
+                continue
+
+            # Only difficult patches need percentile.
+            if (
+                np.percentile(
+                    patch,
+                    99.9,
+                )
+                < background_threshold_norm
+            ):
+                skipped_coords.append(
+                    (z0, y0, x0)
+                )
+            else:
+                infer_coords.append(
+                    (z0, y0, x0)
+                )
 
     _raise_if_cancelled(cancel_callback)
 
@@ -355,7 +569,7 @@ def infer_volume(
         pin_memory=True,
         persistent_workers=(data_loader_num_workers > 0),
         prefetch_factor=2 if data_loader_num_workers > 0 else None,
-        collate_fn=lambda x: x,
+        collate_fn=patch_collate_fn,
     )
 
     patch_pbar = tqdm(
@@ -367,20 +581,29 @@ def infer_volume(
 
     num_batches = max(len(patch_loader), 1)
 
-    for batch_idx, inputs in enumerate(patch_pbar):
-        _raise_if_cancelled(cancel_callback)
+    for batch_idx, (
+        batch_images,
+        batch_coords,
+    ) in enumerate(patch_pbar):
 
-        _emit_progress(
-            progress_callback,
-            int(15 + 75 * batch_idx / num_batches),
-            f'Inferencing batch {batch_idx + 1}/{num_batches}...',
+        _raise_if_cancelled(
+            cancel_callback
         )
 
-        for sample in inputs:
-            _raise_if_cancelled(cancel_callback)
-            sample["image"] = sample["image"].to(device, non_blocking=True)
+        batch_images = batch_images.to(
+            device,
+            non_blocking=True,
+        )
 
-        _raise_if_cancelled(cancel_callback)
+        inputs = [
+            {
+                "image": batch_images[i],
+                "coord": batch_coords[i],
+            }
+            for i in range(
+                batch_images.shape[0]
+            )
+        ]
 
         with torch.inference_mode():
             with torch.autocast(
@@ -460,15 +683,24 @@ def infer_volume(
         confidence_sum=confidence_sum,
         confidence_count=confidence_count,
     )
-
-    # Save result before final post-processing
-    pre_post_instance_padded = instance_map_padded.copy()
-    pre_post_confidence_padded = confidence_map_padded.copy()
-
     z_inf, y_inf, x_inf = infer_shape
-    pre_post_instance = pre_post_instance_padded[:z_inf, :y_inf, :x_inf]
-    pre_post_confidence = pre_post_confidence_padded[:z_inf, :y_inf, :x_inf]
+    # Save result before final post-processing
     if save_intermediate:
+        pre_post_instance = (
+            instance_map_padded[
+                :z_inf,
+                :y_inf,
+                :x_inf,
+            ]
+        )
+
+        pre_post_confidence = (
+            confidence_map_padded[
+                :z_inf,
+                :y_inf,
+                :x_inf,
+            ]
+        )
         save_volume(
             output_dir / f"{Path(image_path).stem}_instance_map_before_postprocess.tif",
             pre_post_instance.astype(np.uint32),
@@ -489,7 +721,7 @@ def infer_volume(
     )
 
     # Crop back to inference image shape first.
-    z_inf, y_inf, x_inf = infer_shape
+
     instance_map_infer = instance_map_padded[:z_inf, :y_inf, :x_inf]
     confidence_map_infer = confidence_map_padded[:z_inf, :y_inf, :x_inf]
 
@@ -528,10 +760,10 @@ def infer_volume(
         log_path = output_dir / f"{stem}_log.json"
 
     _raise_if_cancelled(cancel_callback)
-    save_volume(instance_path, instance_map.astype(np.uint32))
+    save_volume(instance_path, instance_map.astype(np.uint32, copy=False),)
 
     if save_intermediate:
-        save_volume(confidence_path, confidence_map.astype(np.float32))
+        save_volume(confidence_path, confidence_map.astype(np.float32, copy=False))
 
         log_info["total_time_sec"] = time.time() - t_total_start
 
@@ -568,32 +800,35 @@ class PatchDataset(torch.utils.data.Dataset):
             "coord": (z0, y0, x0),
         }
 
-def read_volume(image_path: Union[str, Path]) -> np.ndarray:
-    """
-    Read a 3D volume from .tif/.tiff or .zarr and return a numpy array with shape (Z, Y, X).
 
-    Notes:
-        - This function assumes the input is already a 3D volume or can be squeezed to 3D.
-        - If the input has singleton dimensions, they will be removed.
-    """
+def read_volume(image_path: Union[str, Path]):
     image_path = str(image_path)
     suffix = Path(image_path).suffix.lower()
 
     if suffix in [".tif", ".tiff"]:
-        vol = tifffile.imread(image_path)
+        # Prefer memory-mapped reading for very large TIFF volumes.
+        vol = tifffile.imread(image_path, out="memmap",)
+
     elif suffix == ".zarr":
-        z = zarr.open(image_path, mode="r")
-        vol = np.asarray(z)
+        vol = zarr.open(image_path, mode="r")
+
     else:
         raise ValueError(f"Unsupported file format: {image_path}")
 
-    vol = np.asarray(vol)
-    vol = np.squeeze(vol)
+    if hasattr(vol, "shape"):
+        shape = tuple(vol.shape)
+    else:
+        vol = np.asarray(vol)
+        shape = tuple(vol.shape)
 
-    if vol.ndim != 3:
+    # Only squeeze NumPy/memmap here.
+    if isinstance(vol, np.ndarray):
+        vol = np.squeeze(vol)
+
+    if len(vol.shape) != 3:
         raise ValueError(f"Expected a 3D volume after squeeze, got shape {vol.shape}")
 
-    return vol.astype(np.float32, copy=False)
+    return vol
 
 def save_volume(output_path: Union[str, Path], volume: np.ndarray) -> None:
     """
@@ -609,50 +844,6 @@ def save_volume(output_path: Union[str, Path], volume: np.ndarray) -> None:
         z[:] = volume
     else:
         raise ValueError(f"Unsupported output format: {output_path}")
-
-def normalize_img(
-    volume: np.ndarray,
-    lower_percentile: float = 1.0,
-    upper_percentile: float = 99.0,
- ) -> Tuple[np.ndarray, Dict]:
-    """
-    Normalize the whole volume to [0, 1] using user-provided percentiles.
-
-    Returns:
-        normalized_volume: float32 array in [0, 1]
-        stats: dictionary with normalization metadata
-    """
-    if not (0.0 <= lower_percentile < upper_percentile <= 100.0):
-        raise ValueError("Percentiles must satisfy 0 <= lower < upper <= 100")
-
-    p_low = float(np.percentile(volume, lower_percentile))
-    p_high = float(np.percentile(volume, upper_percentile))
-
-    if p_high <= p_low:
-        # Fallback for degenerate inputs
-        p_low = float(volume.min())
-        p_high = float(volume.max())
-        normalized = np.zeros_like(volume, dtype=np.float32)
-        stats = {
-            "raw_min": float(volume.min()),
-            "raw_max": float(volume.max()),
-            "p_low": p_low,
-            "p_high": p_high,
-            "note": "Degenerate image; output is all zeros."
-        }
-        return normalized, stats
-
-    clipped = np.clip(volume, p_low, p_high)
-    normalized = (clipped - p_low) / (p_high - p_low)
-    normalized = normalized.astype(np.float32, copy=False)
-
-    stats = {
-        "raw_min": float(volume.min()),
-        "raw_max": float(volume.max()),
-        "p_low": p_low,
-        "p_high": p_high,
-    }
-    return normalized, stats
 
 
 def resample_volume_for_inference(
@@ -780,7 +971,7 @@ def resample_volume_for_inference(
     }
 
     if not enabled:
-        return volume.astype(np.float32, copy=False), info
+        return volume, info
 
     resampled = resize_volume_to_shape(
         volume.astype(np.float32, copy=False),
@@ -930,6 +1121,92 @@ def resolve_inference_device(device: Optional[str] = None) -> str:
 
     return device
 
+def compute_percentiles_fast(
+    volume,
+    percentiles,
+    chunk_z: int = 8,
+):
+    qs = np.asarray(
+        percentiles,
+        dtype=np.float64,
+    )
+
+    dtype = np.dtype(volume.dtype)
+
+    if dtype == np.uint8:
+        num_bins = 256
+    elif dtype == np.uint16:
+        num_bins = 65536
+    else:
+        # Fallback for float / unusual dtype.
+        return np.percentile(volume, qs)
+
+    hist = np.zeros(
+        num_bins,
+        dtype=np.int64,
+    )
+
+    z_size = volume.shape[0]
+
+    for z0 in range(0, z_size, chunk_z):
+        z1 = min(z0 + chunk_z, z_size)
+
+        chunk = np.asarray(
+            volume[z0:z1]
+        )
+
+        hist += np.bincount(
+            chunk.reshape(-1),
+            minlength=num_bins,
+        )
+
+    cdf = np.cumsum(hist)
+    n = int(cdf[-1])
+
+    if n <= 0:
+        return np.zeros_like(qs)
+
+    results = []
+
+    for q in qs:
+        rank = (
+            (n - 1)
+            * float(q)
+            / 100.0
+        )
+
+        rank_low = int(math.floor(rank))
+        rank_high = int(math.ceil(rank))
+        alpha = rank - rank_low
+
+        value_low = int(
+            np.searchsorted(
+                cdf,
+                rank_low + 1,
+                side="left",
+            )
+        )
+
+        value_high = int(
+            np.searchsorted(
+                cdf,
+                rank_high + 1,
+                side="left",
+            )
+        )
+
+        value = (
+            value_low
+            + alpha
+            * (value_high - value_low)
+        )
+
+        results.append(float(value))
+
+    return np.asarray(
+        results,
+        dtype=np.float64,
+    )
 
 def activate_inference_device(device: str) -> None:
     """
@@ -970,8 +1247,11 @@ def patch_postprocess_argmax(
             "patch_confidence": patch_confidence,
         }
 
+    # ------------------------------------------------------------
+    # 0. Cheap query filtering
+    # ------------------------------------------------------------
     scores = model_output["pred_scores"].detach().float()
-    masks = model_output["pred_masks"].detach().float()
+    masks = model_output["pred_masks"].detach()
 
     if masks.numel() == 0 or scores.numel() == 0:
         return {
@@ -979,66 +1259,102 @@ def patch_postprocess_argmax(
             "patch_confidence": patch_confidence,
         }
 
-    if masks.min() < 0 or masks.max() > 1:
-        mask_prob = masks.sigmoid()
-    else:
-        mask_prob = masks
-
     # ------------------------------------------------------------
-    # 1. Compute mask quality score
+    # Exact classification-score upper-bound filtering
     # ------------------------------------------------------------
-    mask_bin_tmp = mask_prob > mask_thresh
+    keep_cls = scores > score_thresh
 
-    mask_scores = (
-        mask_prob.flatten(1) * mask_bin_tmp.flatten(1)
-    ).sum(dim=1) / (
-        mask_bin_tmp.flatten(1).sum(dim=1) + 1e-6
-    )
-
-    # Final query score = classification score * mask quality score
-    final_scores = scores * mask_scores
-
-    # Keep queries that satisfy both final score and mask quality thresholds
-    keep = (final_scores > score_thresh) & (mask_scores > mask_thresh)
-
-    if keep.sum().item() == 0:
+    if not keep_cls.any().item():
         return {
             "patch_instance_map": patch_instance_map,
             "patch_confidence": patch_confidence,
         }
 
+    scores = scores[keep_cls]
+    masks = masks[keep_cls].float()
+
+    # ------------------------------------------------------------
+    # Mask logits/probability
+    # ------------------------------------------------------------
+    # if masks.min() < 0 or masks.max() > 1:
+    #     mask_prob = masks.sigmoid()
+    # else:
+    mask_prob = masks
+
+    # ------------------------------------------------------------
+    # Exact empty-mask filtering
+    # ------------------------------------------------------------
+    mask_bin_tmp = mask_prob > mask_thresh
+
+    has_foreground = mask_bin_tmp.flatten(1).any(dim=1)
+
+    if not has_foreground.any().item():
+        return {
+            "patch_instance_map": patch_instance_map,
+            "patch_confidence": patch_confidence,
+        }
+
+    scores = scores[has_foreground]
+    mask_prob = mask_prob[has_foreground]
+    mask_bin_tmp = mask_bin_tmp[has_foreground]
+
+    # ------------------------------------------------------------
+    # 1. Compute mask quality score
+    # ------------------------------------------------------------
+    mask_prob_flat = mask_prob.flatten(1)
+    mask_bin_flat = mask_bin_tmp.flatten(1)
+
+    mask_scores = (
+        mask_prob_flat * mask_bin_flat
+    ).sum(dim=1) / (
+        mask_bin_flat.sum(dim=1) + 1e-6
+    )
+
+    final_scores = scores * mask_scores
+
+    keep = (
+        (final_scores > score_thresh)
+        & (mask_scores > mask_thresh)
+    )
+
+    if not keep.any().item():
+        return {
+            "patch_instance_map": patch_instance_map,
+            "patch_confidence": patch_confidence,
+        }
 
     final_scores = final_scores[keep]
     mask_scores = mask_scores[keep]
     mask_prob = mask_prob[keep]
+    mask_bin = mask_bin_tmp[keep]
 
     # ------------------------------------------------------------
     # 2. Sort queries by final score
     # ------------------------------------------------------------
-    order = torch.argsort(final_scores, descending=True)
+    order = torch.argsort(
+        final_scores,
+        descending=True,
+    )
+
     final_scores = final_scores[order]
     mask_scores = mask_scores[order]
     mask_prob = mask_prob[order]
+    mask_bin = mask_bin[order]
 
-    if topk_postprocess is not None and mask_prob.shape[0] > topk_postprocess:
+    if (
+        topk_postprocess is not None
+        and mask_prob.shape[0] > topk_postprocess
+    ):
         final_scores = final_scores[:topk_postprocess]
         mask_scores = mask_scores[:topk_postprocess]
         mask_prob = mask_prob[:topk_postprocess]
+        mask_bin = mask_bin[:topk_postprocess]
 
     num_queries = mask_prob.shape[0]
 
     # ------------------------------------------------------------
     # 3. Conflict resolving before voxel-level argmax
     # ------------------------------------------------------------
-    # New rule:
-    #   For two conflicting masks on the same z-slice:
-    #     1) If intersection / min(area_a, area_b) > 0.8 -> merge
-    #     2) Else if IoU(intersection / union) > 0.5 -> merge
-    #     3) If merged, assign the merged 2D structure to the query whose
-    #        adjacent z-slice mask is more similar to the merged structure.
-    #     4) If neither condition is satisfied, keep both queries unchanged.
-
-    mask_bin = mask_prob > mask_thresh
     mask_prob_resolved = mask_prob.clone()
 
     conflict_min_pixels = 20
@@ -1562,6 +1878,23 @@ def stitch_patch_instance_results(
         conf_cnt_crop[valid_mask] += 1
 
     return next_instance_id
+
+def patch_collate_fn(samples):
+    images = torch.stack(
+        [
+            sample["image"]
+            for sample in samples
+        ],
+        dim=0,
+    )
+    # (B, 1, Z, Y, X)
+
+    coords = [
+        sample["coord"]
+        for sample in samples
+    ]
+
+    return images, coords
 
 def filter_instances_by_size(
     instance_map: np.ndarray,

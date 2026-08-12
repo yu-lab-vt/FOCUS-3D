@@ -403,9 +403,6 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
             nn.LayerNorm(hidden_dim),
         )
 
-        self.debug_vis_enabled = False
-        self.debug_vis_topk = 300
-
         for _ in range(self.num_layers):
             self.transformer_self_attention_layers.append(
                 SelfAttentionLayer(
@@ -936,71 +933,6 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         single_pad = int(max_known)
         pad_size = int(single_pad * scalar)
 
-        # # ---------- DEBUG: save DN noisy bbox overlay on raw image ----------
-        # if not hasattr(self, "_dn_bbox_overlay_saved"):
-        #     self._dn_bbox_overlay_saved = True
-
-        #     import os
-        #     import tifffile
-        #     import torch.nn.functional as F
-
-        #     save_path = "./debug_dn_bbox_overlay.tif"
-        #     alpha = 0.35
-
-        #     b0 = 0
-        #     D, H, W = targets[b0]["masks"].shape[-3:]
-
-        #     # 用 GT masks 合成一个灰度背景；如果你想叠到原始图像上，更推荐在主函数里做
-        #     bg = targets[b0]["masks"].any(dim=0).float()  # [D,H,W]
-        #     bg = (bg * 255).byte()
-
-        #     rgb = torch.stack([bg, bg, bg], dim=-1).float() / 255.0  # [D,H,W,3]
-
-        #     debug_boxes = known_boxes_expand[known_bid == b0].detach().float().cpu()
-
-        #     for box in debug_boxes:
-        #         cz, cy, cx, dz, dy, dx = box.tolist()
-
-        #         z0 = int((cz - dz / 2) * D)
-        #         z1 = int((cz + dz / 2) * D)
-        #         y0 = int((cy - dy / 2) * H)
-        #         y1 = int((cy + dy / 2) * H)
-        #         x0 = int((cx - dx / 2) * W)
-        #         x1 = int((cx + dx / 2) * W)
-
-        #         z0, z1 = max(z0, 0), min(z1, D - 1)
-        #         y0, y1 = max(y0, 0), min(y1, H - 1)
-        #         x0, x1 = max(x0, 0), min(x1, W - 1)
-
-        #         if z1 <= z0 or y1 <= y0 or x1 <= x0:
-        #             continue
-
-        #         # 只画 bbox 边框，不填充
-        #         edge = torch.zeros((D, H, W), dtype=torch.bool)
-
-        #         edge[z0, y0:y1+1, x0:x1+1] = True
-        #         edge[z1, y0:y1+1, x0:x1+1] = True
-        #         edge[z0:z1+1, y0, x0:x1+1] = True
-        #         edge[z0:z1+1, y1, x0:x1+1] = True
-        #         edge[z0:z1+1, y0:y1+1, x0] = True
-        #         edge[z0:z1+1, y0:y1+1, x1] = True
-
-        #         # 红色半透明框
-        #         rgb[edge] = rgb[edge] * (1 - alpha) + torch.tensor(
-        #             [1.0, 0.0, 0.0],
-        #             device=rgb.device,
-        #             dtype=rgb.dtype,
-        #         ) * alpha
-
-        #     overlay = (rgb.clamp(0, 1) * 255).byte().cpu().numpy()
-
-        #     tifffile.imwrite(
-        #         save_path,
-        #         overlay,              # [D,H,W,3]
-        #         imagej=True,
-        #     )
-
-        #     print(f"[DN DEBUG] saved bbox overlay to {save_path}")
 
         padding_label = torch.zeros(
             pad_size, self.hidden_dim, device=device, dtype=dtype
@@ -1106,7 +1038,6 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
                     "pred_logits",
                     "pred_masks",
                     "aux_outputs",
-                    optional debug fields
                 }
             mask_dict:
                 DN metadata if denoising is enabled.
@@ -1214,10 +1145,6 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         predictions_class = []
         predictions_mask = []
 
-        debug_topk_masks = []
-        debug_topk_scores = []
-        debug_topk_indices = []
-
         # ------------------------------------------------------------
         # 4. Initial prediction before decoder layers
         # ------------------------------------------------------------
@@ -1228,17 +1155,6 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         )
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
-
-        if self.debug_vis_enabled:
-            layer_masks, layer_scores, layer_indices = (
-                self._collect_debug_topk(
-                    outputs_class,
-                    outputs_mask,
-                )
-            )
-            debug_topk_masks.append(layer_masks)
-            debug_topk_scores.append(layer_scores)
-            debug_topk_indices.append(layer_indices)
 
         # ------------------------------------------------------------
         # 5. Decoder layers
@@ -1284,17 +1200,6 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
 
-            if self.debug_vis_enabled:
-                layer_masks, layer_scores, layer_indices = (
-                    self._collect_debug_topk(
-                        outputs_class,
-                        outputs_mask,
-                    )
-                )
-                debug_topk_masks.append(layer_masks)
-                debug_topk_scores.append(layer_scores)
-                debug_topk_indices.append(layer_indices)
-
         assert len(predictions_class) == self.num_layers + 1
 
         # ------------------------------------------------------------
@@ -1327,50 +1232,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         if enc_outputs is not None:
             out['enc_outputs'] = enc_outputs
 
-        if self.debug_vis_enabled:
-            out['debug_topk_masks'] = debug_topk_masks
-            out['debug_topk_scores'] = debug_topk_scores
-            out['debug_topk_indices'] = debug_topk_indices
-
         return out, mask_dict
-
-    def _collect_debug_topk(self, outputs_class, outputs_mask):
-        """
-        Args:
-            outputs_class: [N, Q, C+1]
-            outputs_mask:  [N, Q, D, H, W]   raw logits
-
-        Returns:
-            topk_masks_cpu:   list of len N, each [K, D, H, W] float32 (prob)
-            topk_scores_cpu:  list of len N, each [K]
-            topk_indices_cpu: list of len N, each [K]   query indices
-        """
-        # [N, Q, C]
-        scores = F.softmax(outputs_class, dim=-1)[..., :-1]
-
-        N, Q, C = scores.shape
-        topk_masks_cpu = []
-        topk_scores_cpu = []
-        topk_indices_cpu = []
-
-        for b in range(N):
-            scores_b = scores[b]  # [Q, C]
-            masks_b = outputs_mask[b]  # [Q, D, H, W]
-
-            flat_scores = scores_b.flatten(0, 1)  # [Q*C]
-            k = min(self.debug_vis_topk, flat_scores.numel())
-
-            topk_scores, topk_flat_indices = flat_scores.topk(k, sorted=False)
-            query_indices = topk_flat_indices // C  # [K]
-
-            # 取 query 对应 mask；保存概率图而不是 raw logits
-            topk_masks = masks_b[query_indices].sigmoid()
-
-            topk_masks_cpu.append(topk_masks.detach().cpu())
-            topk_scores_cpu.append(topk_scores.detach().cpu())
-            topk_indices_cpu.append(query_indices.detach().cpu())
-
-        return topk_masks_cpu, topk_scores_cpu, topk_indices_cpu
 
     def forward_prediction_heads(
         self, output, mask_features, attn_mask_target_size

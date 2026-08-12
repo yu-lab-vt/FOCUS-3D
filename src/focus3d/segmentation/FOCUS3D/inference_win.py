@@ -20,8 +20,21 @@ from .mask2former.maskformer_model_win import (
     build_maskformer_model_from_cfg,
 )
 
-def identity_collate(batch):
-    return batch
+def patch_collate_fn(samples):
+    images = torch.stack(
+        [
+            sample["image"]
+            for sample in samples
+        ],
+        dim=0,
+    )
+
+    coords = [
+        sample["coord"]
+        for sample in samples
+    ]
+
+    return images, coords
 
 def _format_eta(seconds: float | None) -> str:
     if seconds is None or seconds < 0 or not math.isfinite(seconds):
@@ -251,7 +264,7 @@ def infer_volume(
     z_ratio: float = 1.0,
     lower_percentile: float = 1.0,
     upper_percentile: float = 99.0,
-    background_threshold: float = 5.0,
+    background_threshold: float | None = None,
     batch_size: int = 1,
     data_loader_num_workers: int = 4,
     save_intermediate: bool = False,
@@ -324,6 +337,9 @@ def infer_volume(
     _check_cancelled(cancel_callback)
 
     model = build_predictor(cfg)
+    # Enable mathematically safe pre-upsampling filtering
+    model.fast_score_thresh = float(score_thresh)
+    model.fast_mask_thresh = float(mask_thresh)
 
     _check_cancelled(cancel_callback)
 
@@ -357,7 +373,11 @@ def infer_volume(
         'z_ratio': float(z_ratio),
         'lower_percentile': float(lower_percentile),
         'upper_percentile': float(upper_percentile),
-        'background_threshold': float(background_threshold),
+        'background_threshold_user': (
+            None
+            if background_threshold is None
+            else float(background_threshold)
+        ),
         'batch_size': int(batch_size),
         'save_intermediate': bool(save_intermediate),
         'amp_enabled_from_cfg': bool(amp_enabled),
@@ -419,37 +439,84 @@ def infer_volume(
     _emit_status(progress_callback, 'Normalizing image...')
     _check_cancelled(cancel_callback)
 
-    norm_volume, norm_stats = normalize_img(
-        infer_raw_volume,
-        lower_percentile=lower_percentile,
-        upper_percentile=upper_percentile,
-    )
-    bg_raw = float(background_threshold)
-    p_low = norm_stats['p_low']
-    p_high = norm_stats['p_high']
-    if p_high <= p_low:
-        background_threshold_norm = 0.0
-    else:
-        background_threshold_norm = (bg_raw - p_low) / (p_high - p_low)
-        background_threshold_norm = float(
-            np.clip(background_threshold_norm, 0.0, 1.0)
-        )
-    log_info['normalization'] = norm_stats
-
-    # --------------------------------------------------------
-    # Patch / stride planning and padding
-    # --------------------------------------------------------
-    print('\n[Step 3] "Generating patches..."')
-    _emit_status(progress_callback, 'Preparing sliding-window patches...')
-    _check_cancelled(cancel_callback)
+    # ============================================================
+    # Resolve stride FIRST
+    # ============================================================
 
     if stride is None:
         stride = tuple(s // 2 for s in patch_size)
     else:
         stride = tuple(stride)
 
-    padded_volume, pad_info = pad_volume_for_sliding_window(
-        norm_volume, patch_size, stride
+    patch_size = tuple(patch_size)
+
+
+    # ============================================================
+    # Compute global percentiles ONCE
+    # ============================================================
+
+    percentile_list = [
+        float(lower_percentile),
+        float(upper_percentile),
+    ]
+
+    if background_threshold is None:
+        percentile_list.append(5.0)
+
+    percentile_values = compute_percentiles_fast(
+        infer_raw_volume,
+        percentile_list,
+        chunk_z=8,
+    )
+
+    p_low = float(percentile_values[0])
+    p_high = float(percentile_values[1])
+
+    norm_stats = {
+        "p_low": p_low,
+        "p_high": p_high,
+    }
+
+
+    # ============================================================
+    # Resolve background threshold
+    # ============================================================
+
+    if background_threshold is None:
+        bg_raw = float(percentile_values[2])
+        background_threshold_source = "global_5th_percentile"
+    else:
+        bg_raw = float(background_threshold)
+        background_threshold_source = "user"
+
+    if p_high <= p_low:
+        background_threshold_norm = 0.0
+    else:
+        background_threshold_norm = (
+            (bg_raw - p_low)
+            / (p_high - p_low)
+        )
+
+        background_threshold_norm = float(
+            np.clip(
+                background_threshold_norm,
+                0.0,
+                1.0,
+            )
+        )
+
+
+    # ============================================================
+    # Normalize + pad
+    # ============================================================
+
+    padded_volume, pad_info = normalize_and_pad_volume(
+        volume=infer_raw_volume,
+        p_low=p_low,
+        p_high=p_high,
+        patch_size=patch_size,
+        stride=stride,
+        chunk_z=8,
     )
     log_info['pad_info'] = pad_info
 
@@ -472,17 +539,46 @@ def infer_volume(
     _emit_status(progress_callback, 'Generating valid inference patches...')
     _check_cancelled(cancel_callback)
 
-    for idx, (z0, y0, x0) in enumerate(all_coords):
-        if idx % 16 == 0:
-            _check_cancelled(cancel_callback)
+    if background_threshold_norm <= 0.0:
+        infer_coords = all_coords
+        skipped_coords = []
 
-        patch = padded_volume[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px]
+    else:
+        infer_coords = []
+        skipped_coords = []
 
-        if np.percentile(patch, 99.9) < background_threshold_norm:
-            skipped_coords.append((z0, y0, x0))
-        else:
-            infer_coords.append((z0, y0, x0))
+        for idx, (z0, y0, x0) in enumerate(all_coords):
 
+            if idx % 16 == 0:
+                _check_cancelled(cancel_callback)
+
+            patch = padded_volume[
+                z0:z0+pz,
+                y0:y0+py,
+                x0:x0+px,
+            ]
+
+            # Cheap exact early-out
+            if patch.max() < background_threshold_norm:
+                skipped_coords.append(
+                    (z0, y0, x0)
+                )
+                continue
+
+            if (
+                np.percentile(
+                    patch,
+                    99.9,
+                )
+                < background_threshold_norm
+            ):
+                skipped_coords.append(
+                    (z0, y0, x0)
+                )
+            else:
+                infer_coords.append(
+                    (z0, y0, x0)
+                )
     _check_cancelled(cancel_callback)
 
     log_info['num_infer_patches'] = int(len(infer_coords))
@@ -523,7 +619,7 @@ def infer_volume(
         pin_memory=True,
         persistent_workers=(data_loader_num_workers > 0),
         prefetch_factor=2 if data_loader_num_workers > 0 else None,
-        collate_fn=identity_collate,
+        collate_fn=patch_collate_fn,
     )
 
     patch_pbar = tqdm(
@@ -553,19 +649,30 @@ def infer_volume(
             f'Patch inference: 0/{total_patches} patches',
         )
 
-    for batch_idx, inputs in enumerate(patch_pbar, start=1):
-        _check_cancelled(cancel_callback)
-
-        for sample in inputs:
-            _check_cancelled(cancel_callback)
-            sample['image'] = sample['image'].to(device, non_blocking=True)
+    for batch_idx, (
+        batch_images,
+        batch_coords,
+    ) in enumerate(patch_pbar):
 
         _check_cancelled(cancel_callback)
+
+        batch_images = batch_images.to(
+            device,
+            non_blocking=True,
+        )
+
+        inputs = [
+            {
+                "image": batch_images[i],
+                "coord": batch_coords[i],
+            }
+            for i in range(batch_images.shape[0])
+        ]
 
         with (
             torch.inference_mode(),
             torch.autocast(
-                device_type='cuda',
+                device_type="cuda",
                 dtype=autocast_dtype,
                 enabled=amp_enabled,
             ),
@@ -685,13 +792,23 @@ def infer_volume(
     )
 
     # Save result before final post-processing.
-    pre_post_instance_padded = instance_map_padded.copy()
-    pre_post_confidence_padded = confidence_map_padded.copy()
-
     z_inf, y_inf, x_inf = infer_shape
-    pre_post_instance = pre_post_instance_padded[:z_inf, :y_inf, :x_inf]
-    pre_post_confidence = pre_post_confidence_padded[:z_inf, :y_inf, :x_inf]
     if save_intermediate:
+        pre_post_instance = (
+            instance_map_padded[
+                :z_inf,
+                :y_inf,
+                :x_inf,
+            ]
+        )
+
+        pre_post_confidence = (
+            confidence_map_padded[
+                :z_inf,
+                :y_inf,
+                :x_inf,
+            ]
+        )
         save_volume(
             output_dir
             / f'{Path(image_path).stem}_instance_map_before_postprocess.tif',
@@ -809,36 +926,36 @@ class PatchDataset(torch.utils.data.Dataset):
         }
 
 
-def read_volume(image_path: str | Path) -> np.ndarray:
-    """
-    Read a 3D volume from .tif/.tiff or .zarr and return a numpy array with
-    shape (Z, Y, X).
-
-    Notes:
-        - This function assumes the input is already a 3D volume or can be
-          squeezed to 3D.
-        - If the input has singleton dimensions, they will be removed.
-    """
+def read_volume(image_path):
     image_path = str(image_path)
     suffix = Path(image_path).suffix.lower()
 
-    if suffix in ['.tif', '.tiff']:
-        vol = tifffile.imread(image_path)
-    elif suffix == '.zarr':
-        z = zarr.open(image_path, mode='r')
-        vol = np.asarray(z)
-    else:
-        raise ValueError(f'Unsupported file format: {image_path}')
-
-    vol = np.asarray(vol)
-    vol = np.squeeze(vol)
-
-    if vol.ndim != 3:
-        raise ValueError(
-            f'Expected a 3D volume after squeeze, got shape {vol.shape}'
+    if suffix in [".tif", ".tiff"]:
+        vol = tifffile.imread(
+            image_path,
+            out="memmap",
         )
 
-    return vol.astype(np.float32, copy=False)
+    elif suffix == ".zarr":
+        vol = zarr.open(
+            image_path,
+            mode="r",
+        )
+
+    else:
+        raise ValueError(
+            f"Unsupported file format: {image_path}"
+        )
+
+    if isinstance(vol, np.ndarray):
+        vol = np.squeeze(vol)
+
+    if len(vol.shape) != 3:
+        raise ValueError(
+            f"Expected a 3D volume after squeeze, got shape {vol.shape}"
+        )
+
+    return vol
 
 
 def save_volume(output_path: str | Path, volume: np.ndarray) -> None:
@@ -877,49 +994,6 @@ def save_volume(output_path: str | Path, volume: np.ndarray) -> None:
         z[:] = volume
     else:
         raise ValueError(f'Unsupported output format: {output_path}')
-
-def normalize_img(
-    volume: np.ndarray,
-    lower_percentile: float = 1.0,
-    upper_percentile: float = 99.0,
-) -> tuple[np.ndarray, dict]:
-    """
-    Normalize the whole volume to [0, 1] using user-provided percentiles.
-
-    Returns:
-        normalized_volume: float32 array in [0, 1]
-        stats: dictionary with normalization metadata
-    """
-    if not (0.0 <= lower_percentile < upper_percentile <= 100.0):
-        raise ValueError('Percentiles must satisfy 0 <= lower < upper <= 100')
-
-    p_low = float(np.percentile(volume, lower_percentile))
-    p_high = float(np.percentile(volume, upper_percentile))
-
-    if p_high <= p_low:
-        p_low = float(volume.min())
-        p_high = float(volume.max())
-        normalized = np.zeros_like(volume, dtype=np.float32)
-        stats = {
-            'raw_min': float(volume.min()),
-            'raw_max': float(volume.max()),
-            'p_low': p_low,
-            'p_high': p_high,
-            'note': 'Degenerate image; output is all zeros.',
-        }
-        return normalized, stats
-
-    clipped = np.clip(volume, p_low, p_high)
-    normalized = (clipped - p_low) / (p_high - p_low)
-    normalized = normalized.astype(np.float32, copy=False)
-
-    stats = {
-        'raw_min': float(volume.min()),
-        'raw_max': float(volume.max()),
-        'p_low': p_low,
-        'p_high': p_high,
-    }
-    return normalized, stats
 
 
 def resize_volume_to_shape(
@@ -1085,7 +1159,7 @@ def resample_volume_for_inference(
     }
 
     if not enabled:
-        return volume.astype(np.float32, copy=False), info
+        return volume, info
 
     resampled = resize_volume_to_shape(
         volume.astype(np.float32, copy=False),
@@ -1120,48 +1194,6 @@ def compute_padded_length(length: int, patch: int, stride: int) -> int:
     return patch + n_steps * stride
 
 
-def pad_volume_for_sliding_window(
-    volume: np.ndarray,
-    patch_size: tuple[int, int, int],
-    stride: tuple[int, int, int],
-) -> tuple[np.ndarray, dict]:
-    """
-    Pad the input volume so that all sliding windows fit exactly.
-
-    Padding is applied only at the end of each dimension.
-    """
-    z, y, x = volume.shape
-    pz, py, px = patch_size
-    sz, sy, sx = stride
-
-    z_pad_target = compute_padded_length(z, pz, sz)
-    y_pad_target = compute_padded_length(y, py, sy)
-    x_pad_target = compute_padded_length(x, px, sx)
-
-    pad_z = z_pad_target - z
-    pad_y = y_pad_target - y
-    pad_x = x_pad_target - x
-
-    pad_width = (
-        (0, pad_z),
-        (0, pad_y),
-        (0, pad_x),
-    )
-
-    padded = np.pad(volume, pad_width=pad_width, mode='reflect')
-
-    pad_info = {
-        'original_shape': [int(z), int(y), int(x)],
-        'padded_shape': [
-            int(padded.shape[0]),
-            int(padded.shape[1]),
-            int(padded.shape[2]),
-        ],
-        'pad_width': [[0, int(pad_z)], [0, int(pad_y)], [0, int(pad_x)]],
-    }
-    return padded, pad_info
-
-
 def generate_patch_coords(
     volume_shape: tuple[int, int, int],
     patch_size: tuple[int, int, int],
@@ -1186,91 +1218,134 @@ def generate_patch_coords(
 # Patch postprocessing
 # ============================================================
 
-
 def patch_postprocess_argmax(
     model_output,
-    patch_shape: tuple[int, int, int],
-    score_thresh: float = 0.5,
-    mask_thresh: float = 0.5,
-    min_voxels: int = 20,
-    topk_postprocess: int = 300,
-):
+    patch_shape,
+    score_thresh=0.5,
+    mask_thresh=0.5,
+    min_voxels=20,
+    topk_postprocess=300,
+ ):
     D, H, W = patch_shape
 
     patch_instance_map = np.zeros((D, H, W), dtype=np.uint16)
     patch_confidence = np.zeros((D, H, W), dtype=np.float32)
 
-    if 'pred_scores' not in model_output or 'pred_masks' not in model_output:
+    if "pred_scores" not in model_output or "pred_masks" not in model_output:
+
         return {
-            'patch_instance_map': patch_instance_map,
-            'patch_confidence': patch_confidence,
+            "patch_instance_map": patch_instance_map,
+            "patch_confidence": patch_confidence,
         }
 
-    scores = model_output['pred_scores'].detach().float()
-    masks = model_output['pred_masks'].detach().float()
+    # ------------------------------------------------------------
+    # 0. Cheap query filtering
+    # ------------------------------------------------------------
+    scores = model_output["pred_scores"].detach().float()
+    masks = model_output["pred_masks"].detach()
 
     if masks.numel() == 0 or scores.numel() == 0:
         return {
-            'patch_instance_map': patch_instance_map,
-            'patch_confidence': patch_confidence,
+            "patch_instance_map": patch_instance_map,
+            "patch_confidence": patch_confidence,
         }
 
-    if masks.min() < 0 or masks.max() > 1:
-        mask_prob = masks.sigmoid()
-    else:
-        mask_prob = masks
+    # ------------------------------------------------------------
+    # Exact classification-score upper-bound filtering
+    # ------------------------------------------------------------
+    keep_cls = scores > score_thresh
+
+    if not keep_cls.any().item():
+        return {
+            "patch_instance_map": patch_instance_map,
+            "patch_confidence": patch_confidence,
+        }
+
+    scores = scores[keep_cls]
+    masks = masks[keep_cls].float()
+
+    # ------------------------------------------------------------
+    # Mask logits/probability
+    # ------------------------------------------------------------
+    # if masks.min() < 0 or masks.max() > 1:
+    #     mask_prob = masks.sigmoid()
+    # else:
+    mask_prob = masks
+
+    # ------------------------------------------------------------
+    # Exact empty-mask filtering
+    # ------------------------------------------------------------
+    mask_bin_tmp = mask_prob > mask_thresh
+
+    has_foreground = mask_bin_tmp.flatten(1).any(dim=1)
+
+    if not has_foreground.any().item():
+        return {
+            "patch_instance_map": patch_instance_map,
+            "patch_confidence": patch_confidence,
+        }
+
+    scores = scores[has_foreground]
+    mask_prob = mask_prob[has_foreground]
+    mask_bin_tmp = mask_bin_tmp[has_foreground]
 
     # ------------------------------------------------------------
     # 1. Compute mask quality score
     # ------------------------------------------------------------
-    mask_bin_tmp = mask_prob > mask_thresh
+    mask_prob_flat = mask_prob.flatten(1)
+    mask_bin_flat = mask_bin_tmp.flatten(1)
 
-    mask_scores = (mask_prob.flatten(1) * mask_bin_tmp.flatten(1)).sum(
-        dim=1
-    ) / (mask_bin_tmp.flatten(1).sum(dim=1) + 1e-6)
+    mask_scores = (
+        mask_prob_flat * mask_bin_flat
+    ).sum(dim=1) / (
+        mask_bin_flat.sum(dim=1) + 1e-6
+    )
 
-    # Final query score = classification score * mask quality score.
     final_scores = scores * mask_scores
 
-    # Keep queries that satisfy both final score and mask quality thresholds.
-    keep = (final_scores > score_thresh) & (mask_scores > mask_thresh)
+    keep = (
+        (final_scores > score_thresh)
+        & (mask_scores > mask_thresh)
+    )
 
-    if keep.sum().item() == 0:
+    if not keep.any().item():
         return {
-            'patch_instance_map': patch_instance_map,
-            'patch_confidence': patch_confidence,
+            "patch_instance_map": patch_instance_map,
+            "patch_confidence": patch_confidence,
         }
 
     final_scores = final_scores[keep]
     mask_scores = mask_scores[keep]
     mask_prob = mask_prob[keep]
+    mask_bin = mask_bin_tmp[keep]
 
     # ------------------------------------------------------------
     # 2. Sort queries by final score
     # ------------------------------------------------------------
-    order = torch.argsort(final_scores, descending=True)
+    order = torch.argsort(
+        final_scores,
+        descending=True,
+    )
+
     final_scores = final_scores[order]
     mask_scores = mask_scores[order]
     mask_prob = mask_prob[order]
+    mask_bin = mask_bin[order]
 
-    if topk_postprocess is not None and mask_prob.shape[0] > topk_postprocess:
+    if (
+        topk_postprocess is not None
+        and mask_prob.shape[0] > topk_postprocess
+    ):
         final_scores = final_scores[:topk_postprocess]
         mask_scores = mask_scores[:topk_postprocess]
         mask_prob = mask_prob[:topk_postprocess]
+        mask_bin = mask_bin[:topk_postprocess]
 
     num_queries = mask_prob.shape[0]
 
     # ------------------------------------------------------------
     # 3. Conflict resolving before voxel-level argmax
     # ------------------------------------------------------------
-    # For two conflicting masks on the same z-slice:
-    #   1) If intersection / min(area_a, area_b) > 0.8 -> merge
-    #   2) Else if IoU(intersection / union) > 0.5 -> merge
-    #   3) If merged, assign the merged 2D structure to the query whose
-    #      adjacent z-slice mask is more similar to the merged structure.
-    #   4) If neither condition is satisfied, keep both queries unchanged.
-
-    mask_bin = mask_prob > mask_thresh
     mask_prob_resolved = mask_prob.clone()
 
     conflict_min_pixels = 20
@@ -1299,7 +1374,7 @@ def patch_postprocess_argmax(
                 continue
 
             for cc_id in range(1, num_cc + 1):
-                cc_mask_np = cc_map == cc_id
+                cc_mask_np = (cc_map == cc_id)
                 if int(cc_mask_np.sum()) < conflict_min_pixels:
                     continue
 
@@ -1309,10 +1384,8 @@ def patch_postprocess_argmax(
                 )
 
                 participate = (
-                    (mask_bin[:, z] & cc_mask[None, :, :])
-                    .flatten(1)
-                    .any(dim=1)
-                )
+                    mask_bin[:, z] & cc_mask[None, :, :]
+                ).flatten(1).any(dim=1)
 
                 if participate.sum().item() <= 1:
                     continue
@@ -1357,9 +1430,7 @@ def patch_postprocess_argmax(
                         iom = float(inter) / float(min(area_i, area_j) + 1e-6)
                         iou = float(inter) / float(union_area + 1e-6)
 
-                        should_merge = (iom > merge_iom_thresh) or (
-                            iou > merge_iou_thresh
-                        )
+                        should_merge = (iom > merge_iom_thresh) or (iou > merge_iou_thresh)
                         if should_merge:
                             union(i, j)
 
@@ -1397,24 +1468,23 @@ def patch_postprocess_argmax(
                         if z > 0:
                             adj_iou = max(
                                 adj_iou,
-                                _safe_iou_bool(
-                                    merged_mask, mask_bin[q, z - 1]
-                                ),
+                                _safe_iou_bool(merged_mask, mask_bin[q, z - 1]),
                             )
 
                         if z < D - 1:
                             adj_iou = max(
                                 adj_iou,
-                                _safe_iou_bool(
-                                    merged_mask, mask_bin[q, z + 1]
-                                ),
+                                _safe_iou_bool(merged_mask, mask_bin[q, z + 1]),
                             )
 
                         score_tie = float(final_scores[q].item())
 
-                        if adj_iou > best_adj_iou or (
-                            abs(adj_iou - best_adj_iou) < 1e-6
-                            and score_tie > best_score_tie
+                        if (
+                            adj_iou > best_adj_iou
+                            or (
+                                abs(adj_iou - best_adj_iou) < 1e-6
+                                and score_tie > best_score_tie
+                            )
                         ):
                             best_adj_iou = adj_iou
                             best_score_tie = score_tie
@@ -1423,19 +1493,17 @@ def patch_postprocess_argmax(
                     if best_q is None:
                         continue
 
-                    # Assign merged structure to best_q. Use the maximum
-                    # probability among merged queries as the winner
-                    # probability on the merged region.
+                    # Assign merged structure to best_q.
+                    # Use the maximum probability among merged queries as
+                    # the winner probability on the merged region.
                     group_probs = mask_prob_resolved[group_qs, z]
                     merged_prob = group_probs.max(dim=0).values
 
-                    mask_prob_resolved[best_q, z][merged_mask] = merged_prob[
-                        merged_mask
-                    ]
+                    mask_prob_resolved[best_q, z][merged_mask] = merged_prob[merged_mask]
                     mask_bin[best_q, z][merged_mask] = True
 
                     # Suppress other queries only on this merged structure.
-                    # Other non-overlapping parts remain unchanged.
+                    # Other non-overlapping parts of those queries remain unchanged.
                     for q in group_qs:
                         if q == best_q:
                             continue
@@ -1449,10 +1517,11 @@ def patch_postprocess_argmax(
 
     best_score, best_idx = voxel_scores.max(dim=0)  # (D, H, W)
 
-    # Foreground is determined by the selected query's resolved mask
-    # probability.
+    # Foreground is determined by the selected query's resolved mask probability
     selected_mask_prob = torch.gather(
-        mask_prob_resolved, dim=0, index=best_idx.unsqueeze(0)
+        mask_prob_resolved,
+        dim=0,
+        index=best_idx.unsqueeze(0)
     ).squeeze(0)
 
     fg = selected_mask_prob > mask_thresh
@@ -1480,9 +1549,7 @@ def patch_postprocess_argmax(
     # ------------------------------------------------------------
     # 6. Remove abnormal full-foreground patch
     # ------------------------------------------------------------
-    foreground_ratio = float(np.count_nonzero(patch_instance_map)) / float(
-        patch_instance_map.size
-    )
+    foreground_ratio = float(np.count_nonzero(patch_instance_map)) / float(patch_instance_map.size)
 
     nonzero_ids = np.unique(patch_instance_map)
     nonzero_ids = nonzero_ids[nonzero_ids > 0]
@@ -1492,15 +1559,242 @@ def patch_postprocess_argmax(
         patch_confidence[...] = 0.0
 
     return {
-        'patch_instance_map': patch_instance_map,
-        'patch_confidence': patch_confidence,
+        "patch_instance_map": patch_instance_map,
+        "patch_confidence": patch_confidence,
     }
 
 
 # ============================================================
 # Stitching
 # ============================================================
+def compute_percentiles_fast(
+    volume,
+    percentiles,
+    chunk_z: int = 8,
+):
+    qs = np.asarray(
+        percentiles,
+        dtype=np.float64,
+    )
 
+    dtype = np.dtype(volume.dtype)
+
+    if dtype == np.uint8:
+        num_bins = 256
+    elif dtype == np.uint16:
+        num_bins = 65536
+    else:
+        # Fallback for float / unusual dtype.
+        return np.percentile(volume, qs)
+
+    hist = np.zeros(
+        num_bins,
+        dtype=np.int64,
+    )
+
+    z_size = volume.shape[0]
+
+    for z0 in range(0, z_size, chunk_z):
+        z1 = min(z0 + chunk_z, z_size)
+
+        chunk = np.asarray(
+            volume[z0:z1]
+        )
+
+        hist += np.bincount(
+            chunk.reshape(-1),
+            minlength=num_bins,
+        )
+
+    cdf = np.cumsum(hist)
+    n = int(cdf[-1])
+
+    if n <= 0:
+        return np.zeros_like(qs)
+
+    results = []
+
+    for q in qs:
+        rank = (
+            (n - 1)
+            * float(q)
+            / 100.0
+        )
+
+        rank_low = int(math.floor(rank))
+        rank_high = int(math.ceil(rank))
+        alpha = rank - rank_low
+
+        value_low = int(
+            np.searchsorted(
+                cdf,
+                rank_low + 1,
+                side="left",
+            )
+        )
+
+        value_high = int(
+            np.searchsorted(
+                cdf,
+                rank_high + 1,
+                side="left",
+            )
+        )
+
+        value = (
+            value_low
+            + alpha
+            * (value_high - value_low)
+        )
+
+        results.append(float(value))
+
+    return np.asarray(
+        results,
+        dtype=np.float64,
+    )
+
+
+def normalize_and_pad_volume(
+    volume,
+    p_low: float,
+    p_high: float,
+    patch_size,
+    stride,
+    chunk_z: int = 8,
+):
+    z, y, x = volume.shape
+    pz, py, px = patch_size
+    sz, sy, sx = stride
+
+    z_target = compute_padded_length(
+        z, pz, sz
+    )
+    y_target = compute_padded_length(
+        y, py, sy
+    )
+    x_target = compute_padded_length(
+        x, px, sx
+    )
+
+    pad_z = z_target - z
+    pad_y = y_target - y
+    pad_x = x_target - x
+
+    padded = np.empty(
+        (z_target, y_target, x_target),
+        dtype=np.float32,
+    )
+
+    if p_high <= p_low:
+        padded.fill(0.0)
+    else:
+        inv_range = 1.0 / (
+            p_high - p_low
+        )
+
+        for z0 in range(0, z, chunk_z):
+            z1 = min(
+                z0 + chunk_z,
+                z,
+            )
+
+            chunk = np.asarray(
+                volume[z0:z1],
+                dtype=np.float32,
+            )
+
+            np.clip(
+                chunk,
+                p_low,
+                p_high,
+                out=chunk,
+            )
+
+            chunk -= p_low
+            chunk *= inv_range
+
+            padded[
+                z0:z1,
+                :y,
+                :x,
+            ] = chunk
+
+    # --------------------------------------------------------
+    # Reproduce np.pad(..., mode="reflect")
+    # without copying the whole volume.
+    # --------------------------------------------------------
+
+    if pad_x > 0:
+        x_idx = np.pad(
+            np.arange(x),
+            (0, pad_x),
+            mode="reflect",
+        )[x:]
+
+        padded[
+            :z,
+            :y,
+            x:
+        ] = np.take(
+            padded[:z, :y, :x],
+            x_idx,
+            axis=2,
+        )
+
+    if pad_y > 0:
+        y_idx = np.pad(
+            np.arange(y),
+            (0, pad_y),
+            mode="reflect",
+        )[y:]
+
+        padded[
+            :z,
+            y:,
+            :
+        ] = np.take(
+            padded[:z, :y, :],
+            y_idx,
+            axis=1,
+        )
+
+    if pad_z > 0:
+        z_idx = np.pad(
+            np.arange(z),
+            (0, pad_z),
+            mode="reflect",
+        )[z:]
+
+        padded[
+            z:,
+            :,
+            :
+        ] = np.take(
+            padded[:z, :, :],
+            z_idx,
+            axis=0,
+        )
+
+    pad_info = {
+        "original_shape": [
+            int(z),
+            int(y),
+            int(x),
+        ],
+        "padded_shape": [
+            int(z_target),
+            int(y_target),
+            int(x_target),
+        ],
+        "pad_width": [
+            [0, int(pad_z)],
+            [0, int(pad_y)],
+            [0, int(pad_x)],
+        ],
+    }
+
+    return padded, pad_info
 
 def stitch_patch_instance_results(
     global_instance_map: np.ndarray,
