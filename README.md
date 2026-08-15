@@ -46,7 +46,11 @@ For most Linux environments, the official source installation command is:
 python -m pip install 'git+https://github.com/facebookresearch/detectron2.git'
 ```
 
-#### 5. Launch napari
+#### 5. Download pretrained model
+Users can download the pretrained model for 3D segmentation: https://huggingface.co/Qinghua-thu/FOCUS-3D/.
+
+
+#### 6. Launch napari
 
 ```bash
 python -m napari
