@@ -1,1 +1,1 @@
-Please download checkpoint: https://cloud.tsinghua.edu.cn/d/7b290a5c8a0444d78af8/.
+Please download checkpoint: [https://huggingface.co/Qinghua-thu/FOCUS-3D/](https://huggingface.co/Qinghua-thu/FOCUS-3D).
