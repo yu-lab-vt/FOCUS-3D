@@ -58,8 +58,6 @@ python -m napari
 
 ## Recommended Workflow
 
-The following workflow is designed for first-time users. 
-
 ### Step 1 — Load and inspect the image
 1. In napari, open `Plugins -> 3D Segmentation (FOCUS-3D)`.
 2. Load a raw 3D microscopy image:
@@ -68,22 +66,20 @@ The following workflow is designed for first-time users.
 3. Open the `Basic` tab and use `Display Settings` when the raw image is difficult to inspect:
    - move the `Minimum` and `Maximum` sliders to adjust contrast;
    - click `Auto` for percentile-based contrast adjustment;
-   - The display settings affect visualization only; they do not modify the raw image values used for segmentation.
 
 ### Step 2 — Run automatic 3D segmentation
-
 1. Open the `Segmentation` tab.
 2. In `Run Segmentation`, set the parameters that are most likely to vary between datasets:
    - **Z Ratio** — the physical Z-to-XY spacing ratio. Use `1.0` for isotropic data.
-   - **Output Path** — the directory used for the current segmentation result.
+   - **Output Path** — the directory used for the segmentation result.
    - **Checkpoint** — the pretrained or fine-tuned checkpoint.
    - **Cell radius (pixel)** — the approximate cell radius in the XY plane.
    - **Background intensity** — patches or cells with grayscale values less than this value will be removed.
-   - **Min size (3D)** and **Max size (3D)** — remove implausibly small or large instances.
+   - **Min size (3D)** and **Max size (3D)** — remove small or large instances.
 3. Use `Advanced` only when you need to change the GPU, configuration file, normalization percentiles, patch stride, batch size, or stitching thresholds. See the [complete menu reference](docs/MENU_REFERENCE.md#run-segmentation) for parameter definitions and defaults.
 4. Click `Run 3D Segmentation`.
 
-After inference, FOCUS-3D loads an editable label layer into napari. The inference outputs are saved to the specified output path in both TIFF and Zarr formats.
+After inference, FOCUS-3D loads a label layer into napari. The inference outputs are saved to the specified output path in both TIFF and Zarr formats.
 
 ### Step 3 — Inspect and curate the segmentation
 
@@ -100,13 +96,13 @@ After inference, FOCUS-3D loads an editable label layer into napari. The inferen
    * use `Delete All Z` to remove an incorrect 3D instance;
    * use `Delete Inside ROI (All Z)` to remove multiple labels in a selected region.
 
-   For detailed instructions on ROI drawing, label-editing operations, and keyboard shortcuts, see [Manual Curation](docs/MENU_REFERENCE.md#manual-curation).
+   For detailed instructions on label-editing operations and keyboard shortcuts, see [Manual Curation](docs/MENU_REFERENCE.md#manual-curation).
 
 4. For labels stored in Zarr format, edits are written directly to the underlying Zarr data, so no separate save step is required. Labels loaded from TIFF are edited in memory and must be saved manually from the `Save` panel after curation.
 
-### Step 4 — Use one-click local refinement when needed
+### Step 4 — Use one-click segmentation when needed
 
-Manual drawing is not always the fastest way to correct a difficult cell.
+One-click segmentation can accelerate the curation.
 
 1. Keep both the raw image and segmentation label layer loaded.
 2. Open `Segmentation -> One-click segmentation`.
@@ -122,7 +118,7 @@ Open the `Analysis` tab after the segmentation has been checked.
 #### Reconstruct one selected cell
 
 1. Select a non-background cell in the label layer.
-2. Set the appropriate `Z Ratio`.
+2. Set the `Z Ratio`.
 3. Click `Reconstruct Selected Label`.
 4. Save the reconstructed mesh as `.npz` when needed.
 
@@ -202,7 +198,7 @@ The complete descriptions of all controls are maintained in:
 
 ## Issues
 
-If you encounter a problem, please [file an issue](https://github.com/Qinghua24/cellseg/issues) with a detailed description, relevant logs, and a minimal example when possible. You may also contact `zhangqh24@mails.tsinghua.edu.cn`.
+If you encounter a problem, please [file an issue](https://github.com/Qinghua24/cellseg/issues) with a detailed description, relevant logs, and a minimal example when possible. You can also contact `zhangqh24@mails.tsinghua.edu.cn`.
 
 ## Citing
 
