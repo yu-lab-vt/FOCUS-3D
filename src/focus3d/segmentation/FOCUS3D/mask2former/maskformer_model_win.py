@@ -325,7 +325,7 @@ class MaskFormer(nn.Module):
             ):
                 processed_results.append({})
 
-                instance_r = retry_if_cuda_oom(self.instance_inference)(
+                instance_r = self.instance_inference(
                     mask_cls_result,
                     mask_pred_result,
                 )

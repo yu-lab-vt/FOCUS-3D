@@ -9,8 +9,6 @@ from detectron2.config import configurable
 from detectron2.data import MetadataCatalog
 from detectron2.modeling import META_ARCH_REGISTRY, build_backbone
 from detectron2.modeling.backbone import Backbone
-from detectron2.utils.events import get_event_storage
-from detectron2.utils.memory import retry_if_cuda_oom
 from torch import nn
 from torch.nn import functional as F
 
