@@ -12,9 +12,256 @@ from functools import partial
 
 import torch
 import torch.nn as nn
-from timm.models.vision_transformer import Block, PatchEmbed
 
 from .util.pos_embed import get_2d_sincos_pos_embed, get_3d_sincos_pos_embed
+
+
+class PatchEmbed(nn.Module):
+    """
+    Local replacement for timm.models.vision_transformer.PatchEmbed.
+
+    This is mainly kept for compatibility with the 2D MAE class.
+    The 3D MAE path uses PatchEmbed3D below.
+    """
+
+    def __init__(
+        self,
+        img_size=224,
+        patch_size=16,
+        in_chans=3,
+        embed_dim=768,
+        norm_layer=None,
+        flatten=True,
+        bias=True,
+    ):
+        super().__init__()
+
+        if isinstance(img_size, int):
+            img_size = (img_size, img_size)
+        elif isinstance(img_size, (list, tuple)):
+            img_size = tuple(img_size)
+            if len(img_size) == 3:
+                # If a 3D size is accidentally passed to the 2D class,
+                # use H/W dimensions for 2D compatibility.
+                img_size = (img_size[-2], img_size[-1])
+            elif len(img_size) != 2:
+                raise ValueError(
+                    f'PatchEmbed expects 2D img_size, got {img_size}'
+                )
+
+        if isinstance(patch_size, int):
+            patch_size = (patch_size, patch_size)
+        elif isinstance(patch_size, (list, tuple)):
+            patch_size = tuple(patch_size)
+            if len(patch_size) == 3:
+                patch_size = (patch_size[-2], patch_size[-1])
+            elif len(patch_size) != 2:
+                raise ValueError(
+                    f'PatchEmbed expects 2D patch_size, got {patch_size}'
+                )
+
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.grid_size = (
+            img_size[0] // patch_size[0],
+            img_size[1] // patch_size[1],
+        )
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
+        self.flatten = flatten
+
+        self.proj = nn.Conv2d(
+            in_chans,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            bias=bias,
+        )
+        self.norm = (
+            norm_layer(embed_dim) if norm_layer is not None else nn.Identity()
+        )
+
+    def forward(self, x):
+        x = self.proj(x)
+
+        if self.flatten:
+            x = x.flatten(2).transpose(1, 2)
+
+        x = self.norm(x)
+        return x
+
+
+class Mlp(nn.Module):
+    """
+
+    State dict keys are compatible with timm Block:
+        mlp.fc1.*
+        mlp.fc2.*
+    """
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        act_layer=nn.GELU,
+        drop=0.0,
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.drop1 = nn.Dropout(drop)
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop2 = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        x = self.drop2(x)
+        return x
+
+
+class Attention(nn.Module):
+    """
+    Local replacement for timm ViT Attention.
+
+    State dict keys are compatible with timm Block:
+        attn.qkv.*
+        attn.proj.*
+    """
+
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        qkv_bias=False,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+    ):
+        super().__init__()
+
+        if dim % num_heads != 0:
+            raise ValueError(
+                f'dim={dim} must be divisible by num_heads={num_heads}'
+            )
+
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim**-0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+
+        qkv = self.qkv(x)
+        qkv = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = attn @ v
+        x = x.transpose(1, 2).reshape(B, N, C)
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class DropPath(nn.Module):
+    """
+    Stochastic depth. Kept for architecture compatibility.
+    With drop_prob=0.0, this is identity.
+    """
+
+    def __init__(self, drop_prob=0.0):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x):
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+
+        random_tensor = keep_prob + torch.rand(
+            shape,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        random_tensor.floor_()
+
+        return x.div(keep_prob) * random_tensor
+
+
+class Block(nn.Module):
+    """
+    Local replacement for timm.models.vision_transformer.Block.
+
+    Key names are intentionally compatible with timm:
+        norm1.*
+        attn.qkv.*
+        attn.proj.*
+        norm2.*
+        mlp.fc1.*
+        mlp.fc2.*
+    """
+
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        mlp_ratio=4.0,
+        qkv_bias=False,
+        qk_scale=None,
+        drop=0.0,
+        attn_drop=0.0,
+        drop_path=0.0,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+    ):
+        super().__init__()
+
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(
+            dim=dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+
+        self.drop_path = (
+            DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        )
+
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            act_layer=act_layer,
+            drop=drop,
+        )
+
+    def forward(self, x):
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
 
 
 class PatchEmbed3D(nn.Module):
@@ -181,7 +428,6 @@ class MaskedAutoencoderViT(nn.Module):
         w = self.patch_embed.proj.weight.data
         torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
 
-        # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
         torch.nn.init.normal_(self.cls_token, std=0.02)
         torch.nn.init.normal_(self.mask_token, std=0.02)
 

@@ -19,11 +19,11 @@ except ImportError:
 from dataclasses import dataclass
 from functools import partial
 
-from .vitadapter.vitadapter_win import ViTAdapter
+from .vitadapter.vitadapter import ViTAdapter
 
 # Import the 3D MAE model (adjust the import path as needed)
 try:
-    from .models_mae_win import MaskedAutoencoderViT3D
+    from .models_mae import MaskedAutoencoderViT3D
 except ImportError:
     raise ImportError(
         'Could not import MaskedAutoencoderViT3D. Make sure models_mae.py is in your PYTHONPATH.'

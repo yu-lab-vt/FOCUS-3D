@@ -7,17 +7,16 @@ from functools import partial
 import torch
 import torch.nn as nn
 from detectron2.modeling import BACKBONE_REGISTRY, Backbone, ShapeSpec
-from timm.models.layers import trunc_normal_
+from torch.nn.init import trunc_normal_
 
 from .vitadapter.vitadapter import ViTAdapter
 
-# Import the 3D MAE model (adjust the import path as needed)
 try:
     from .models_mae import MaskedAutoencoderViT3D
-except ImportError:
+except ImportError as e:
     raise ImportError(
-        'Could not import MaskedAutoencoderViT3D. Make sure models_mae.py is in your PYTHONPATH.'
-    )
+        'Could not import MaskedAutoencoderViT3D from models_mae_win.py.'
+    ) from e
 
 
 @BACKBONE_REGISTRY.register()

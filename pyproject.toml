@@ -31,25 +31,19 @@ requires-python = ">=3.10"
 # See best practices: https://napari.org/stable/plugins/building_a_plugin/best_practices.html
 dependencies = [
     "numpy",
-    "magicgui",
     "qtpy",
     "scikit-image",
     "scipy",
     "pandas",
     "tifffile",
     "zarr",
-    "imageio",
     "pyyaml",
     "requests",
     "dask",
-    "fsspec",
-    "numcodecs",
-    "pillow",
     "matplotlib",
     "scikit-learn",
-    "umap-learn",
+    "tqdm",
     "imagecodecs>=2023.9.18",
-    "timm>=1.0",
 ]
 
 [project.optional-dependencies]
