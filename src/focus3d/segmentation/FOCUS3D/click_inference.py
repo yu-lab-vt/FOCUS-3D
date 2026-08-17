@@ -18,13 +18,47 @@ if str(_FOCUS3D_DIR) not in sys.path:
 
 
 if __package__:
-    from .inference_win import normalize_img, read_volume
+    from .inference_win import read_volume
 else:
-    from inference_win import normalize_img, read_volume
+    from inference_win import read_volume
 
 # ============================================================
 # Refine local area
 # ============================================================
+def normalize_img(
+    image: np.ndarray,
+    lower_percentile: float = 1.0,
+    upper_percentile: float = 99.0,
+):
+    """
+    Percentile-based normalization to [0, 1].
+
+    Returns
+    -------
+    normalized : np.ndarray
+        Float32 normalized image.
+    stats : dict
+        Percentiles used for normalization.
+    """
+    image = np.asarray(image, dtype=np.float32)
+
+    p_low = float(np.percentile(image, lower_percentile))
+    p_high = float(np.percentile(image, upper_percentile))
+
+    stats = {
+        'p_low': p_low,
+        'p_high': p_high,
+        'lower_percentile': float(lower_percentile),
+        'upper_percentile': float(upper_percentile),
+    }
+
+    if p_high <= p_low:
+        return np.zeros_like(image, dtype=np.float32), stats
+
+    image = np.clip(image, p_low, p_high)
+    image = (image - p_low) / (p_high - p_low)
+
+    return image.astype(np.float32, copy=False), stats
 
 def crop_centered_patch_3d(
     volume: np.ndarray,
@@ -472,8 +506,8 @@ def infer_clicked_instance(
     coord_zyx,
     model,
     patch_size=(32, 96, 96),
-    lower_percentile=0.0,
-    upper_percentile=100.0,
+    lower_percentile=0.1,
+    upper_percentile=99.9,
     normalize=True,
     image_is_normalized=False,
     pad_mode='reflect',
