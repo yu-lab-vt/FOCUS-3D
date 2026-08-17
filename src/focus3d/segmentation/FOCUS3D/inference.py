@@ -3,10 +3,7 @@ import math
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
-from mask2former import add_maskformer2_config
-from detectron2.config import get_cfg
-from detectron2.modeling import build_model
-from detectron2.checkpoint import DetectionCheckpointer
+
 import numpy as np
 import torch
 import tifffile
@@ -16,6 +13,15 @@ from tqdm.auto import tqdm
 from skimage.measure import label as sk_label
 from scipy.ndimage import find_objects
 
+from detectron2.config import get_cfg
+from detectron2.modeling import build_model
+from detectron2.checkpoint import DetectionCheckpointer
+# Explicit imports required for Detectron2 registry registration.
+from .mask2former.config import add_maskformer2_config
+from .mask2former.maskformer_model import MaskFormer  # noqa: F401
+from .mask2former.modeling.backbone.mae3d_backbone import (
+    D2MAE3DBackbone,  # noqa: F401
+)
 # ============================================================
 # Main inference function
 # ============================================================
