@@ -38,18 +38,35 @@ from detectron2.utils.logger import setup_logger
 from pathlib import Path
 import sys
 
-FOCUS3D_ROOT = Path(__file__).resolve().parent
-if str(FOCUS3D_ROOT) not in sys.path:
-    sys.path.insert(0, str(FOCUS3D_ROOT))
-# Import the modified components (ensure they are registered)
-from mask2former.config import add_maskformer2_config
-from mask2former.maskformer_model import MaskFormer  # noqa: F401
-from mask2former.data.data_mapper import (
-    MaskFormer3DInstanceDatasetMapper,
-    register_real_dataset,
-)
+# Support both:
+# 1. package import:
+#    from focus3d.segmentation.FOCUS3D.train_net_3d import ...
+# 2. direct script execution:
+#    python train_net_3d.py ...
+if __package__:
+    from .mask2former.config import add_maskformer2_config
+    from .mask2former.maskformer_model import MaskFormer  # noqa: F401
+    from .mask2former.data.data_mapper import (
+        MaskFormer3DInstanceDatasetMapper,
+        register_real_dataset,
+    )
+    from .mask2former.modeling.backbone.mae3d_backbone import (
+        D2MAE3DBackbone,
+    )
+else:
+    FOCUS3D_ROOT = Path(__file__).resolve().parent
+    if str(FOCUS3D_ROOT) not in sys.path:
+        sys.path.insert(0, str(FOCUS3D_ROOT))
 
-from mask2former.modeling.backbone.mae3d_backbone import D2MAE3DBackbone
+    from mask2former.config import add_maskformer2_config
+    from mask2former.maskformer_model import MaskFormer  # noqa: F401
+    from mask2former.data.data_mapper import (
+        MaskFormer3DInstanceDatasetMapper,
+        register_real_dataset,
+    )
+    from mask2former.modeling.backbone.mae3d_backbone import (
+        D2MAE3DBackbone,
+    )
 
 
 class Trainer(DefaultTrainer):

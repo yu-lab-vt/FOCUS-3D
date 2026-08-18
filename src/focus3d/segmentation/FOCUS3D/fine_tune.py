@@ -192,7 +192,10 @@ def run_finetune(
     _check_cancelled(cancel_callback)
 
     # Import after CUDA_VISIBLE_DEVICES is set.
-    from train_net_3d import build_cfg, run_train
+    if __package__:
+        from .train_net_3d import build_cfg, run_train
+    else:
+        from train_net_3d import build_cfg, run_train
 
     cfg_opts = []
     if opts:
