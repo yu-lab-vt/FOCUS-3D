@@ -47,7 +47,7 @@ https://detectron2.readthedocs.io/en/latest/tutorials/install.html
 For most Linux environments, the official source installation command is:
 
 ```bash
-python -m pip install 'git+https://github.com/facebookresearch/detectron2.git'
+python -m pip install --no-build-isolation 'git+https://github.com/facebookresearch/detectron2.git'
 ```
 
 #### 6. Launch napari
