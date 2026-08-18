@@ -140,22 +140,26 @@ Open the `Analysis` tab after the segmentation has been checked.
    - `Clustering` for feature-based cell grouping.
 4. Use `Show feature` to map supported results back to the napari label volume.
 
-### Step 6 — Prepare curated patches and fine-tune the model
+### Step 6 — Prepare training data and fine-tune the model
 
-Fine-tuning is a two-stage workflow: curate training patches in napari, then run the training notebook.
+Fine-tuning consists of preparing annotated training data and then running the fine-tuning notebook.
 
-#### A. Export curated patches from napari
+#### A. Prepare training data
 
-1. Keep the raw image and corrected label volume loaded.
-2. Open `Segmentation -> Finetune with Current Labels`.
-3. Click `Calculate Valid Patches`.
-4. Inspect the patch boxes and choose a `Patch ID`.
-5. Set the patch `Save Path`.
-6. Click `Curate Selected Patch`.
-7. In the new patch viewer, correct the labels with the `Basic` curation tools.
-8. In `Save Curated Patch`, click `Save`.
+There are two ways to prepare the annotations:
 
-Each saved sample is written as a paired TIFF image and label:
+* **If the entire volume has been annotated:** you do **not** need to use `Calculate Valid Patches` in napari. Provide the fully annotated raw image and label volume to the fine-tuning notebook. The notebook includes code to automatically crop the full volume into training patches and organize them into `imagesTr` and `labelsTr`.
+
+* **If annotating the entire volume is impractical:** use the napari plugin to curate selected patches:
+
+  1. Keep the raw image and corrected label volume loaded.
+  2. Open `Segmentation -> Finetune with Current Labels`.
+  3. Click `Calculate Valid Patches`.
+  4. Choose a `Patch ID` and set the `Save Path`.
+  5. Click `Curate Selected Patch`.
+  6. Correct the labels in the patch viewer and click `Save`.
+
+Curated patches are saved as:
 
 ```text
 <save_path>/
@@ -167,23 +171,24 @@ Each saved sample is written as a paired TIFF image and label:
     └── ...
 ```
 
-Use `Clear Patch Boxes` when you want to remove the patch overlays and return to normal curation.
+Use `Clear Patch Boxes` to remove the patch overlays when finished.
 
 #### B. Run fine-tuning from the notebook
 
-1. Expand the collapsed `Fine-tune` instruction inside the same panel.
-2. Open:
+The fine-tuning notebook is **not included in the `pip` installation** and must be downloaded separately from the FOCUS-3D repository.
+
+Open:
 
 ```text
 notebooks/02_finetune.ipynb
 ```
 
-3. Configure the notebook to use the curated patch directory.
-4. Run fine-tuning and obtain a new checkpoint.
-5. Return to `Segmentation -> Run Segmentation`.
-6. Select the new checkpoint in the `Checkpoint` field and run segmentation again.
+If using a fully annotated volume, first run the notebook section that crops it into training patches. If patches were already exported from napari, directly set the notebook to use the prepared `imagesTr` and `labelsTr` directories.
 
-The napari panel prepares and exports training data, but it does not launch model training directly.
+Run fine-tuning to obtain a new checkpoint, then return to `Segmentation -> Run Segmentation`, select the new checkpoint in the `Checkpoint` field, and run segmentation again.
+
+The napari plugin can assist with patch preparation, while model fine-tuning itself is performed in the notebook.
+
 
 ## Detailed Interface Reference
 
