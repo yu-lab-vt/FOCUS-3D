@@ -12,12 +12,12 @@ MODEL:
     DECODER_NUM_HEADS: 16
     MLP_RATIO: 4.0
     NORM_PIX_LOSS: False
-    PRETRAINED: "./MAE_checkpoint_0510/checkpoint-399.pth"
+    PRETRAINED: ""
     VIT_ADAPTER:
-      PRETRAIN_SIZE: [32,96,96]         
-      NUM_HEADS: 16             
-      ITERATIONS: 4             
-      INTERACTION_INDEXES: [[0, 5], [6, 11], [12, 17], [18, 23]]  
+      PRETRAIN_SIZE: [32,96,96]
+      NUM_HEADS: 16
+      ITERATIONS: 4
+      INTERACTION_INDEXES: [[0, 5], [6, 11], [12, 17], [18, 23]]
       ADD_VIT_FEATURE: True
       EMBEDED_DIM : 1008
   SEM_SEG_HEAD:
@@ -65,8 +65,8 @@ MODEL:
   PIXEL_STD: [1.0]
 DATASETS:
   TRAIN: ("cell_3d_train",)
-  IMAGE_DIR: "/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/embryo_data/u-net_train/FISH2_0417/imagesTr/"
-  LABEL_DIR: "/mnt/26f9605d-186a-448a-a28a-495884a29801/zqh/embryo_data/u-net_train/FISH2_0417/labelsTr/"
+  IMAGE_DIR: ""
+  LABEL_DIR: ""
 SOLVER:
   AMP:
     ENABLED: True
@@ -76,8 +76,8 @@ SOLVER:
   BACKBONE_MULTIPLIER: 0.1
   VITADAPTER_MULTIPLIER: 1.0
   BASE_LR: 0.0001
-  STEPS: (35000, 38000)
-  MAX_ITER: 40000
+  STEPS: (8000, 9000)
+  MAX_ITER: 10000
   WARMUP_ITERS : 1000
   WEIGHT_DECAY: 0.05
   CLIP_GRADIENTS:
@@ -92,7 +92,7 @@ INPUT:
   CROP:
     ENABLED: False
   DATASET_MAPPER_NAME: MaskFormer3DInstanceDatasetMapper
-OUTPUT_DIR: ./output/output_0521
+OUTPUT_DIR: ./output/output_dir
 TEST:
   EVAL_PERIOD: 30000
   DETECTIONS_PER_IMAGE: 300
