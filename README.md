@@ -203,9 +203,9 @@ The complete descriptions of all controls are maintained in:
 
 ## Issues
 
-If you encounter a problem, please [file an issue](https://github.com/Qinghua24/cellseg/issues) with a detailed description, relevant logs, and a minimal example when possible. You can also contact `zhangqh24@mails.tsinghua.edu.cn`.
+If you encounter a problem, please [file an issue](https://github.com/Qinghua24/cellseg/issues) with a detailed description, relevant logs, and a minimal example when possible. You can also contact `zhangqh24@mails.tsinghua.edu.cn`. We also look forward to collaborating and jointly developing new algorithms, or customizing models based on your data.
 
 ## Citing
 
-Please contact us before the paper is published.
+Please contact `yug@tsinghua.edu.cn` before the paper is published.
 
