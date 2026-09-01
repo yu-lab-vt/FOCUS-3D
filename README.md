@@ -8,7 +8,24 @@
 [![napari hub](https://img.shields.io/endpoint?url=https://api.napari-hub.org/shields/cellseg)](https://napari-hub.org/plugins/cellseg)
 [![npe2](https://img.shields.io/badge/plugin-npe2-blue?link=https://napari.org/stable/plugins/index.html)](https://napari.org/stable/plugins/index.html)
 
-FOCUS-3D provides a user-friendly napari plugin for interactive 3D cell segmentation, manual curation, model fine-tuning, and analysis. Users can run automatic 3D segmentation with pretrained FOCUS-3D models, manually correct segmentation errors, perform one-click segmentation, prepare curated patches for human-in-the-loop fine-tuning, reconstruct selected 3D cell instances, and compute quantitative statistics within the same napari workflow. You can find some examples and tutorials on our website [https://www.quiclab.org.cn/focus-3d](https://www.quiclab.org.cn/focus-3d).
+FOCUS-3D provides a user-friendly napari plugin for interactive 3D cell segmentation and analysis.
+
+With the plugin, you can:
+
+* Run automatic 3D cell segmentation with pretrained FOCUS-3D models
+* Manually correct segmentation errors
+* Perform one-click segmentation
+* Prepare curated patches for human-in-the-loop fine-tuning
+* Fine-tune FOCUS-3D models on your own data
+* Reconstruct selected 3D cell instances
+* Compute quantitative statistics within the same napari workflow
+
+Examples and tutorials are available on our website:
+https://www.quiclab.org.cn/focus-3d
+
+Want to try FOCUS-3D without installing anything?
+Use [FOCUS-3D Online](https://huggingface.co/spaces/Qinghua-thu/FOCUS-3D) on Hugging Face Spaces for quick online inference and testing.
+
 
 <img width="800" height="434" alt="image" src="https://github.com/user-attachments/assets/2a9ccc08-3109-4b73-bcae-0514bcec2a86" />
 
