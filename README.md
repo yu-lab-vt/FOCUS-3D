@@ -21,7 +21,7 @@ With the plugin, you can:
 * Compute quantitative statistics
 
 Examples and tutorials are available on our website:
-https://www.quiclab.org.cn/focus-3d
+https://www.quiclab.org.cn/focus-3d.
 
 Want to try FOCUS-3D without installing anything?
 Use [FOCUS-3D Online](https://huggingface.co/spaces/Qinghua-thu/FOCUS-3D) on Hugging Face Spaces for quick online inference and testing.
