@@ -18,7 +18,7 @@ With the plugin, you can:
 * Prepare curated patches for human-in-the-loop fine-tuning
 * Fine-tune FOCUS-3D models on your own data
 * Reconstruct selected 3D cell instances
-* Compute quantitative statistics within the same napari workflow
+* Compute quantitative statistics
 
 Examples and tutorials are available on our website:
 https://www.quiclab.org.cn/focus-3d
