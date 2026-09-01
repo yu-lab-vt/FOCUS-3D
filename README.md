@@ -227,7 +227,7 @@ If you encounter a problem, please [file an issue](https://github.com/yu-lab-vt/
 ```bibtex
 @article{zhang2026focus,
   title={FOCUS-3D: Robust, generalizable volumetric cell segmentation for three-dimensional fluorescence microscopy},
-  author={Zhang, Qinghua and Mu, Zeyu and Liu, Bowen and Chi, Yunfeng and Li, Dong and Wang, Wei and Ni, Jian-Quan and Wan, Yinan and Yu, Lu and Navajas Acedo, Joaquin and Yu, Guoqiang},
+  author={Zhang, Qinghua and Mu, Zeyu and Liu, Boqi and Chi, Yunfeng and Li, Donglin and Wang, Wenjuan and Ni, Jian-Quan and Wan, Yinan and Yu, Li and Navajas Acedo, Joaquin and Yu, Guoqiang},
   journal={bioRxiv},
   year={2026},
   doi={10.64898/2026.08.25.746907}
