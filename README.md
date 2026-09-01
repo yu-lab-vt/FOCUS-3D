@@ -8,24 +8,25 @@
 [![napari hub](https://img.shields.io/endpoint?url=https://api.napari-hub.org/shields/cellseg)](https://napari-hub.org/plugins/cellseg)
 [![npe2](https://img.shields.io/badge/plugin-npe2-blue?link=https://napari.org/stable/plugins/index.html)](https://napari.org/stable/plugins/index.html)
 
-FOCUS-3D provides a user-friendly napari plugin for interactive 3D cell segmentation and analysis.
+FOCUS-3D provides a user-friendly **napari plugin** for interactive 3D cell segmentation and analysis.
 
-With the plugin, you can:
+### ✨ What you can do
 
-* Run automatic 3D cell segmentation with pretrained FOCUS-3D models
-* Manually correct segmentation errors
-* Perform one-click segmentation
-* Prepare curated patches for human-in-the-loop fine-tuning
-* Fine-tune FOCUS-3D models on your own data
-* Reconstruct selected 3D cell instances
-* Compute quantitative statistics
+&nbsp;&nbsp;&nbsp;&nbsp;🚀 Run automatic 3D cell segmentation with pretrained FOCUS-3D models<br>
+&nbsp;&nbsp;&nbsp;&nbsp;✏️ Manually correct segmentation errors<br>
+&nbsp;&nbsp;&nbsp;&nbsp;🖱️ Perform one-click segmentation<br>
+&nbsp;&nbsp;&nbsp;&nbsp;🧩 Prepare curated patches for human-in-the-loop fine-tuning<br>
+&nbsp;&nbsp;&nbsp;&nbsp;🧠 Fine-tune FOCUS-3D models on your own data<br>
+&nbsp;&nbsp;&nbsp;&nbsp;🔬 Reconstruct selected 3D cell instances<br>
+&nbsp;&nbsp;&nbsp;&nbsp;📊 Compute quantitative statistics
 
-Examples and tutorials are available on our website:
-https://www.quiclab.org.cn/focus-3d.
+### 📚 Examples & Tutorials
 
-Want to try FOCUS-3D without installing anything?
-Use [FOCUS-3D Online](https://huggingface.co/spaces/Qinghua-thu/FOCUS-3D) on Hugging Face Spaces for quick online inference and testing.
+Visit our website for examples, tutorials, and usage instructions:  🌐 [FOCUS-3D Website](https://www.quiclab.org.cn/focus-3d)
 
+### ☁️ Try FOCUS-3D Online
+
+Want to try FOCUS-3D without installing anything? 🚀 [**FOCUS-3D Online**](https://huggingface.co/spaces/Qinghua-thu/FOCUS-3D) on Hugging Face Spaces allows you to upload your own 3D fluorescence microscopy data for quick online inference and testing.
 
 <img width="800" height="434" alt="image" src="https://github.com/user-attachments/assets/2a9ccc08-3109-4b73-bcae-0514bcec2a86" />
 
