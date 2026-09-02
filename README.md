@@ -1,12 +1,12 @@
 # FOCUS-3D
 
-[![License BSD-3](https://img.shields.io/pypi/l/cellseg.svg?color=green)](https://github.com/Qinghua24/cellseg/raw/main/LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/cellseg.svg?color=green)](https://pypi.org/project/cellseg)
-[![Python Version](https://img.shields.io/pypi/pyversions/cellseg.svg?color=green)](https://python.org)
-[![tests](https://github.com/Qinghua24/cellseg/workflows/tests/badge.svg)](https://github.com/Qinghua24/cellseg/actions)
-[![codecov](https://codecov.io/gh/Qinghua24/cellseg/branch/main/graph/badge.svg)](https://codecov.io/gh/Qinghua24/cellseg)
-[![napari hub](https://img.shields.io/endpoint?url=https://api.napari-hub.org/shields/cellseg)](https://napari-hub.org/plugins/cellseg)
-[![npe2](https://img.shields.io/badge/plugin-npe2-blue?link=https://napari.org/stable/plugins/index.html)](https://napari.org/stable/plugins/index.html)
+[![Website](https://img.shields.io/badge/Website-FOCUS--3D-7BC8A4?logo=googlechrome\&logoColor=white)](https://www.quiclab.org.cn/focus-3d)
+[![GitHub](https://img.shields.io/badge/GitHub-FOCUS--3D-8FAADC?logo=github\&logoColor=white)](https://github.com/yu-lab-vt/FOCUS-3D)
+[![Paper](https://img.shields.io/badge/Paper-bioRxiv-E8A0A0)](https://doi.org/10.64898/2026.08.25.746907)
+[![Hugging Face](https://img.shields.io/badge/🤗%20Hugging%20Face-Try%20Online-F2C94C)](https://huggingface.co/spaces/Qinghua-thu/FOCUS-3D)
+[![Python](https://img.shields.io/badge/Python-3.10-7FB3D5?logo=python\&logoColor=white)](https://www.python.org/)
+[![napari](https://img.shields.io/badge/napari-Official-C9A7EB)](https://napari.org/)
+
 
 FOCUS-3D provides a user-friendly **napari plugin** for interactive 3D cell segmentation and analysis.
 
