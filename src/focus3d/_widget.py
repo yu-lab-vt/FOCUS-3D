@@ -90,8 +90,8 @@ from focus3d.basic.curation import (
     _exit_new_label_mode,
     _get_first_image_layer_for_refine,
     _get_label_bbox_near_click_for_local_refine,
-    _get_selected_cell_bbox_3d,
     _install_local_refinement_callbacks,
+    _make_undo_patch,
     _on_brush_z_changed,
     _on_clicked_local_refinement_error,
     _on_clicked_local_refinement_finished,
@@ -103,12 +103,13 @@ from focus3d.basic.curation import (
     _on_one_click_model_loaded,
     _on_roi_brush_size_changed,
     _on_roi_draw_mode_changed,
+    _push_undo_transaction,
     _rasterize_shapes_to_slice_masks,
     _remove_local_refinement_callbacks,
     _save_current_brush_slice,
     _start_clicked_local_refinement,
     _start_one_click_model_loading,
-    _undo_local_refinement,
+    _undo_last_edit,
     _update_brush_color_button,
     _update_curation_controls,
 )
@@ -445,16 +446,12 @@ class SegmentationWidget(QWidget):
         self._delete_all_active = False
         self._zarr_write_lock = RLock()
         self._label_io_busy = False
-        self._cell_refine_active = False
-        self._cell_refine_undo_stack = []
-        self.cell_refine_thread = None
-        self.cell_refine_worker = None
-        self.cell_refine_progress = None
+        self._focus3d_undo_stack = []
+        self._focus3d_undo_limit = 30
 
         self._local_refine_mode_active = False
         self._local_refine_busy = False
         self._local_refine_model = None
-        self._local_refine_undo_stack = []
         self.local_refine_thread = None
         self.local_refine_worker = None
         self.local_refine_progress = None
@@ -507,9 +504,6 @@ class SegmentationWidget(QWidget):
         self._init_analysis_tab()
 
         self.viewer.dims.events.current_step.connect(self._on_brush_z_changed)
-        self.viewer.bind_key(
-            'Control-Z', self._undo_local_refinement, overwrite=True
-        )
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
         self._install_delete_shortcut()
         # self.setMaximumWidth(350)
@@ -2983,9 +2977,10 @@ class SegmentationWidget(QWidget):
         """
         Handle global keyboard shortcuts.
 
-        Important:
-        + / - must be intercepted before napari Labels layer uses them
-        to modify selected_label.
+        Global shortcuts:
+        - Ctrl+Z: undo latest FOCUS-3D curation operation
+        - Delete: delete selected label on current Z
+        - +/-: adjust label brush size
         """
         if event.type() == QEvent.KeyPress:
             if not self.window().isActiveWindow():
@@ -2993,15 +2988,58 @@ class SegmentationWidget(QWidget):
 
             focus_widget = QApplication.focusWidget()
 
-            if isinstance(focus_widget, QLineEdit):
+            # ---------------------------------------------------------
+            # Do not steal Ctrl+Z/Delete etc. while editing text.
+            # Let QLineEdit handle its own keyboard shortcuts.
+            # ---------------------------------------------------------
+            if isinstance(
+                focus_widget,
+                (
+                    QLineEdit,
+                    QSpinBox,
+                    QDoubleSpinBox,
+                    QComboBox,
+                    QSlider,
+                ),
+            ):
                 return super().eventFilter(obj, event)
 
+            # ---------------------------------------------------------
+            # Ctrl + Z : FOCUS-3D global undo
+            # ---------------------------------------------------------
+            key = event.key()
+
+            is_ctrl_z = event.matches(QKeySequence.Undo)
+
+            if is_ctrl_z:
+                self._undo_last_edit()
+                event.accept()
+                return True
+
+            mutation_busy = (
+                getattr(self, '_current_roi_mode', None) is not None
+                or getattr(self, '_new_label_mode_active', False)
+                or getattr(self, '_delete_inside_mode_active', False)
+                or getattr(self, '_delete_all_active', False)
+                or getattr(self, '_local_refine_busy', False)
+                or getattr(self, '_local_refine_loading', False)
+            )
+
             if event.matches(QKeySequence.Delete):
+                if mutation_busy:
+                    notifications.show_warning(
+                        'Please finish the current editing operation first.'
+                    )
+                    event.accept()
+                    return True
+
                 self._delete_selected_label_slice()
                 event.accept()
                 return True
 
-            key = event.key()
+            # ---------------------------------------------------------
+            # +/- : brush size
+            # ---------------------------------------------------------
             text = event.text()
 
             is_plus = key == Qt.Key_Plus or key == Qt.Key_Equal or text == '+'
@@ -3035,10 +3073,26 @@ class SegmentationWidget(QWidget):
         return None
 
     def _get_labels_layer(self):
+        active = self.viewer.layers.selection.active
+
+        temp_brush = getattr(
+            self,
+            '_roi_brush_layer',
+            None,
+        )
+
+        if isinstance(active, Labels) and active is not temp_brush:
+            return active
+
+        labels_layer = self._get_segmentation_labels_layer()
+
+        if labels_layer is not None:
+            return labels_layer
+
         for layer in self.viewer.layers:
-            if isinstance(layer, Labels):
+            if isinstance(layer, Labels) and layer is not temp_brush:
                 return layer
-        # notifications.show_error('No Labels layer found.')
+
         return None
 
     def _get_segmentation_labels_layer(self):
@@ -3724,38 +3778,70 @@ class SegmentationWidget(QWidget):
 
     # ---------- Pick mode toggle ----------
     def _toggle_pick_mode(self):
-        """Toggle the labels layer between 'pick' mode and normal view."""
+        """Toggle the labels layer between pick mode and normal view."""
+
         labels_layer = self._activate_labels_layer(show_warning=True)
         if labels_layer is None:
             return
 
+        # ------------------------------------------------------------
+        # Exit Curation Mode
+        # ------------------------------------------------------------
         if self._pick_mode_active:
+            editing_busy = (
+                self._current_roi_mode is not None
+                or self._new_label_mode_active
+                or self._delete_inside_mode_active
+                or self._delete_all_active
+            )
+
+            if editing_busy:
+                notifications.show_warning(
+                    'Please finish or cancel the current editing operation '
+                    'before exiting Curation Mode.'
+                )
+                return
+
             labels_layer.mode = 'pan_zoom'
-            self._current_roi_mode = None
-            self._new_label_mode_active = False
-            self._delete_inside_mode_active = False
-            self._delete_all_active = False
 
             self.btn_pick_mode.setText('Enter Curation Mode')
             self._pick_mode_active = False
 
-            self._activate_labels_layer(labels_layer, show_warning=False)
+            self._activate_labels_layer(
+                labels_layer,
+                show_warning=False,
+            )
+
             self._update_curation_controls()
 
             notifications.show_info('Curation mode deactivated.')
+            return
 
-        else:
-            labels_layer.mode = 'pick'
-            self.viewer.layers.selection.active = labels_layer
-
-            self.btn_pick_mode.setText('Exit Curation Mode')
-            self._pick_mode_active = True
-
-            self._update_curation_controls()
-
-            notifications.show_info(
-                'Curation mode activated. Click on a label to select it.'
+        # ------------------------------------------------------------
+        # Enter Curation Mode
+        # ------------------------------------------------------------
+        if (
+            getattr(self, '_local_refine_mode_active', False)
+            or getattr(self, '_local_refine_busy', False)
+            or getattr(self, '_local_refine_loading', False)
+        ):
+            notifications.show_warning(
+                'Please exit One-click Segmentation mode before '
+                'entering Curation Mode.'
             )
+            return
+
+        labels_layer.mode = 'pick'
+        self.viewer.layers.selection.active = labels_layer
+
+        self.btn_pick_mode.setText('Exit Curation Mode')
+        self._pick_mode_active = True
+
+        self._update_curation_controls()
+
+        notifications.show_info(
+            'Curation mode activated. Click on a label to select it.'
+        )
 
     def _finalize_delete_inside(self):
         """Reset delete-inside flag, restore UI, and reselect label layer."""
@@ -4587,7 +4673,6 @@ SegmentationWidget._on_delete_inside_finished = _on_delete_inside_finished
 SegmentationWidget._add_new_label = _add_new_label
 SegmentationWidget._choose_roi_brush_color = _choose_roi_brush_color
 SegmentationWidget._update_brush_color_button = _update_brush_color_button
-SegmentationWidget._get_selected_cell_bbox_3d = _get_selected_cell_bbox_3d
 SegmentationWidget._get_first_image_layer_for_refine = (
     _get_first_image_layer_for_refine
 )
@@ -4612,7 +4697,9 @@ SegmentationWidget._on_clicked_local_refinement_finished = (
 SegmentationWidget._on_clicked_local_refinement_error = (
     _on_clicked_local_refinement_error
 )
-SegmentationWidget._undo_local_refinement = _undo_local_refinement
+SegmentationWidget._make_undo_patch = _make_undo_patch
+SegmentationWidget._push_undo_transaction = _push_undo_transaction
+SegmentationWidget._undo_last_edit = _undo_last_edit
 SegmentationWidget._show_3d_reconstruction = _lazy_show_3d_reconstruction
 SegmentationWidget._on_recon_progress = _lazy_on_recon_progress
 SegmentationWidget._on_reconstruction_finished = (

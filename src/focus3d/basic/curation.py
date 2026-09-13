@@ -24,161 +24,42 @@ from skimage.draw import polygon as draw_polygon
 
 
 class DeleteAllWorker(QObject):
-    finished = Signal(int)  # label_val
+    finished = Signal(object)
     error = Signal(str)
-    progress = Signal(int, str)  # percent, message
+    progress = Signal(int, str)
 
     def __init__(self, data, label_val, current_z, write_lock=None):
         super().__init__()
         self.data = data
-        self.label_val = label_val
-        self.current_z = (
-            current_z  # Store the current slice index for range limiting
-        )
+        self.label_val = int(label_val)
+        self.current_z = int(current_z)
         self.write_lock = write_lock
 
     def run(self):
         try:
             delete_N = 25
             total_slices = self.data.shape[0]
-            # Calculate slice range: 50 slices above and below current slice
+
             z_start = max(0, self.current_z - delete_N)
             z_end = min(
-                total_slices, self.current_z + delete_N
-            )  # +51 because end is exclusive
-            slices_to_process = z_end - z_start
-            found = False
+                total_slices,
+                self.current_z + delete_N,
+            )
 
-            if isinstance(self.data, np.ndarray):
-                # Process only the relevant slice range
-                for idx, z in enumerate(range(z_start, z_end)):
-                    if QThread.currentThread().isInterruptionRequested():
-                        return
+            slices_to_process = max(z_end - z_start, 1)
 
-                    with (
-                        self.write_lock
-                        if self.write_lock is not None
-                        else nullcontext()
-                    ):
-                        slice_data = np.asarray(self.data[z]).copy()
-                        mask = slice_data == self.label_val
-                        if np.any(mask):
-                            slice_data[mask] = 0
-                            self.data[z] = slice_data
-                            found = True
+            undo_patches = []
+            cancelled = False
 
-                    # Emit progress based on processed slices within the range
-                    progress_percent = int(100 * (idx + 1) / slices_to_process)
-                    self.progress.emit(
-                        progress_percent,
-                        f'Processing slice {z + 1}/{total_slices} (range {z_start + 1}-{z_end})',
-                    )
-
-            elif isinstance(self.data, zarr.Array):
-                # For zarr, process slice by slice within the range.
-                # The read-modify-write cycle must be locked.
-                for idx, z in enumerate(range(z_start, z_end)):
-                    if QThread.currentThread().isInterruptionRequested():
-                        return
-
-                    with (
-                        self.write_lock
-                        if self.write_lock is not None
-                        else nullcontext()
-                    ):
-                        slice_data = np.asarray(self.data[z]).copy()
-                        mask = slice_data == self.label_val
-                        if np.any(mask):
-                            slice_data[mask] = 0
-                            self.data[z] = slice_data
-                            found = True
-
-                    progress_percent = int(100 * (idx + 1) / slices_to_process)
-                    self.progress.emit(
-                        progress_percent,
-                        f'Processing slice {z + 1}/{total_slices} (range {z_start + 1}-{z_end})',
-                    )
-            else:
+            if not isinstance(self.data, (np.ndarray, zarr.Array)):
                 self.error.emit(f'Unsupported data type: {type(self.data)}')
                 return
 
-            if found:
-                self.finished.emit(self.label_val)
-            else:
-                # No label found in the processed range, still emit to notify
-                self.finished.emit(self.label_val)
-        except (ValueError, RuntimeError, OSError) as e:
-            self.error.emit(str(e))
-
-
-class DeleteInsideWorker(QObject):
-    """Worker for deleting all labels intersecting a polygon across all Z."""
-
-    finished = Signal(int)  # number of deleted labels
-    error = Signal(str)
-    progress = Signal(int, str)
-
-    def __init__(self, data, shapes, current_z, write_lock=None):
-        super().__init__()
-        self.data = data
-        self.shapes = shapes  # list of polygons (each as (N,2) or (N,3) if 3D)
-        self.current_z = current_z
-        self.write_lock = write_lock
-        self._is_cancelled = False
-
-    def cancel(self):
-        self._is_cancelled = True
-
-    def run(self):
-        """
-        Delete all labels that intersect the drawn polygon across all Z slices.
-        Optimized by processing each slice only once, using np.isin to delete multiple labels simultaneously.
-        """
-        try:
-            # --- Step 1: Generate polygon mask on the current slice ---
-            slice_shape = self.data.shape[1:3]  # (Y, X)
-            combined_mask = np.zeros(slice_shape, dtype=bool)
-            for poly in self.shapes:
-                # If polygon vertices include Z coordinate (ndim=3), discard the Z column
-                if poly.shape[1] == 3:
-                    poly = poly[:, 1:]  # keep only (y, x)
-
-                poly = _smooth_closed_polygon_yx(
-                    poly,
-                    samples_per_segment=16,
-                )
-
-                rr, cc = draw_polygon(poly[:, 0], poly[:, 1], slice_shape)
-                combined_mask[rr, cc] = True
-
-            # --- Step 2: Identify which labels are inside the polygon on the current slice ---
-            with (
-                self.write_lock
-                if self.write_lock is not None
-                else nullcontext()
-            ):
-                current_slice = np.asarray(self.data[self.current_z]).copy()
-                labels_in_mask = np.unique(current_slice[combined_mask])
-                labels_in_mask = labels_in_mask[
-                    labels_in_mask != 0
-                ]  # exclude background
-
-            if len(labels_in_mask) == 0:
-                self.finished.emit(0)  # no labels to delete
-                return
-
-            # --- Step 3: Delete those labels across all slices, processing one slice at a time ---
-            total_slices = self.data.shape[0]
-            delete_N = 25
-            z_start = max(0, self.current_z - delete_N)
-            z_end = min(total_slices, self.current_z + delete_N + 1)
-            total_steps = z_end - z_start + 1
-            # for z in range(total_slices):
-            for step, z in enumerate(range(z_start, z_end), start=1):
+            for idx, z in enumerate(range(z_start, z_end)):
                 if QThread.currentThread().isInterruptionRequested():
-                    return
+                    cancelled = True
+                    break
 
-                # Read-modify-write must be locked.
                 with (
                     self.write_lock
                     if self.write_lock is not None
@@ -186,122 +67,360 @@ class DeleteInsideWorker(QObject):
                 ):
                     slice_data = np.asarray(self.data[z]).copy()
 
-                    # Create a boolean mask marking all pixels that belong to any label in labels_in_mask
-                    mask = np.isin(slice_data, labels_in_mask)
+                    mask = slice_data == self.label_val
 
                     if np.any(mask):
-                        # Set those pixels to background (0)
+                        yy, xx = np.where(mask)
+
+                        y0 = int(yy.min())
+                        y1 = int(yy.max()) + 1
+                        x0 = int(xx.min())
+                        x1 = int(xx.max()) + 1
+
+                        old_region = slice_data[
+                            y0:y1,
+                            x0:x1,
+                        ].copy()
+
                         slice_data[mask] = 0
                         self.data[z] = slice_data
 
-                # Update progress
+                        undo_patches.append(
+                            {
+                                'slice_key': (
+                                    z,
+                                    slice(y0, y1),
+                                    slice(x0, x1),
+                                ),
+                                'old_data': old_region,
+                            }
+                        )
+
+                progress_percent = int(100 * (idx + 1) / slices_to_process)
+
                 self.progress.emit(
-                    int(100 * step / total_steps),
-                    f'Processing slice {z + 1}/{total_slices}',
+                    progress_percent,
+                    (
+                        f'Processing slice {z + 1}/{total_slices} '
+                        f'(range {z_start + 1}-{z_end})'
+                    ),
                 )
 
-            # --- Step 4: Notify completion with the number of labels deleted ---
-            self.finished.emit(len(labels_in_mask))
+            self.finished.emit(
+                {
+                    'label_val': self.label_val,
+                    'patches': undo_patches,
+                    'cancelled': cancelled,
+                    'current_z': self.current_z,
+                }
+            )
 
         except (ValueError, RuntimeError, OSError) as e:
             self.error.emit(str(e))
 
 
-class RefineSelectedCellWorker(QObject):
-    """Worker for refining one selected cell in a background thread."""
+class DeleteInsideWorker(QObject):
+    """Worker for deleting all labels intersecting a polygon across Z."""
 
     finished = Signal(object)
     error = Signal(str)
     progress = Signal(int, str)
 
-    def __init__(
-        self,
-        image_crop,
-        label_crop,
-        label_val,
-        bbox,
-        gaussian_sigma=(0.0, 3.0, 3.0),
-        min_seed_voxels=5,
-        shift=(3, 6, 6),
-        curve_thres=0.0,
-        im_resolution=(1.0, 1.0, 1.0),
-    ):
+    def __init__(self, data, shapes, current_z, write_lock=None):
         super().__init__()
-        self.image_crop = image_crop
-        self.label_crop = label_crop
-        self.label_val = int(label_val)
-        self.bbox = bbox
-        self.gaussian_sigma = gaussian_sigma
-        self.min_seed_voxels = int(min_seed_voxels)
-        self.shift = shift
-        self.curve_thres = float(curve_thres)
-        self.im_resolution = im_resolution
+        self.data = data
+        self.shapes = shapes
+        self.current_z = int(current_z)
+        self.write_lock = write_lock
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
 
     def run(self):
         try:
-            self.progress.emit(5, 'Preparing local crop...')
+            slice_shape = self.data.shape[1:3]
 
-            cell_mask_crop = self.label_crop == self.label_val
-            if not np.any(cell_mask_crop):
-                raise ValueError(
-                    f'Label {self.label_val} not found in local crop.'
+            combined_mask = np.zeros(
+                slice_shape,
+                dtype=bool,
+            )
+
+            for poly in self.shapes:
+                if poly.shape[1] == 3:
+                    poly = poly[:, 1:]
+
+                poly = _smooth_closed_polygon_yx(
+                    poly,
+                    samples_per_segment=16,
                 )
 
-            other_labels_crop = (self.label_crop > 0) & (
-                self.label_crop != self.label_val
-            )
-
-            self.progress.emit(35, 'Running local graph-cut refinement...')
-            from focus3d.basic.Princut_refine.local_refine import (
-                refine_single_cell_graphcut,
-            )
-
-            refined_mask_crop = refine_single_cell_graphcut(
-                image_crop=self.image_crop,
-                cell_mask_crop=cell_mask_crop,
-                other_labels_crop=other_labels_crop,
-                gaussian_sigma=self.gaussian_sigma,
-                min_seed_voxels=self.min_seed_voxels,
-                shift=self.shift,
-                curve_thres=self.curve_thres,
-                im_resolution=self.im_resolution,
-            )
-
-            refined_mask_crop = np.asarray(refined_mask_crop).astype(bool)
-
-            if refined_mask_crop.shape != cell_mask_crop.shape:
-                raise ValueError(
-                    f'Refined mask shape mismatch: expected {cell_mask_crop.shape}, '
-                    f'got {refined_mask_crop.shape}.'
+                rr, cc = draw_polygon(
+                    poly[:, 0],
+                    poly[:, 1],
+                    slice_shape,
                 )
 
-            if not np.any(refined_mask_crop):
-                raise ValueError('Refinement produced an empty mask.')
+                combined_mask[rr, cc] = True
 
-            self.progress.emit(80, 'Building replacement label crop...')
+            with (
+                self.write_lock
+                if self.write_lock is not None
+                else nullcontext()
+            ):
+                current_slice = np.asarray(self.data[self.current_z]).copy()
 
-            new_label_crop = self.label_crop.copy()
-            new_label_crop[new_label_crop == self.label_val] = 0
+                labels_in_mask = np.unique(current_slice[combined_mask])
 
-            refined_mask_crop[other_labels_crop] = False
-            new_label_crop[refined_mask_crop] = self.label_val
+                labels_in_mask = labels_in_mask[labels_in_mask != 0]
 
-            result = {
-                'bbox': self.bbox,
-                'label_val': self.label_val,
-                'old_label_crop': self.label_crop,
-                'new_label_crop': new_label_crop,
-                'old_voxels': int(np.sum(cell_mask_crop)),
-                'new_voxels': int(np.sum(refined_mask_crop)),
-            }
+            if len(labels_in_mask) == 0:
+                self.finished.emit(
+                    {
+                        'deleted_count': 0,
+                        'patches': [],
+                        'cancelled': False,
+                        'current_z': self.current_z,
+                    }
+                )
+                return
 
-            self.progress.emit(100, 'one-click segmentation finished.')
-            self.finished.emit(result)
+            total_slices = self.data.shape[0]
+            delete_N = 25
 
-        except Exception:
-            tb = traceback.format_exc()
-            print('\n[ClickedLocalRefineWorker ERROR]\n', tb, flush=True)
-            self.error.emit(tb)
+            z_start = max(
+                0,
+                self.current_z - delete_N,
+            )
+
+            z_end = min(
+                total_slices,
+                self.current_z + delete_N + 1,
+            )
+
+            total_steps = max(z_end - z_start, 1)
+
+            undo_patches = []
+            cancelled = False
+
+            for step, z in enumerate(
+                range(z_start, z_end),
+                start=1,
+            ):
+                if (
+                    self._is_cancelled
+                    or QThread.currentThread().isInterruptionRequested()
+                ):
+                    cancelled = True
+                    break
+
+                with (
+                    self.write_lock
+                    if self.write_lock is not None
+                    else nullcontext()
+                ):
+                    slice_data = np.asarray(self.data[z]).copy()
+
+                    mask = np.isin(
+                        slice_data,
+                        labels_in_mask,
+                    )
+
+                    if np.any(mask):
+                        yy, xx = np.where(mask)
+
+                        y0 = int(yy.min())
+                        y1 = int(yy.max()) + 1
+                        x0 = int(xx.min())
+                        x1 = int(xx.max()) + 1
+
+                        old_region = slice_data[
+                            y0:y1,
+                            x0:x1,
+                        ].copy()
+
+                        slice_data[mask] = 0
+                        self.data[z] = slice_data
+
+                        undo_patches.append(
+                            {
+                                'slice_key': (
+                                    z,
+                                    slice(y0, y1),
+                                    slice(x0, x1),
+                                ),
+                                'old_data': old_region,
+                            }
+                        )
+
+                self.progress.emit(
+                    int(100 * step / total_steps),
+                    f'Processing slice {z + 1}/{total_slices}',
+                )
+
+            self.finished.emit(
+                {
+                    'deleted_count': int(len(labels_in_mask)),
+                    'patches': undo_patches,
+                    'cancelled': cancelled,
+                    'current_z': self.current_z,
+                }
+            )
+
+        except (ValueError, RuntimeError, OSError) as e:
+            self.error.emit(str(e))
+
+
+def _make_undo_patch(self, slice_key, old_data):
+    """Create one compact undo patch."""
+    return {
+        'slice_key': slice_key,
+        'old_data': np.asarray(old_data).copy(),
+    }
+
+
+def _push_undo_transaction(
+    self,
+    operation,
+    labels_layer,
+    patches,
+    label_id_or_count=None,
+    z_index=None,
+    selected_label_before=None,
+):
+    """Push one completed FOCUS-3D editing operation onto the undo stack."""
+
+    patches = [p for p in patches if p is not None]
+
+    if len(patches) == 0:
+        return
+
+    if not hasattr(self, '_focus3d_undo_stack'):
+        self._focus3d_undo_stack = []
+
+    self._focus3d_undo_stack.append(
+        {
+            'operation': str(operation),
+            'labels_layer': labels_layer,
+            'patches': patches,
+            'label_id_or_count': label_id_or_count,
+            'z_index': z_index,
+            'selected_label_before': selected_label_before,
+        }
+    )
+
+    max_undo = int(getattr(self, '_focus3d_undo_limit', 30))
+
+    if len(self._focus3d_undo_stack) > max_undo:
+        del self._focus3d_undo_stack[:-max_undo]
+
+
+def _undo_last_edit(self, viewer=None):
+    """
+    Undo the latest committed FOCUS-3D label-editing operation.
+    """
+
+    in_active_session = (
+        getattr(self, '_current_roi_mode', None) is not None
+        or getattr(self, '_new_label_mode_active', False)
+        or getattr(self, '_delete_inside_mode_active', False)
+        or getattr(self, '_delete_all_active', False)
+        or getattr(self, '_local_refine_busy', False)
+        or getattr(self, '_local_refine_loading', False)
+    )
+
+    if in_active_session:
+        notifications.show_warning(
+            'Please finish or cancel the current editing operation before undo.'
+        )
+        return
+
+    stack = getattr(self, '_focus3d_undo_stack', [])
+
+    # Remove stale records whose original layer has been deleted.
+    while stack:
+        item = stack[-1]
+        labels_layer = item.get('labels_layer', None)
+
+        if labels_layer is not None and labels_layer in self.viewer.layers:
+            break
+
+        stack.pop()
+
+    if stack:
+        item = stack[-1]
+        labels_layer = item['labels_layer']
+        patches = item.get('patches', [])
+
+        if not patches:
+            stack.pop()
+            notifications.show_warning('Invalid undo record was discarded.')
+            return
+
+        try:
+            with _label_write_lock_context(self):
+                for patch in reversed(patches):
+                    slice_key = patch['slice_key']
+                    old_data = patch['old_data']
+                    labels_layer.data[slice_key] = old_data
+
+        except Exception as e:
+            # Critical: keep the undo record in the stack.
+            notifications.show_error(
+                f'Undo failed while restoring label data:\n{e}'
+            )
+            return
+
+        # Only remove history after all data were restored successfully.
+        stack.pop()
+
+        selected_label_before = item.get(
+            'selected_label_before',
+            None,
+        )
+
+        if selected_label_before is not None:
+            labels_layer.selected_label = int(selected_label_before)
+
+        try:
+            labels_layer.refresh(
+                thumbnail=False,
+                extent=False,
+                highlight=False,
+            )
+        except TypeError:
+            labels_layer.refresh()
+
+        operation = item.get('operation', 'edit')
+
+        # Logging failure must never invalidate a successful undo.
+        try:
+            self._append_log_entry(
+                operation='undo',
+                label_id_or_count=item.get(
+                    'label_id_or_count',
+                    None,
+                ),
+                z_index=item.get('z_index', None),
+                layer_name=labels_layer.name,
+                note=f'Undo previous operation: {operation}.',
+            )
+        except Exception as e:
+            print(
+                f'[FOCUS3D undo log warning] {e}',
+                flush=True,
+            )
+
+        notifications.show_info(f'Undo: {operation}.')
+        return
+
+    active_layer = self.viewer.layers.selection.active
+
+    if isinstance(active_layer, Labels) and hasattr(active_layer, 'undo'):
+        active_layer.undo()
+        return
+
+    notifications.show_info('Nothing to undo.')
 
 
 def _label_write_lock_context(self):
@@ -829,257 +948,6 @@ def _get_first_image_layer_for_refine(self):
     return None
 
 
-def _refine_selected_cell(self):
-    """
-    Start background refinement for the currently selected cell.
-    """
-    labels_layer = self._get_labels_layer()
-    if labels_layer is None:
-        notifications.show_error('No labels layer found.')
-        return
-
-    image_layer = self._get_first_image_layer_for_refine()
-    if image_layer is None:
-        notifications.show_error('No image layer found.')
-        return
-
-    label_val = int(labels_layer.selected_label)
-    if label_val == 0:
-        notifications.show_warning(
-            'Please select a non-background cell first.'
-        )
-        return
-
-    label_data = labels_layer.data
-    image_data = image_layer.data
-
-    if label_data.ndim != 3 or image_data.ndim != 3:
-        notifications.show_error(
-            'Refine Selected Cell expects 3D image and 3D labels.'
-        )
-        return
-
-    if tuple(label_data.shape) != tuple(image_data.shape):
-        notifications.show_error(
-            f'Image and label shape mismatch: image={image_data.shape}, '
-            f'label={label_data.shape}.'
-        )
-        return
-
-    bbox = self._get_selected_cell_bbox_3d(
-        labels_layer=labels_layer,
-        label_val=label_val,
-        expand_factor=2.0,
-        min_size=(4, 20, 20),
-        max_empty_gap=1,
-        require_current_slice=True,
-    )
-
-    if bbox is None:
-        notifications.show_warning(
-            f'Label {label_val} not found in 3D volume.'
-        )
-        return
-
-    z0, z1, y0, y1, x0, x1 = bbox
-
-    image_crop = np.asarray(image_data[z0:z1, y0:y1, x0:x1]).copy()
-    label_crop = np.asarray(label_data[z0:z1, y0:y1, x0:x1]).copy()
-
-    if not np.any(label_crop == label_val):
-        notifications.show_warning(
-            f'Label {label_val} not found in local crop.'
-        )
-        return
-
-    self._cell_refine_active = True
-    self._update_curation_controls()
-
-    self.cell_refine_progress = QProgressDialog(
-        'Refining selected cell...', 'Cancel', 0, 100, self
-    )
-    self.cell_refine_progress.setWindowTitle('Cell Refinement')
-    self.cell_refine_progress.setAutoClose(True)
-    self.cell_refine_progress.setAutoReset(True)
-    self.cell_refine_progress.show()
-
-    self.cell_refine_thread = QThread()
-    self.cell_refine_worker = RefineSelectedCellWorker(
-        image_crop=image_crop,
-        label_crop=label_crop,
-        label_val=label_val,
-        bbox=bbox,
-        gaussian_sigma=(0.0, 3.0, 3.0),
-        min_seed_voxels=5,
-        shift=(3, 6, 6),
-        curve_thres=0.0,
-        im_resolution=(1.0, 1.0, 1.0),
-    )
-    self.cell_refine_worker.moveToThread(self.cell_refine_thread)
-
-    self.cell_refine_worker.progress.connect(
-        lambda val, msg: self.cell_refine_progress.setValue(val)
-    )
-    self.cell_refine_worker.progress.connect(
-        lambda val, msg: self.cell_refine_progress.setLabelText(msg)
-    )
-    self.cell_refine_worker.finished.connect(
-        self._on_refine_selected_cell_finished
-    )
-    self.cell_refine_worker.error.connect(self._on_refine_selected_cell_error)
-
-    self.cell_refine_progress.canceled.connect(
-        self.cell_refine_thread.requestInterruption
-    )
-    self.cell_refine_progress.canceled.connect(
-        self._on_refine_selected_cell_cancelled
-    )
-
-    self.cell_refine_thread.started.connect(self.cell_refine_worker.run)
-    self.cell_refine_worker.finished.connect(self.cell_refine_thread.quit)
-    self.cell_refine_worker.error.connect(self.cell_refine_thread.quit)
-    self.cell_refine_worker.finished.connect(
-        self.cell_refine_worker.deleteLater
-    )
-    self.cell_refine_worker.error.connect(self.cell_refine_worker.deleteLater)
-    self.cell_refine_thread.finished.connect(
-        self.cell_refine_thread.deleteLater
-    )
-
-    self.cell_refine_thread.start()
-
-
-def _on_refine_selected_cell_finished(self, result):
-    """
-    Write the refined crop back to the labels layer in the main thread.
-    """
-    if (
-        hasattr(self, 'cell_refine_progress')
-        and self.cell_refine_progress is not None
-    ):
-        self.cell_refine_progress.close()
-
-    labels_layer = self._get_labels_layer()
-    if labels_layer is None:
-        self._cell_refine_active = False
-        self._update_curation_controls()
-        notifications.show_error('No labels layer found after refinement.')
-        return
-
-    bbox = result['bbox']
-    label_val = int(result['label_val'])
-    old_label_crop = result['old_label_crop']
-    new_label_crop = result['new_label_crop']
-
-    z0, z1, y0, y1, x0, x1 = bbox
-
-    if not hasattr(self, '_cell_refine_undo_stack'):
-        self._cell_refine_undo_stack = []
-
-    self._cell_refine_undo_stack.append(
-        {
-            'labels_layer': labels_layer,
-            'label_val': label_val,
-            'bbox': bbox,
-            'old_crop': old_label_crop,
-        }
-    )
-
-    max_undo = 10
-    if len(self._cell_refine_undo_stack) > max_undo:
-        self._cell_refine_undo_stack.pop(0)
-
-    with _label_write_lock_context(self):
-        labels_layer.data[z0:z1, y0:y1, x0:x1] = new_label_crop
-
-    labels_layer.selected_label = label_val
-    labels_layer.refresh()
-
-    self._append_log_entry(
-        operation='refine selected cell',
-        label_id_or_count=label_val,
-        z_index=int(self.viewer.dims.current_step[0]),
-        note=(
-            f'Refined selected cell {label_val}. '
-            f'bbox=(z:{z0}-{z1}, y:{y0}-{y1}, x:{x0}-{x1}); '
-            f'old_voxels={result["old_voxels"]}, '
-            f'new_voxels={result["new_voxels"]}.'
-        ),
-    )
-
-    self._cell_refine_active = False
-    self._update_curation_controls()
-    self.viewer.layers.selection.active = labels_layer
-
-    notifications.show_info(
-        f'Refined cell {label_val}: '
-        f'{result["old_voxels"]} → {result["new_voxels"]} voxels.'
-    )
-
-
-def _on_refine_selected_cell_error(self, error_msg):
-    """
-    Handle background refinement failure.
-    """
-    if (
-        hasattr(self, 'cell_refine_progress')
-        and self.cell_refine_progress is not None
-    ):
-        self.cell_refine_progress.close()
-
-    self._cell_refine_active = False
-    self._update_curation_controls()
-
-    notifications.show_error(f'Refine selected cell failed: {error_msg}')
-
-
-def _on_refine_selected_cell_cancelled(self):
-    """
-    Handle user cancellation.
-
-    The current worker is not force-killed during graph cut. The cancel button
-    only requests interruption and closes the progress dialog when the worker
-    exits.
-    """
-    notifications.show_info('Cell refinement cancellation requested.')
-
-
-def _undo_cell_refinement(self, viewer=None):
-    """
-    Undo latest Refine Selected Cell operation.
-    """
-    if not hasattr(self, '_cell_refine_undo_stack'):
-        notifications.show_info('No cell refinement history.')
-        return
-
-    if len(self._cell_refine_undo_stack) == 0:
-        notifications.show_info('No cell refinement operation to undo.')
-        return
-
-    item = self._cell_refine_undo_stack.pop()
-
-    labels_layer = item['labels_layer']
-    bbox = item['bbox']
-    old_crop = item['old_crop']
-    label_val = item['label_val']
-
-    if labels_layer is None or labels_layer not in self.viewer.layers:
-        notifications.show_warning(
-            'The original labels layer no longer exists.'
-        )
-        return
-
-    z0, z1, y0, y1, x0, x1 = bbox
-
-    with _label_write_lock_context(self):
-        labels_layer.data[z0:z1, y0:y1, x0:x1] = old_crop
-
-    labels_layer.selected_label = label_val
-    labels_layer.refresh()
-
-    notifications.show_info(f'Undo refinement for cell {label_val}.')
-
-
 def _choose_label_dtype(max_label: int):
     """
     Choose a compact unsigned dtype for label volume.
@@ -1090,181 +958,6 @@ def _choose_label_dtype(max_label: int):
         return np.uint32
     else:
         return np.uint64
-
-
-def _get_selected_cell_bbox_3d(
-    self,
-    labels_layer,
-    label_val,
-    expand_factor=2.0,
-    min_size=(4, 20, 20),
-    max_empty_gap=1,
-    require_current_slice=True,
-):
-    """
-    Find selected cell bbox by scanning around the current Z slice.
-
-    This avoids scanning the full 3D label volume.
-
-    Parameters
-    ----------
-    labels_layer : napari.layers.Labels
-        Label layer containing the selected cell.
-
-    label_val : int
-        Selected cell ID.
-
-    expand_factor : float
-        Enlarge the detected bbox by this factor.
-
-    min_size : tuple[int, int, int]
-        Minimum crop size in (Z, Y, X).
-
-    max_empty_gap : int
-        Stop scanning in one direction after this many consecutive empty slices.
-        For example, max_empty_gap=1 stops after one empty slice.
-
-    require_current_slice : bool
-        If True, the selected label must exist on the current Z slice.
-        This is recommended for interactive refinement.
-    """
-    data = labels_layer.data
-
-    if label_val is None or int(label_val) == 0:
-        return None
-
-    Z, Y, X = data.shape
-    current_z = int(self.viewer.dims.current_step[0])
-    current_z = max(0, min(current_z, Z - 1))
-
-    def slice_bbox(z):
-        """Return 2D bbox of label_val on one slice, or None."""
-        sl = np.asarray(data[z])
-        yy, xx = np.where(sl == label_val)
-
-        if len(yy) == 0:
-            return None
-
-        return (
-            int(yy.min()),
-            int(yy.max()) + 1,
-            int(xx.min()),
-            int(xx.max()) + 1,
-        )
-
-    current_bbox = slice_bbox(current_z)
-
-    if current_bbox is None:
-        if require_current_slice:
-            notifications.show_warning(
-                f'Label {label_val} is not visible on current Z slice {current_z}. '
-                'Please click the cell on a slice where it is visible.'
-            )
-            return None
-
-        # Fallback: local search around current_z only, not full volume.
-        # You can increase this radius if needed.
-        search_radius = 5
-        for dz in range(1, search_radius + 1):
-            for z in (current_z - dz, current_z + dz):
-                if z < 0 or z >= Z:
-                    continue
-                bbox = slice_bbox(z)
-                if bbox is not None:
-                    current_z = z
-                    current_bbox = bbox
-                    break
-            if current_bbox is not None:
-                break
-
-        if current_bbox is None:
-            return None
-
-    z_hits = []
-    y0_list, y1_list = [], []
-    x0_list, x1_list = [], []
-
-    def add_slice(z, bbox):
-        y0, y1, x0, x1 = bbox
-        z_hits.append(int(z))
-        y0_list.append(int(y0))
-        y1_list.append(int(y1))
-        x0_list.append(int(x0))
-        x1_list.append(int(x1))
-
-    add_slice(current_z, current_bbox)
-
-    # Scan backward from current_z.
-    empty_gap = 0
-    for z in range(current_z - 1, -1, -1):
-        bbox = slice_bbox(z)
-        if bbox is None:
-            empty_gap += 1
-            if empty_gap > max_empty_gap:
-                break
-            continue
-
-        empty_gap = 0
-        add_slice(z, bbox)
-
-    # Scan forward from current_z.
-    empty_gap = 0
-    for z in range(current_z + 1, Z):
-        bbox = slice_bbox(z)
-        if bbox is None:
-            empty_gap += 1
-            if empty_gap > max_empty_gap:
-                break
-            continue
-
-        empty_gap = 0
-        add_slice(z, bbox)
-
-    if len(z_hits) == 0:
-        return None
-
-    z0 = min(z_hits)
-    z1 = max(z_hits) + 1
-    y0 = min(y0_list)
-    y1 = max(y1_list)
-    x0 = min(x0_list)
-    x1 = max(x1_list)
-
-    def expand_one_axis(a0, a1, max_len, factor, min_len):
-        center = 0.5 * (a0 + a1)
-        length = max(1.0, float(a1 - a0))
-
-        new_length = length * float(factor)
-        new_length = max(new_length, float(min_len))
-
-        b0 = int(np.floor(center - new_length / 2.0))
-        b1 = int(np.ceil(center + new_length / 2.0))
-
-        # Shift the box back into the valid range while preserving size
-        # as much as possible.
-        if b0 < 0:
-            b1 -= b0
-            b0 = 0
-
-        if b1 > max_len:
-            b0 -= b1 - max_len
-            b1 = max_len
-
-        b0 = max(0, b0)
-        b1 = min(max_len, b1)
-
-        return b0, b1
-
-    min_z, min_y, min_x = min_size
-
-    z0, z1 = expand_one_axis(z0, z1, Z, expand_factor, min_z)
-    y0, y1 = expand_one_axis(y0, y1, Y, expand_factor, min_y)
-    x0, x1 = expand_one_axis(x0, x1, X, expand_factor, min_x)
-
-    if z1 <= z0 or y1 <= y0 or x1 <= x0:
-        return None
-
-    return z0, z1, y0, y1, x0, x1
 
 
 def _start_one_click_model_loading(
@@ -1510,6 +1203,12 @@ def _enter_local_refinement_mode(self):
     Model loading is done in a background QThread, so the napari UI will not
     freeze when the user clicks Enter One-click Segmentation.
     """
+    if getattr(self, '_pick_mode_active', False):
+        notifications.show_warning(
+            'Please exit Curation Mode before entering '
+            'One-click Segmentation mode.'
+        )
+        return
     image_layer = self._get_first_image_layer_for_refine()
 
     if image_layer is None:
@@ -1707,6 +1406,8 @@ def _start_clicked_local_refinement(self, coord_zyx):
             'The label layer was missing, so a new empty editable '
             'label layer was created automatically.'
         )
+    self._local_refine_labels_layer = labels_layer
+    self._local_refine_selected_label_before = int(labels_layer.selected_label)
 
     # Reuse the image data already loaded by napari.
     # Avoid reopening and rereading the original volume for every click.
@@ -1957,7 +1658,18 @@ def _on_clicked_local_refinement_finished(self, result):
         notifications.show_warning(message)
         return
 
-    labels_layer = self._get_labels_layer()
+    labels_layer = getattr(
+        self,
+        '_local_refine_labels_layer',
+        None,
+    )
+
+    if labels_layer is None or labels_layer not in self.viewer.layers:
+        self._local_refine_busy = False
+        notifications.show_error(
+            'Original Labels layer no longer exists after one-click segmentation.'
+        )
+        return
     if labels_layer is None:
         self._local_refine_busy = False
         notifications.show_error(
@@ -2135,30 +1847,33 @@ def _on_clicked_local_refinement_finished(self, result):
     new_crop[mask_crop] = target_label
 
     # ------------------------------------------------------------
-    # 4. Save undo information
-    # ------------------------------------------------------------
-    if not hasattr(self, '_local_refine_undo_stack'):
-        self._local_refine_undo_stack = []
-
-    self._local_refine_undo_stack.append(
-        {
-            'labels_layer': labels_layer,
-            'bbox': bbox,
-            'old_crop': old_crop,
-            'label_val': target_label,
-        }
-    )
-
-    max_undo = 20
-    if len(self._local_refine_undo_stack) > max_undo:
-        self._local_refine_undo_stack.pop(0)
-
-    # ------------------------------------------------------------
     # 5. Write local crop back.
     #    Works for both numpy and zarr.
     # ------------------------------------------------------------
     with _label_write_lock_context(self):
         label_data[z0:z1, y0:y1, x0:x1] = new_crop
+
+    self._push_undo_transaction(
+        operation='clicked one-click segmentation',
+        labels_layer=labels_layer,
+        patches=[
+            self._make_undo_patch(
+                (
+                    slice(z0, z1),
+                    slice(y0, y1),
+                    slice(x0, x1),
+                ),
+                old_crop,
+            )
+        ],
+        label_id_or_count=target_label,
+        z_index=z,
+        selected_label_before=getattr(
+            self,
+            '_local_refine_selected_label_before',
+            int(labels_layer.selected_label),
+        ),
+    )
 
     labels_layer.selected_label = target_label
     labels_layer.refresh(
@@ -2384,7 +2099,6 @@ def _on_local_refinement_click(self, layer, event):
         if labels_layer is None:
             notifications.show_error('No labels layer found.')
             return
-
         Z, Y, X = labels_layer.data.shape
         zz, yy, xx = coord_zyx
 
@@ -2416,12 +2130,13 @@ def _update_curation_controls(self):
         or self._new_label_mode_active
         or self._delete_inside_mode_active
         or self._delete_all_active
-        or getattr(self, '_cell_refine_active', False)
+        or getattr(self, '_local_refine_busy', False)
+        or getattr(self, '_local_refine_loading', False)
     )
     # Buttons that are always disabled when curation mode is off
-    self.btn_roi_add.setEnabled(curation_active)
-    self.btn_roi_subtract.setEnabled(curation_active)
-    self.btn_add_new_label.setEnabled(curation_active)
+    self.btn_roi_add.setEnabled(curation_active and not in_session)
+    self.btn_roi_subtract.setEnabled(curation_active and not in_session)
+    self.btn_add_new_label.setEnabled(curation_active and not in_session)
     self.btn_delete_slice.setEnabled(curation_active and not in_session)
     self.btn_delete_all.setEnabled(curation_active and not in_session)
     self.btn_change_label.setEnabled(curation_active and not in_session)
@@ -2454,7 +2169,7 @@ def _update_curation_controls(self):
 
     active_labels = self._get_labels_layer()
     if active_labels:
-        self.chk_contour.blockSignals(False)
+        self.chk_contour.blockSignals(True)
         self.chk_contour.setChecked(active_labels.contour)
         self.chk_contour.blockSignals(False)
 
@@ -2548,24 +2263,59 @@ def _change_selected_label_id(self):
 
     # Get current slice data (supports numpy/zarr arrays)
     # Read-modify-write current slice under lock.
+    slice_data = np.asarray(labels_layer.data[current_z])
+
+    yy, xx = np.where(slice_data == source_label)
+
+    if len(yy) == 0:
+        notifications.show_info(
+            f'Label {source_label} not found on slice {current_z}!'
+        )
+        return
+
+    y0 = int(yy.min())
+    y1 = int(yy.max()) + 1
+    x0 = int(xx.min())
+    x1 = int(xx.max()) + 1
+
+    selected_label_before = int(labels_layer.selected_label)
+
     with _label_write_lock_context(self):
-        slice_data = np.asarray(labels_layer.data[current_z]).copy()
+        region = np.asarray(
+            labels_layer.data[
+                current_z,
+                y0:y1,
+                x0:x1,
+            ]
+        ).copy()
 
-        # Create mask for pixels with source label
-        mask = slice_data == source_label
+        old_region = region.copy()
 
-        # Check if source label exists on current slice
-        if not np.any(mask):
-            notifications.show_info(
-                f'Label {source_label} not found on slice {current_z}!'
+        region[region == source_label] = new_label
+
+        labels_layer.data[
+            current_z,
+            y0:y1,
+            x0:x1,
+        ] = region
+
+    self._push_undo_transaction(
+        operation='change label',
+        labels_layer=labels_layer,
+        patches=[
+            self._make_undo_patch(
+                (
+                    current_z,
+                    slice(y0, y1),
+                    slice(x0, x1),
+                ),
+                old_region,
             )
-            return
-
-        # Replace source label with new ID
-        slice_data[mask] = new_label
-
-        # Update the slice in labels layer
-        labels_layer.data[current_z] = slice_data
+        ],
+        label_id_or_count=source_label,
+        z_index=current_z,
+        selected_label_before=selected_label_before,
+    )
 
     labels_layer.refresh()
 
@@ -2613,8 +2363,30 @@ def _delete_selected_label_slice(self):
     # Read/write only the bbox region.
     with _label_write_lock_context(self):
         region = np.asarray(data[z_idx, y0:y1, x0:x1]).copy()
+
+        old_region = region.copy()
+
         region[region == label_val] = 0
+
         data[z_idx, y0:y1, x0:x1] = region
+
+    self._push_undo_transaction(
+        operation='delete current Z',
+        labels_layer=labels_layer,
+        patches=[
+            self._make_undo_patch(
+                (
+                    z_idx,
+                    slice(y0, y1),
+                    slice(x0, x1),
+                ),
+                old_region,
+            )
+        ],
+        label_id_or_count=label_val,
+        z_index=z_idx,
+        selected_label_before=int(label_val),
+    )
 
     labels_layer.refresh()
 
@@ -2664,6 +2436,9 @@ def _delete_selected_label_all(self):
         return
     data = labels_layer.data
     current_z = self.viewer.dims.current_step[0]
+    self._delete_all_labels_layer = labels_layer
+    self._delete_all_selected_label_before = int(labels_layer.selected_label)
+    self._delete_all_start_z = int(current_z)
     self._delete_all_active = True
     self._update_curation_controls()  # This will disable relevant buttons
 
@@ -2704,23 +2479,70 @@ def _delete_selected_label_all(self):
     self.delete_all_progress.show()
 
 
-def _on_delete_all_finished(self, label_val):
-    labels_layer = self._get_labels_layer()
-    if labels_layer:
-        labels_layer.refresh()
-        current_z = self.viewer.dims.current_step[0]
-        self._append_log_entry(
+def _on_delete_all_finished(self, result):
+    if not isinstance(result, dict):
+        notifications.show_error('Delete All returned an invalid result.')
+        return
+
+    label_val = int(result['label_val'])
+    patches = result.get('patches', [])
+    cancelled = bool(result.get('cancelled', False))
+    current_z = int(
+        result.get(
+            'current_z',
+            self.viewer.dims.current_step[0],
+        )
+    )
+
+    labels_layer = getattr(
+        self,
+        '_delete_all_labels_layer',
+        None,
+    )
+
+    if labels_layer is None or labels_layer not in self.viewer.layers:
+        notifications.show_warning('Original Labels layer no longer exists.')
+        return
+
+    if patches:
+        self._push_undo_transaction(
             operation='delete all Z',
+            labels_layer=labels_layer,
+            patches=patches,
             label_id_or_count=label_val,
             z_index=current_z,
-            note='Deleted label in nearby slices around current Z.',
+            selected_label_before=getattr(
+                self,
+                '_delete_all_selected_label_before',
+                label_val,
+            ),
         )
+
+    labels_layer.refresh()
+
+    self._append_log_entry(
+        operation='delete all Z',
+        label_id_or_count=label_val,
+        z_index=current_z,
+        layer_name=labels_layer.name,
+        note=(
+            f'Deleted label in {len(patches)} modified slice(s). '
+            f'cancelled={cancelled}.'
+        ),
+    )
+
+    if cancelled:
         notifications.show_info(
-            f'Label {label_val} nearby slices (current ±30).'
+            f'Delete All was cancelled after modifying '
+            f'{len(patches)} slice(s). Ctrl+Z can restore them.'
+        )
+    elif patches:
+        notifications.show_info(
+            f'Label {label_val} deleted from {len(patches)} nearby slice(s).'
         )
     else:
         notifications.show_info(
-            f'Label {label_val} not found in nearby slices.'
+            f'Label {label_val} was not found in nearby slices.'
         )
 
 
@@ -2976,27 +2798,59 @@ def _apply_roi(self):
     # ------------------------------------------------------------
     # 3. Read/write only this local region
     # ------------------------------------------------------------
+    selected_label_before = int(labels_layer.selected_label)
+    operation_mode = self._current_roi_mode
+
     with _label_write_lock_context(self):
         region = np.asarray(data[z_idx, y0:y1, x0:x1]).copy()
 
-        if self._current_roi_mode == 'add':
-            region[mask_crop] = target_label
-            data[z_idx, y0:y1, x0:x1] = region
+        old_region = region.copy()
 
-        elif self._current_roi_mode == 'subtract':
-            # Only remove target_label pixels inside the ROI.
+        if operation_mode == 'add':
+            region[mask_crop] = target_label
+
+        elif operation_mode == 'subtract':
             target_pixels = mask_crop & (region == target_label)
 
             if np.any(target_pixels):
                 region[target_pixels] = 0
-                data[z_idx, y0:y1, x0:x1] = region
 
         else:
             notifications.show_error('Unknown ROI mode.')
             self._cancel_roi()
             return
 
-    if self._current_roi_mode == 'add':
+        changed = not np.array_equal(region, old_region)
+
+        if changed:
+            data[z_idx, y0:y1, x0:x1] = region
+
+    if changed:
+        operation_name = (
+            'add to label'
+            if operation_mode == 'add'
+            else 'subtract from label'
+        )
+
+        self._push_undo_transaction(
+            operation=operation_name,
+            labels_layer=labels_layer,
+            patches=[
+                self._make_undo_patch(
+                    (
+                        z_idx,
+                        slice(y0, y1),
+                        slice(x0, x1),
+                    ),
+                    old_region,
+                )
+            ],
+            label_id_or_count=target_label,
+            z_index=z_idx,
+            selected_label_before=selected_label_before,
+        )
+
+    if operation_mode == 'add':
         self._append_log_entry(
             operation='add to label',
             label_id_or_count=target_label,
@@ -3010,7 +2864,7 @@ def _apply_roi(self):
             f'Added label {target_label} inside ROI on slice {z_idx}.'
         )
 
-    elif self._current_roi_mode == 'subtract':
+    elif operation_mode == 'subtract':
         self._append_log_entry(
             operation='subtract from label',
             label_id_or_count=target_label,
@@ -3083,6 +2937,8 @@ def _apply_new_label(self):
         return
 
     modified_slices = set()
+    undo_patches = []
+    selected_label_before = int(labels_layer.selected_label)
 
     use_shape_roi = self.roi_polygon_radio.isChecked() or (
         hasattr(self, 'roi_trace_radio') and self.roi_trace_radio.isChecked()
@@ -3115,19 +2971,6 @@ def _apply_new_label(self):
             self._cancel_roi()
             return
 
-        # with _label_write_lock_context(self):
-        #     for z, mask in slice_masks.items():
-        #         if not np.any(mask):
-        #             continue
-
-        #         z = int(z)
-
-        #         # read-modify-write must be locked as one unit
-        #         slice_data = np.asarray(data[z]).copy()
-        #         slice_data[mask] = target_label
-        #         data[z] = slice_data
-
-        #         modified_slices.add(z)
         with _label_write_lock_context(self):
             for z, mask in slice_masks.items():
                 if not np.any(mask):
@@ -3145,8 +2988,26 @@ def _apply_new_label(self):
 
                 # Only read/write the local bbox, not the whole slice.
                 region = np.asarray(data[z, y0:y1, x0:x1]).copy()
+
+                old_region = region.copy()
+
                 region[mask_crop] = target_label
+
+                if np.array_equal(region, old_region):
+                    continue
+
                 data[z, y0:y1, x0:x1] = region
+
+                undo_patches.append(
+                    self._make_undo_patch(
+                        (
+                            z,
+                            slice(y0, y1),
+                            slice(x0, x1),
+                        ),
+                        old_region,
+                    )
+                )
 
                 modified_slices.add(z)
     else:
@@ -3180,19 +3041,77 @@ def _apply_new_label(self):
                         continue
 
                     region = np.asarray(data[z, y0:y1, x0:x1]).copy()
+
+                    old_region = region.copy()
+
                     region[mask_crop] = target_label
+
+                    if np.array_equal(region, old_region):
+                        continue
+
                     data[z, y0:y1, x0:x1] = region
 
+                    undo_patches.append(
+                        self._make_undo_patch(
+                            (
+                                z,
+                                slice(y0, y1),
+                                slice(x0, x1),
+                            ),
+                            old_region,
+                        )
+                    )
+
+                    modified_slices.add(z)
+
                 else:
-                    slice_mask = saved
+                    slice_mask = np.asarray(saved, dtype=bool)
+
                     if not np.any(slice_mask):
                         continue
 
-                    slice_data = np.asarray(data[z]).copy()
-                    slice_data[slice_mask] = target_label
-                    data[z] = slice_data
+                    yy, xx = np.where(slice_mask)
 
-                modified_slices.add(z)
+                    y0 = int(yy.min())
+                    y1 = int(yy.max()) + 1
+                    x0 = int(xx.min())
+                    x1 = int(xx.max()) + 1
+
+                    mask_crop = slice_mask[y0:y1, x0:x1]
+
+                    region = np.asarray(data[z, y0:y1, x0:x1]).copy()
+
+                    old_region = region.copy()
+
+                    region[mask_crop] = target_label
+
+                    if np.array_equal(region, old_region):
+                        continue
+
+                    data[z, y0:y1, x0:x1] = region
+
+                    undo_patches.append(
+                        self._make_undo_patch(
+                            (
+                                z,
+                                slice(y0, y1),
+                                slice(x0, x1),
+                            ),
+                            old_region,
+                        )
+                    )
+
+                    modified_slices.add(z)
+
+    if undo_patches:
+        self._push_undo_transaction(
+            operation='add new label',
+            labels_layer=labels_layer,
+            patches=undo_patches,
+            label_id_or_count=target_label,
+            z_index=current_z,
+            selected_label_before=selected_label_before,
+        )
 
     self._append_log_entry(
         operation='add new label',
@@ -3313,8 +3232,6 @@ def _cancel_roi(self, labels_layer_to_activate=None):
     self._roi_brush_z = None
     self._current_roi_mode = None
     self._roi_target_label = None
-    if self._delete_all_active:
-        self._delete_all_active = False
     self._update_curation_controls()
     # Activate the specified labels layer, or any labels layer if none specified
     # Restore label layer selection after cancelling ROI.
@@ -3361,16 +3278,7 @@ def _exit_new_label_mode(self, labels_layer_to_activate=None):
     self._update_curation_controls()
 
     # Re‑enable all buttons that were disabled
-    self.btn_roi_add.setEnabled(True)
-    self.btn_roi_subtract.setEnabled(True)
-    self.btn_add_new_label.setEnabled(True)
-    self.btn_delete_slice.setEnabled(True)
-    self.btn_delete_all.setEnabled(True)
     self.btn_save.setEnabled(True)
-    self.roi_polygon_radio.setEnabled(True)
-    self.roi_brush_radio.setEnabled(True)
-    if hasattr(self, 'roi_trace_radio'):
-        self.roi_trace_radio.setEnabled(True)
     # Disable Apply/Cancel (they are only active during ROI modes)
     self.btn_apply_roi.setEnabled(False)
     self.btn_cancel_roi.setEnabled(False)
@@ -3464,6 +3372,11 @@ def _apply_delete_inside(self):
     current_z = self.viewer.dims.current_step[0]
     data = labels_layer.data
 
+    self._delete_inside_labels_layer = labels_layer
+    self._delete_inside_selected_label_before = int(
+        labels_layer.selected_label
+    )
+    self._delete_inside_start_z = int(current_z)
     # Manually remove ROI layers WITHOUT resetting the mode flag
     if self._roi_layer is not None and self._roi_layer in self.viewer.layers:
         self.viewer.layers.remove(self._roi_layer)
@@ -3526,31 +3439,81 @@ def _apply_delete_inside(self):
     self.delete_inside_progress.show()
 
 
-def _on_delete_inside_finished(self, deleted_count):
-    labels_layer = self._get_labels_layer()
+def _on_delete_inside_finished(self, result):
+    if not isinstance(result, dict):
+        notifications.show_error(
+            'Delete Inside ROI returned an invalid result.'
+        )
+        return
 
-    if labels_layer:
-        labels_layer.refresh()
+    deleted_count = int(result.get('deleted_count', 0))
+    patches = result.get('patches', [])
+    cancelled = bool(result.get('cancelled', False))
 
-        if hasattr(self, '_activate_labels_layer'):
-            self._activate_labels_layer(labels_layer, show_warning=False)
-        else:
-            self.viewer.layers.selection.active = labels_layer
+    current_z = int(
+        result.get(
+            'current_z',
+            self.viewer.dims.current_step[0],
+        )
+    )
 
-        current_z = self.viewer.dims.current_step[0]
-        self._append_log_entry(
-            operation='delete inside roi + apply roi',
+    labels_layer = getattr(
+        self,
+        '_delete_inside_labels_layer',
+        None,
+    )
+
+    if labels_layer is None or labels_layer not in self.viewer.layers:
+        notifications.show_warning('Original Labels layer no longer exists.')
+        return
+
+    if patches:
+        self._push_undo_transaction(
+            operation='delete inside ROI',
+            labels_layer=labels_layer,
+            patches=patches,
             label_id_or_count=deleted_count,
             z_index=current_z,
-            note=f'Deleted {deleted_count} label(s) intersecting ROI.',
+            selected_label_before=getattr(
+                self,
+                '_delete_inside_selected_label_before',
+                None,
+            ),
         )
+
+    labels_layer.refresh()
+
+    if hasattr(self, '_activate_labels_layer'):
+        self._activate_labels_layer(
+            labels_layer,
+            show_warning=False,
+        )
+    else:
+        self.viewer.layers.selection.active = labels_layer
+
+    self._append_log_entry(
+        operation='delete inside roi + apply roi',
+        label_id_or_count=deleted_count,
+        z_index=current_z,
+        layer_name=labels_layer.name,
+        note=(
+            f'Deleted {deleted_count} label(s) intersecting ROI; '
+            f'modified_slices={len(patches)}; '
+            f'cancelled={cancelled}.'
+        ),
+    )
+
+    if cancelled:
+        notifications.show_info(
+            f'Delete Inside ROI was cancelled after modifying '
+            f'{len(patches)} slice(s). Ctrl+Z can restore them.'
+        )
+    elif deleted_count > 0:
         notifications.show_info(
             f'Deleted {deleted_count} label(s) that intersected the polygon.'
         )
     else:
-        notifications.show_info(
-            'No labels found inside polygon or operation cancelled.'
-        )
+        notifications.show_info('No labels found inside polygon.')
 
 
 def _add_new_label(self):
@@ -3824,39 +3787,3 @@ def _rasterize_shapes_to_slice_masks(
             slice_masks[z] = mask
 
     return slice_masks
-
-
-def _undo_local_refinement(self, viewer=None):
-    """
-    Undo the latest one-click segmentation operation.
-    """
-    if not hasattr(self, '_local_refine_undo_stack'):
-        notifications.show_info('No one-click segmentation history.')
-        return
-
-    if len(self._local_refine_undo_stack) == 0:
-        notifications.show_info('No one-click segmentation operation to undo.')
-        return
-
-    item = self._local_refine_undo_stack.pop()
-
-    labels_layer = item['labels_layer']
-    bbox = item['bbox']
-    old_crop = item['old_crop']
-
-    if labels_layer is None or labels_layer not in self.viewer.layers:
-        notifications.show_warning(
-            'The original labels layer no longer exists.'
-        )
-        return
-
-    z0, z1, y0, y1, x0, x1 = bbox
-
-    with _label_write_lock_context(self):
-        labels_layer.data[z0:z1, y0:y1, x0:x1] = old_crop
-
-    labels_layer.refresh()
-
-    notifications.show_info(
-        f'Undo one-click segmentation: restored bbox z:{z0}-{z1}, y:{y0}-{y1}, x:{x0}-{x1}.'
-    )

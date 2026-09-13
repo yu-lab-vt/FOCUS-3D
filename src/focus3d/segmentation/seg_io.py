@@ -208,6 +208,8 @@ def _browse_checkpoint(self):
 
 def _init_session_log_file(self, label_path: str):
     """Create a new CSV log file for the currently loaded label."""
+    if hasattr(self, '_focus3d_undo_stack'):
+        self._focus3d_undo_stack.clear()
     label_path = Path(label_path)
     self.current_label_path = label_path
 
