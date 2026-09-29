@@ -16,8 +16,6 @@ import zarr
 from napari.utils import notifications
 from qtpy.QtCore import QObject, QThread, Signal
 from qtpy.QtWidgets import QFileDialog, QLineEdit, QMessageBox, QProgressDialog
-from skimage import io
-from zarr.convenience import copy_store
 
 
 def _prepare_zyx_label_array_for_tiff(data):
@@ -110,21 +108,61 @@ class SaveWorker(QObject):
             else:  # Zarr
                 self.progress.emit(30, 'Saving as Zarr...')
                 store_path = base + '.zarr'
-                if isinstance(data, da.Array):
-                    data.to_zarr(store_path, compute=True)
-                elif isinstance(data, zarr.Array):
-                    dest_store = zarr.DirectoryStore(store_path)
-                    copy_store(data.store, dest_store)
-                elif isinstance(data, np.ndarray):
-                    da.from_array(data, chunks='auto').to_zarr(
-                        store_path, compute=True
+
+                # Target Zarr chunks: Z/Y/X = 1/512/512
+                shape = tuple(int(v) for v in data.shape)
+
+                if len(shape) != 3:
+                    raise ValueError(
+                        f'Expected 3D data (Z, Y, X), got shape={shape}.'
                     )
+
+                target_chunks = (
+                    1,
+                    min(512, shape[1]),
+                    min(512, shape[2]),
+                )
+
+                if isinstance(data, da.Array):
+                    # Rechunk first, then save
+                    data = data.rechunk(target_chunks)
+                    data.to_zarr(
+                        store_path,
+                        overwrite=True,
+                        compute=True,
+                    )
+
+                elif isinstance(data, zarr.Array):
+                    # Convert Zarr -> Dask -> rechunk -> new Zarr
+                    data_da = da.from_zarr(data)
+                    data_da = data_da.rechunk(target_chunks)
+                    data_da.to_zarr(
+                        store_path,
+                        overwrite=True,
+                        compute=True,
+                    )
+
+                elif isinstance(data, np.ndarray):
+                    # Create dask array directly with desired chunks
+                    data_da = da.from_array(
+                        data,
+                        chunks=target_chunks,
+                    )
+                    data_da.to_zarr(
+                        store_path,
+                        overwrite=True,
+                        compute=True,
+                    )
+
                 else:
                     raise TypeError(
                         f'Unsupported data type for Zarr: {type(data)}'
                     )
+
                 self.progress.emit(100, 'Zarr saved.')
-                self.finished.emit(f'Saved Zarr to {store_path}')
+                self.finished.emit(
+                    f'Saved Zarr to {store_path} with chunks={target_chunks}'
+                )
         except (ValueError, OSError) as e:
             self.error.emit(f'Save error: {e}\n{traceback.format_exc()}')
 
@@ -439,45 +477,6 @@ def _on_save_finished(self, message):
 def _on_save_error(self, error_msg):
     self.save_progress.close()
     notifications.show_error(error_msg)
-
-
-def _save_labels(self, labels: np.ndarray, base_filename: str):
-    save_dir = self.path_edit.text()
-    os.makedirs(save_dir, exist_ok=True)
-    filepath = os.path.join(save_dir, base_filename)
-    io.imsave(filepath, labels.astype(np.uint16))
-    notifications.show_info(f'Saved to {filepath}')
-
-
-def _save_labels_zarr(self, data):
-    save_dir = self.path_edit.text()
-    os.makedirs(save_dir, exist_ok=True)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    store_path = os.path.join(save_dir, f'labels_{timestamp}.zarr')
-    if isinstance(data, da.Array):
-        data.to_zarr(store_path, compute=True)
-        notifications.show_info(f'Saved dask array to Zarr: {store_path}')
-
-    elif isinstance(data, zarr.Array):
-        dest_store = zarr.DirectoryStore(store_path)
-        copy_store(data.store, dest_store)
-        notifications.show_info(f'Copied Zarr store to: {store_path}')
-
-    elif isinstance(data, np.ndarray):
-        da.from_array(data, chunks='auto').to_zarr(store_path, compute=True)
-        notifications.show_info(f'Saved numpy array to Zarr: {store_path}')
-
-        try:
-            arr = np.asarray(data)
-            da.from_array(arr, chunks='auto').to_zarr(store_path, compute=True)
-            notifications.show_info(
-                f'Converted and saved to Zarr: {store_path}'
-            )
-        except (ValueError, OSError) as e:
-            notifications.show_error(
-                f'Unsupported data type for Zarr save: {type(data)} - {e}'
-            )
-            return
 
 
 def _export_log(self):

@@ -127,8 +127,6 @@ from focus3d.segmentation.seg_io import (
     _on_save_error,
     _on_save_finished,
     _save_current_labels,
-    _save_labels,
-    _save_labels_zarr,
     _show_log_file_location,
     _show_segmentation_tif,
 )
@@ -4648,8 +4646,6 @@ SegmentationWidget._load_zarr_folder = _load_zarr_folder
 SegmentationWidget._save_current_labels = _save_current_labels
 SegmentationWidget._on_save_finished = _on_save_finished
 SegmentationWidget._on_save_error = _on_save_error
-SegmentationWidget._save_labels = _save_labels
-SegmentationWidget._save_labels_zarr = _save_labels_zarr
 SegmentationWidget._export_log = _export_log
 
 SegmentationWidget._update_curation_controls = _update_curation_controls
